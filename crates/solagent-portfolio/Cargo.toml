@@ -1,0 +1,13 @@
+[package]
+name = "solagent-portfolio"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+solagent-core = { path = "../solagent-core" }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }

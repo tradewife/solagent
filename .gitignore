@@ -1,0 +1,29 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Environment / Secrets
+.env
+.env.*
+!.env.example
+config/local.toml
+*.key
+*.pem
+
+# Database
+*.db
+*.db-shm
+*.db-wal
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Build artifacts
+dist/

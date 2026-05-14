@@ -1,0 +1,93 @@
+# SolAgent Configuration
+
+[api]
+# Rate limits are managed internally per-client.
+# These are the base URLs for each API.
+dexscreener_url = "https://api.dexscreener.com"
+birdeye_url = "https://public-api.birdeye.so"
+helius_url = "https://api.helius.xyz"
+jupiter_url = "https://quote-api.jup.ag/v6"
+
+# API keys (set via environment variables: BIRDEYE_API_KEY, HELIUS_API_KEY)
+# Free tier: DexScreener and Jupiter need no key.
+# Birdeye free key: https://bds.birdeye.so/
+# Helius free key: https://dev.helius.xyz/
+
+[chain.solana]
+rpc_urls = [
+    "https://api.mainnet-beta.solana.com",
+    "https://solana-api.syndica.io/access-token/public",
+]
+# Helius RPC (free, faster): set HELIUS_API_KEY env var
+
+[chain.base]
+rpc_url = "https://base-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}"
+
+[risk]
+# Position sizing (% of portfolio per trade)
+position_size_pct = 2.0
+# Max % of portfolio in any single token
+max_position_pct = 5.0
+# Max concurrent open positions
+max_positions = 10
+# Daily loss limit (% of portfolio) -- halts trading when hit
+daily_loss_limit_pct = 5.0
+# Drawdown from peak (%) -- halts agent entirely
+drawdown_limit_pct = 10.0
+# Max positions in same sector
+max_correlation = 3
+# Cooldown after a loss (seconds)
+cooldown_seconds = 300
+# Default stop loss (%)
+stop_loss_pct = 20.0
+# Default take profit (%)
+take_profit_pct = 50.0
+# Trailing stop (% from peak)
+trailing_stop_pct = 10.0
+
+[safety]
+# Minimum safety score to trade (0-100)
+min_safety_score = 60
+# Check mint authority
+check_mint_authority = true
+# Check freeze authority
+check_freeze_authority = true
+# Check LP lock
+check_lp_lock = true
+# Check holder concentration
+check_holder_concentration = true
+# Check dev wallet against blacklist
+check_dev_wallet = true
+# Simulate honeypot check
+check_honeypot = true
+# Check buy/sell taxes
+check_taxes = true
+
+[signals]
+# Signal weights for confluence scoring
+whale_consensus_weight = 0.30
+accumulation_weight = 0.20
+launch_momentum_weight = 0.20
+volume_spike_weight = 0.15
+social_weight = 0.15
+# Minimum confluence score to trade (0-100)
+min_confluence_score = 65
+# Whale consensus window (minutes)
+whale_consensus_window_mins = 30
+# Volume spike multiplier
+volume_spike_multiplier = 3.0
+
+[agent]
+# Active strategies
+strategies = ["whale_consensus", "accumulation", "launch_momentum", "volume_spike"]
+# New pair scan interval (seconds)
+scan_interval_secs = 5
+# Max tokens to track simultaneously
+max_tracked_tokens = 100
+# Max wallets to monitor
+max_watched_wallets = 50
+
+[logging]
+level = "info"
+# JSON structured logs for Railway
+json_format = false

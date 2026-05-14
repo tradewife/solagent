@@ -1,0 +1,15 @@
+[package]
+name = "solagent-data"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+solagent-core = { path = "../solagent-core" }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+governor = "0.10"
+urlencoding = "2"

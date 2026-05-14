@@ -1,0 +1,18 @@
+[package]
+name = "solagent-agent"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+solagent-core = { path = "../solagent-core" }
+solagent-data = { path = "../solagent-data" }
+solagent-signals = { path = "../solagent-signals" }
+solagent-safety = { path = "../solagent-safety" }
+solagent-risk = { path = "../solagent-risk" }
+solagent-exec = { path = "../solagent-exec" }
+solagent-portfolio = { path = "../solagent-portfolio" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }

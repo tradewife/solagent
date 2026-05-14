@@ -1,0 +1,70 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/solagent-core",
+    "crates/solagent-data",
+    "crates/solagent-chain-solana",
+    "crates/solagent-chain-base",
+    "crates/solagent-signals",
+    "crates/solagent-safety",
+    "crates/solagent-risk",
+    "crates/solagent-exec",
+    "crates/solagent-portfolio",
+    "crates/solagent-agent",
+    "crates/solagent-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+# Async
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# HTTP
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate"] }
+
+# Crypto
+solana-sdk = "2.2"
+solana-client = "2.2"
+solana-transaction-status = "2.2"
+spl-token = "7"
+ed25519-dalek = "2"
+
+# Ethereum/Base
+ethers = "2"
+alloy = { version = "1", features = ["full"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Utils
+uuid = { version = "1", features = ["v4", "serde"] }
+hex = "0.4"
+bs58 = "0.5"
+base64 = "0.22"
+rand = "0.9"
+dashmap = "6"
+parking_lot = "0.12"
