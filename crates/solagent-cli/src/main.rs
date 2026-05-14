@@ -277,10 +277,120 @@ async fn main() -> Result<()> {
             chain,
             verbose,
         } => {
-            println!("📊 Analyzing token: {address}");
-            println!("   Chain: {chain}");
-            println!("   Verbose: {verbose}");
-            todo!("solagent-signals + solagent-safety: full analysis")
+            tracing::info!(%address, %chain, "Analyzing token");
+
+            let dex = solagent_data::DexScreenerClient::new(
+                "https://api.dexscreener.com".to_string(),
+                None,
+            );
+            let birdeye = solagent_data::BirdeyeClient::new(
+                "https://public-api.birdeye.so".to_string(),
+                std::env::var("BIRDEYE_API_KEY").ok(),
+            );
+
+            // DexScreener pair data
+            let pairs_result = dex.get_token_info(&address).await;
+            let pair = match pairs_result {
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    println!("Token not found on DexScreener.");
+                    return Ok(());
+                }
+                Err(e) => {
+                    println!("Error fetching token: {e}");
+                    return Ok(());
+                }
+            };
+
+            let symbol = &pair.base_token.symbol;
+            let name = &pair.base_token.name;
+
+            println!("=== {} ({}) ===", symbol, name);
+            println!("Address:  {}", address);
+            println!("DEX:      {}", pair.dex_id);
+            if let Some(usd) = pair.price_usd.as_ref() {
+                println!("Price:    ${usd}");
+            }
+            if let Some(mc) = pair.market_cap {
+                println!("MC:       ${mc:.0}");
+            }
+            if let Some(fdv) = pair.fdv {
+                println!("FDV:      ${fdv:.0}");
+            }
+            if let Some(liq) = pair.liquidity.as_ref().and_then(|l| l.usd) {
+                println!("Liquidity: ${liq:.0}");
+            }
+            if let Some(vol) = pair.volume.as_ref().and_then(|v| v.h24) {
+                println!("Vol 24h:  ${vol:.0}");
+            }
+            if let Some(change) = pair.price_change.as_ref().and_then(|c| c.h24) {
+                let arrow = if change >= 0.0 { "+" } else { "" };
+                println!("Change 24h: {arrow}{change:.2}%");
+            }
+            if let Some(txns) = pair.txns.as_ref() {
+                println!("Txns 24h: {} buys / {} sells", txns.h24.buys, txns.h24.sells);
+            }
+            if let Some(boosts) = pair.boosts.as_ref().and_then(|b| b.active) {
+                println!("Boosts:   {}", boosts);
+            }
+            if let Some(age_ms) = pair.pair_created_at {
+                let created = chrono::DateTime::from_timestamp_millis(age_ms).unwrap_or_default();
+                let age_mins = (chrono::Utc::now() - created).num_minutes();
+                println!("Age:      {}h {}m", age_mins / 60, age_mins % 60);
+            }
+
+            // Birdeye security data
+            println!("\n--- Security ---");
+            match birdeye.get_token_security(&address).await {
+                Ok(sec) => {
+                    let mint_auth = sec.mint_authority.as_deref().unwrap_or("REVOKED");
+                    let freeze_auth = sec.freeze_authority.as_deref().unwrap_or("REVOKED");
+                    let renounced = sec.renounced.unwrap_or(false);
+                    println!("Mint Authority:   {}", if mint_auth.is_empty() { "REVOKED".to_string() } else { mint_auth.to_string() });
+                    println!("Freeze Authority: {}", if freeze_auth.is_empty() { "REVOKED".to_string() } else { freeze_auth.to_string() });
+                    println!("Renounced:        {}", renounced);
+                    if let Some(honeypot) = sec.is_honeypot {
+                        println!("Honeypot:         {}", if honeypot { "YES - DANGER" } else { "No" });
+                    }
+                    if let Some(buy_tax) = sec.buy_tax {
+                        println!("Buy Tax:          {:.2}%", buy_tax * 100.0);
+                    }
+                    if let Some(sell_tax) = sec.sell_tax {
+                        println!("Sell Tax:         {:.2}%", sell_tax * 100.0);
+                    }
+                }
+                Err(e) => {
+                    println!("Security data unavailable: {e}");
+                    println!("(Set BIRDEYE_API_KEY env var for full security data)");
+                }
+            }
+
+            // Birdeye holders
+            if verbose {
+                println!("\n--- Top Holders ---");
+                match birdeye.get_top_holders(&address).await {
+                    Ok(holders) => {
+                        for (i, h) in holders.iter().take(10).enumerate() {
+                            let owner = &h.owner;
+                            let pct_display = format!("{:.2}%", h.pct);
+                            println!("{:>3}. {} ... | {}", i + 1, &owner[..owner.len().min(20)], pct_display);
+                        }
+                    }
+                    Err(_) => println!("Holder data unavailable"),
+                }
+
+                println!("\n--- Top Traders ---");
+                match birdeye.get_top_traders(&address).await {
+                    Ok(traders) => {
+                        for (i, t) in traders.iter().take(10).enumerate() {
+                            let owner = &t.owner;
+                            let pnl = t.pnl.map(|p| format!("${p:.0}")).unwrap_or("-".into());
+                            println!("{:>3}. {} ... | PnL: {}", i + 1, &owner[..owner.len().min(20)], pnl);
+                        }
+                    }
+                    Err(_) => println!("Trader data unavailable"),
+                }
+            }
         }
 
         Commands::Trade {

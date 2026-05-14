@@ -312,37 +312,101 @@ impl DexScreenerClient {
 
 // ─── Birdeye Client ──────────────────────────────────────────────────────────
 
+/// Generic Birdeye API response wrapper.
+/// All Birdeye endpoints return `{ success: bool, data: T }`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BirdeyeResponse<T> {
+    pub success: bool,
+    pub data: T,
+}
+
+/// Inner data for the `/defi/price` endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenPriceData {
+    pub value: f64,
+    pub update_unix_time: i64,
+    pub price_change_24h: Option<f64>,
+}
+
+/// Token price info returned by `get_token_price`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenPrice {
     pub address: String,
     pub price_usd: f64,
+    pub update_unix_time: i64,
     pub price_change_24h: Option<f64>,
 }
 
+/// Inner data for the `/defi/token_security` endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenSecurityData {
+    pub mint_authority: Option<String>,
+    pub freeze_authority: Option<String>,
+    pub renounced: Option<bool>,
+    pub mutable_metadata: Option<bool>,
+    pub top_holders: Option<Vec<HolderInfo>>,
+    pub is_honeypot: Option<bool>,
+    pub buy_tax: Option<f64>,
+    pub sell_tax: Option<f64>,
+    /// Additional fields from Birdeye that we keep as untyped JSON.
+    #[serde(flatten)]
+    pub other: serde_json::Value,
+}
+
+/// Token security info returned by `get_token_security`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenSecurity {
     pub address: String,
     pub mint_authority: Option<String>,
     pub freeze_authority: Option<String>,
+    pub renounced: Option<bool>,
+    pub mutable_metadata: Option<bool>,
     pub top_holders: Vec<HolderInfo>,
     pub is_honeypot: Option<bool>,
     pub buy_tax: Option<f64>,
     pub sell_tax: Option<f64>,
 }
 
+/// Top holder entry from the `/defi/v3/token/holder` endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HolderInfo {
-    pub address: String,
+    pub owner: String,
     pub amount: f64,
     pub pct: f64,
+    /// Allow additional fields.
+    #[serde(flatten)]
+    pub other: serde_json::Value,
 }
 
+/// Inner data for the `/defi/v3/token/holder` endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HolderListData {
+    pub items: Vec<HolderInfo>,
+    #[serde(flatten)]
+    pub other: serde_json::Value,
+}
+
+/// Top trader entry from the `/defi/v3/token/top-traders` endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TraderInfo {
-    pub address: String,
-    pub pnl: f64,
-    pub win_rate: f64,
-    pub trades: u64,
+    pub owner: String,
+    pub pnl: Option<f64>,
+    pub buy_count: Option<u64>,
+    pub sell_count: Option<u64>,
+    /// Allow additional fields.
+    #[serde(flatten)]
+    pub other: serde_json::Value,
+}
+
+/// Inner data for the `/defi/v3/token/top-traders` endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraderListData {
+    pub items: Vec<TraderInfo>,
+    #[serde(flatten)]
+    pub other: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -354,17 +418,27 @@ pub struct WalletPnl {
     pub trade_count: u64,
 }
 
+/// Default Birdeye public API base URL.
+pub const BIRDEYE_DEFAULT_BASE_URL: &str = "https://public-api.birdeye.so";
+
 /// Birdeye API client.
 pub struct BirdeyeClient {
     client: RateLimitedClient,
-    #[allow(dead_code)]
     base_url: String,
-    #[allow(dead_code)]
     api_key: Option<String>,
 }
 
 impl BirdeyeClient {
+    /// Create a new Birdeye client.
+    ///
+    /// `base_url` defaults to `BIRDEYE_DEFAULT_BASE_URL` if empty.
+    /// `api_key` is optional – some endpoints work without it on the free tier.
     pub fn new(base_url: String, api_key: Option<String>) -> Self {
+        let base_url = if base_url.is_empty() {
+            BIRDEYE_DEFAULT_BASE_URL.to_string()
+        } else {
+            base_url
+        };
         Self {
             client: RateLimitedClient::new(3),
             base_url,
@@ -372,28 +446,107 @@ impl BirdeyeClient {
         }
     }
 
+    /// Convenience constructor with default base URL and optional API key.
+    pub fn with_api_key(api_key: Option<String>) -> Self {
+        Self::new(BIRDEYE_DEFAULT_BASE_URL.to_string(), api_key)
+    }
+
+    /// Build a reqwest GET request builder with common Birdeye headers set.
+    /// Respects the rate limiter before constructing the request.
+    async fn birdeye_get(&self, path: &str, chain: &str) -> reqwest::RequestBuilder {
+        let url = format!("{}{path}", self.base_url);
+        let client = self.client.request().await;
+        let mut req = client.get(&url).header("x-chain", chain);
+        if let Some(ref key) = self.api_key {
+            req = req.header("X-API-KEY", key);
+        }
+        req
+    }
+
+    /// Execute a request and deserialize the Birdeye response, unwrapping the `data` field.
+    async fn send_birdeye<T: serde::de::DeserializeOwned>(&self, req: reqwest::RequestBuilder) -> Result<T> {
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Birdeye API returned {status}: {body}");
+        }
+        let birdeye_resp: BirdeyeResponse<T> = resp.json().await?;
+        if !birdeye_resp.success {
+            anyhow::bail!("Birdeye API returned success=false");
+        }
+        Ok(birdeye_resp.data)
+    }
+
     /// Get token price.
-    pub async fn get_token_price(&self, address: &str) -> Result<TokenPrice> {
-        let _client = self.client.request().await;
-        todo!("GET /defi/price with address={address}")
+    ///
+    /// `chain` is passed as the `x-chain` header (e.g. `"solana"`, `"ethereum"`).
+    pub async fn get_token_price(&self, address: &str, chain: &str) -> Result<TokenPrice> {
+        let req = self
+            .birdeye_get(
+                &format!("/defi/price?address={}&check_liquidity=true", address),
+                chain,
+            )
+            .await;
+        let data: TokenPriceData = self.send_birdeye(req).await?;
+        Ok(TokenPrice {
+            address: address.to_string(),
+            price_usd: data.value,
+            update_unix_time: data.update_unix_time,
+            price_change_24h: data.price_change_24h,
+        })
     }
 
     /// Get token security info (mint/freeze authority, holders, taxes).
     pub async fn get_token_security(&self, address: &str) -> Result<TokenSecurity> {
-        let _client = self.client.request().await;
-        todo!("GET /defi/token_security with address={address}")
+        let req = self
+            .birdeye_get(
+                &format!("/defi/token_security?address={}", address),
+                "solana",
+            )
+            .await;
+        let data: TokenSecurityData = self.send_birdeye(req).await?;
+        Ok(TokenSecurity {
+            address: address.to_string(),
+            mint_authority: data.mint_authority,
+            freeze_authority: data.freeze_authority,
+            renounced: data.renounced,
+            mutable_metadata: data.mutable_metadata,
+            top_holders: data.top_holders.unwrap_or_default(),
+            is_honeypot: data.is_honeypot,
+            buy_tax: data.buy_tax,
+            sell_tax: data.sell_tax,
+        })
     }
 
     /// Get top traders for a token.
     pub async fn get_top_traders(&self, address: &str) -> Result<Vec<TraderInfo>> {
-        let _client = self.client.request().await;
-        todo!("GET /defi/v3/token/top-traders with address={address}")
+        let req = self
+            .birdeye_get(
+                &format!(
+                    "/defi/v3/token/top-traders?address={}&sort_by=pnl&sort_type=desc&offset=0&limit=10",
+                    address
+                ),
+                "solana",
+            )
+            .await;
+        let data: TraderListData = self.send_birdeye(req).await?;
+        Ok(data.items)
     }
 
     /// Get top holders for a token.
     pub async fn get_top_holders(&self, address: &str) -> Result<Vec<HolderInfo>> {
-        let _client = self.client.request().await;
-        todo!("GET /defi/v3/token/holder with address={address}")
+        let req = self
+            .birdeye_get(
+                &format!(
+                    "/defi/v3/token/holder?address={}&sort_by=amount&sort_type=desc&offset=0&limit=10",
+                    address
+                ),
+                "solana",
+            )
+            .await;
+        let data: HolderListData = self.send_birdeye(req).await?;
+        Ok(data.items)
     }
 
     /// Get wallet PnL summary.
@@ -405,65 +558,171 @@ impl BirdeyeClient {
 
 // ─── Helius Client ───────────────────────────────────────────────────────────
 
+/// Helius webhook configuration for creating/listing webhooks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WebhookConfig {
+    #[serde(rename = "webhookURL")]
     pub webhook_url: String,
+    #[serde(default)]
     pub transaction_types: Vec<String>,
+    #[serde(default)]
     pub account_addresses: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_header: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub webhook_id: Option<String>,
 }
 
+/// A parsed transaction returned by the Helius `/addresses/{address}/transactions` endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ParsedTransaction {
     pub signature: String,
-    pub slot: u64,
-    pub block_time: Option<i64>,
-    pub meta: Option<serde_json::Value>,
-    pub transaction: Option<serde_json::Value>,
+    #[serde(rename = "type")]
+    pub tx_type: Option<String>,
+    pub source: Option<String>,
+    pub description: Option<String>,
+    pub fee: Option<u64>,
+    pub fee_payer: Option<String>,
+    pub native_transfers: Option<Vec<serde_json::Value>>,
+    pub events: Option<serde_json::Value>,
+    /// Timestamp of the transaction.
+    pub timestamp: Option<i64>,
+    /// Allow additional fields from Helius.
+    #[serde(flatten)]
+    pub other: serde_json::Value,
 }
 
+/// Token balance entry from the Helius `/addresses/{address}/balances` endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TokenAccount {
+#[serde(rename_all = "camelCase")]
+pub struct TokenBalance {
     pub address: String,
-    pub mint: String,
-    pub amount: u64,
+    pub amount: f64,
     pub decimals: u8,
-    pub owner: String,
+    pub mint: String,
 }
 
-/// Helius API client for Solana enhanced RPC.
+/// Response wrapper for `/addresses/{address}/balances`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BalancesResponse {
+    #[serde(default)]
+    pub tokens: Vec<TokenBalance>,
+}
+
+/// Helius API client for Solana enhanced RPC and DAS API.
 pub struct HeliusClient {
     client: RateLimitedClient,
-    #[allow(dead_code)]
-    api_key: String,
-    #[allow(dead_code)]
+    api_key: Option<String>,
     base_url: String,
 }
 
 impl HeliusClient {
+    const DEFAULT_BASE_URL: &'static str = "https://api.helius.xyz/v0";
+
+    /// Create a new Helius client with an API key.
+    pub fn new_with_key(api_key: String) -> Self {
+        Self {
+            client: RateLimitedClient::new(10),
+            api_key: Some(api_key),
+            base_url: Self::DEFAULT_BASE_URL.to_string(),
+        }
+    }
+
+    /// Create a new Helius client without an API key.
+    /// All API calls will return an error since Helius requires a key.
+    pub fn new_without_key() -> Self {
+        Self {
+            client: RateLimitedClient::new(10),
+            api_key: None,
+            base_url: Self::DEFAULT_BASE_URL.to_string(),
+        }
+    }
+
+    /// Legacy constructor kept for backwards compatibility.
     pub fn new(api_key: String, base_url: String) -> Self {
         Self {
             client: RateLimitedClient::new(10),
-            api_key,
+            api_key: Some(api_key),
             base_url,
         }
     }
 
-    /// Register a webhook for on-chain events.
-    pub async fn register_webhook(&self, _config: WebhookConfig) -> Result<String> {
-        let _client = self.client.request().await;
-        todo!("POST /v0/webhooks with config")
+    /// Ensure an API key is available, returning an error otherwise.
+    fn require_api_key(&self) -> Result<&str> {
+        self.api_key
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Helius API key is not configured"))
     }
 
-    /// Get parsed transaction details.
+    /// Build a URL with the API key query parameter appended.
+    fn build_url(&self, path: &str) -> Result<String> {
+        let key = self.require_api_key()?;
+        let separator = if path.contains('?') { '&' } else { '?' };
+        Ok(format!("{}{}{}api-key={}", self.base_url, path, separator, key))
+    }
+
+    /// Get parsed transaction history for an address.
+    /// POST /addresses/{address}/transactions
+    pub async fn get_transactions(
+        &self,
+        address: &str,
+        tx_type: Option<&str>,
+    ) -> Result<Vec<ParsedTransaction>> {
+        let url = self.build_url(&format!("/addresses/{}/transactions", address))?;
+        let mut body = serde_json::json!({});
+        if let Some(t) = tx_type {
+            body["type"] = serde_json::Value::String(t.to_string());
+        }
+        let txs: Vec<ParsedTransaction> = self.client.post_json(&url, &body).await?;
+        Ok(txs)
+    }
+
+    /// Get token balances for an address.
+    /// GET /addresses/{address}/balances
+    pub async fn get_balances(&self, address: &str) -> Result<BalancesResponse> {
+        let url = self.build_url(&format!("/addresses/{}/balances", address))?;
+        let resp: BalancesResponse = self.client.get_json(&url).await?;
+        Ok(resp)
+    }
+
+    /// Create a webhook for on-chain events.
+    /// POST /webhooks
+    pub async fn create_webhook(&self, config: &WebhookConfig) -> Result<WebhookConfig> {
+        let url = self.build_url("/webhooks")?;
+        let body = serde_json::to_value(config)?;
+        let resp: WebhookConfig = self.client.post_json(&url, &body).await?;
+        Ok(resp)
+    }
+
+    /// List all webhooks.
+    /// GET /webhooks
+    pub async fn list_webhooks(&self) -> Result<Vec<WebhookConfig>> {
+        let url = self.build_url("/webhooks")?;
+        let resp: Vec<WebhookConfig> = self.client.get_json(&url).await?;
+        Ok(resp)
+    }
+
+    /// Register a webhook for on-chain events (legacy name, delegates to create_webhook).
+    pub async fn register_webhook(&self, config: WebhookConfig) -> Result<String> {
+        let resp = self.create_webhook(&config).await?;
+        resp.webhook_id
+            .ok_or_else(|| anyhow::anyhow!("Helius did not return a webhook ID"))
+    }
+
+    /// Get parsed transaction details by signature (alias for get_transactions filtered).
+    /// Uses the parsed transactions endpoint for a single address.
     pub async fn get_parsed_transaction(&self, signature: &str) -> Result<ParsedTransaction> {
-        let _client = self.client.request().await;
-        todo!("POST /v0/transactions/parsed with signature={signature}")
+        let url = self.build_url(&format!("/transactions/{}", signature))?;
+        let resp: ParsedTransaction = self.client.get_json(&url).await?;
+        Ok(resp)
     }
 
-    /// Get all token accounts for an owner.
-    pub async fn get_token_accounts(&self, owner: &str) -> Result<Vec<TokenAccount>> {
-        let _client = self.client.request().await;
-        todo!("POST /v0/addresses/{owner}/tokens")
+    /// Get all token balances for an owner address (legacy name, delegates to get_balances).
+    pub async fn get_token_accounts(&self, owner: &str) -> Result<Vec<TokenBalance>> {
+        let resp = self.get_balances(owner).await?;
+        Ok(resp.tokens)
     }
 }
 
