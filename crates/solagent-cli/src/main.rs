@@ -664,7 +664,16 @@ async fn main() -> Result<()> {
                 solagent_exec::ExecutionEngine::new(solagent_exec::ExecutionConfig::default())
             };
 
-            let confluence_threshold = config.as_ref().map(|c| c.strategies.confluence_threshold).unwrap_or(65.0);
+            let confluence_threshold = config.as_ref().map(|c| c.strategies.confluence_threshold).unwrap_or(35.0);
+
+            // Create wallet score cache from SQLite registry so whale consensus
+            // can match watched-wallet buys against known smart money scores.
+            let score_cache = solagent_signals::RegistryScoreCache::new(pool.clone());
+            if let Err(e) = score_cache.refresh().await {
+                tracing::warn!(error = %e, "Failed to refresh wallet score cache");
+            } else {
+                tracing::info!(count = score_cache.len(), "Wallet score cache loaded");
+            }
 
             // Create signal detectors.
             let whale_signal = std::sync::Arc::new(solagent_signals::WhaleConsensusSignal::new(
@@ -672,7 +681,7 @@ async fn main() -> Result<()> {
                 2,    // min_wallets
                 30,   // window_minutes
                 50.0, // min_buy_usd
-                Box::new(solagent_signals::InMemoryWalletScores::new()),
+                Box::new(score_cache),
             ));
             // Subscribe whale signal to WalletBuy events on the event bus.
             whale_signal.subscribe_to_events(&event_bus);
@@ -691,12 +700,12 @@ async fn main() -> Result<()> {
                 solagent_core::Chain::Solana,
                 "/home/kt/solagent/scripts/twitter-wrapper.sh".to_string(),
                 vec![
+                    "pump.fun".to_string(),
                     "solana memecoin".to_string(),
-                    "pump.fun launch".to_string(),
-                    "$SOL gem".to_string(),
+                    "ca:".to_string(),
                 ],
                 60,  // window_minutes
-                3,   // min_mentions
+                1,   // min_mentions (1 tweet about a specific CA is enough)
             );
 
             let mut confluence = solagent_signals::ConfluenceScorer::new(confluence_threshold);
@@ -754,6 +763,7 @@ async fn main() -> Result<()> {
                 confluence: std::sync::Mutex::new(confluence),
                 confluence_threshold,
                 watcher,
+                gmgn: solagent_data::GmgnClient::new(),
             };
 
             // Load watched wallets from registry into the watcher.

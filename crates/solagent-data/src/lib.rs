@@ -1,10 +1,11 @@
 //! # solagent-data
 //!
-//! API clients for DexScreener, Birdeye, Helius, and Jupiter with rate limiting.
+//! API clients for DexScreener, Birdeye, GMGN, Helius, and Jupiter with rate limiting.
 //! Also provides the WalletWatcher for real-time wallet monitoring.
 
 pub mod birdeye;
 pub mod dexscreener;
+pub mod gmgn;
 pub mod helius;
 pub mod http;
 pub mod jupiter;
@@ -19,6 +20,7 @@ pub use dexscreener::{
     BoostedToken, DexPair, DexPairResponse, DexScreenerClient, DexSearchResponse,
     DexTokenResponse, TokenLink,
 };
+pub use gmgn::{GmgnClient, GmgnTokenInfo, GMGN_CLI_DEFAULT_PATH};
 pub use helius::{
     BalancesResponse, HeliusClient, NativeBalanceChange, NativeTransfer, ParsedTransaction,
     SwapEvent, TokenBalance, TokenBalanceChange, TokenTransfer, TransactionEvent,

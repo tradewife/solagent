@@ -103,6 +103,8 @@ pub struct AgentSubsystems {
     pub confluence_threshold: f64,
     /// Wallet watcher for detecting smart money trades (Helius-backed).
     pub watcher: Option<solagent_data::WalletWatcher>,
+    /// GMGN client for fetching holder count data.
+    pub gmgn: solagent_data::GmgnClient,
 }
 
 // ─── Agent ───────────────────────────────────────────────────────────────────
@@ -116,6 +118,8 @@ pub struct Agent {
     running: Arc<tokio::sync::RwLock<bool>>,
     /// Track exit parameters per position.
     position_exits: Arc<tokio::sync::RwLock<std::collections::HashMap<String, PositionExit>>>,
+    /// Recently-evaluated tokens with cooldown (address -> last eval time).
+    eval_cooldown: Arc<tokio::sync::RwLock<std::collections::HashMap<String, DateTime<Utc>>>>,
 }
 
 impl Agent {
@@ -130,6 +134,7 @@ impl Agent {
             decisions: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             running: Arc::new(tokio::sync::RwLock::new(false)),
             position_exits: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            eval_cooldown: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         }
     }
 
@@ -164,10 +169,12 @@ impl Agent {
                 confluence: std::sync::Mutex::new(solagent_signals::ConfluenceScorer::new(65.0)),
                 confluence_threshold: 65.0,
                 watcher: None,
+                gmgn: solagent_data::GmgnClient::new(),
             }),
             decisions: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             running: Arc::new(tokio::sync::RwLock::new(false)),
             position_exits: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            eval_cooldown: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         }
     }
 
@@ -273,12 +280,49 @@ impl Agent {
 
         tracing::info!(count = tokens.len(), "Scan discovered tokens");
 
-        // Feed scan data into signal detectors (volume + launch momentum).
+        // Fetch holder counts from GMGN for discovered tokens (rate-limited).
+        // Only fetch for tokens with volume/mcap data (likely legitimate).
+        let tokens_with_data: Vec<String> = tokens.iter()
+            .filter(|t| t.volume_24h.is_some() || t.market_cap_usd.is_some())
+            .map(|t| t.address.clone())
+            .collect();
+
+        if !tokens_with_data.is_empty() {
+            tracing::info!(
+                count = tokens_with_data.len(),
+                "Fetching holder counts from GMGN for tokens with volume/mcap data"
+            );
+            let holder_counts = self.subsystems.gmgn.get_holder_counts(&tokens_with_data).await;
+            let fetched = holder_counts.len();
+            let total = tokens_with_data.len();
+            tracing::info!(
+                fetched,
+                total,
+                "GMGN holder count fetch complete ({fetched}/{total} successful)"
+            );
+
+            // Update tokens with fetched holder counts.
+            for token in &mut tokens {
+                if let Some(count) = holder_counts.get(&token.address) {
+                    token.holder_count = Some(*count);
+                }
+            }
+        }
+
+        // Feed scan data into signal detectors (volume, launch momentum, accumulation).
         for token in &tokens {
+            if token.holder_count.is_some() {
+                tracing::debug!(
+                    token = &token.address[..token.address.len().min(12)],
+                    holder_count = ?token.holder_count,
+                    "Feeding scan data with holder count"
+                );
+            }
             self.subsystems.confluence.lock().unwrap().feed_scan_data(
                 &token.address,
                 token.volume_24h,
                 token.holder_count,
+                token.price_usd,
             );
         }
 
@@ -697,9 +741,31 @@ impl Agent {
 
                     match self.scan().await {
                         Ok(tokens) => {
+                            // Search Twitter for discovered token CAs (top 5 per cycle to respect rate limits).
+                            let addresses: Vec<String> = tokens.iter().take(5).map(|t| t.address.clone()).collect();
+                            self.subsystems.confluence.lock().unwrap().poll_social_tokens(&addresses, 5).await;
+
+                            // Prune expired cooldown entries (older than 5 minutes).
+                            let cooldown_duration = chrono::Duration::minutes(5);
+                            {
+                                let mut cd = self.eval_cooldown.write().await;
+                                let now = Utc::now();
+                                cd.retain(|_, t| *t + cooldown_duration > now);
+                            }
+
                             // Only evaluate the first N tokens per scan to respect API rate limits.
                             let eval_limit = self.config.max_concurrent_evaluations.min(tokens.len());
-                            for token in tokens.iter().take(eval_limit) {
+                            let cooldown = self.eval_cooldown.read().await;
+                            let tokens_to_eval: Vec<_> = tokens.iter().take(eval_limit)
+                                .filter(|t| !cooldown.contains_key(&t.address))
+                                .collect();
+                            let skipped = eval_limit.saturating_sub(tokens_to_eval.len());
+                            if skipped > 0 {
+                                tracing::debug!(skipped, "Tokens skipped due to evaluation cooldown");
+                            }
+                            drop(cooldown);
+
+                            for token in tokens_to_eval {
                                 self.subsystems.event_bus.publish(Event::TokenDiscovered {
                                     token: token.clone(),
                                     timestamp: Utc::now(),
@@ -752,6 +818,9 @@ impl Agent {
 
                                 // Rate-limit between evaluations to respect Birdeye free tier.
                                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+                                // Mark token as evaluated (cooldown 5 min to avoid re-evaluating same tokens).
+                                self.eval_cooldown.write().await.insert(token.address.clone(), Utc::now());
                             }
                         }
                         Err(e) => {

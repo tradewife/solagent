@@ -717,8 +717,47 @@ impl SocialSignal {
         Ok(())
     }
 
+    /// Search Twitter for specific token CAs discovered during scanning.
+    /// This is the primary way the social signal gets useful data — searching
+    /// for an exact CA finds tweets where people are actually discussing the token.
+    /// Limits to `max_tokens` per call to stay within rate limits.
+    pub async fn poll_token_cas(&self, addresses: &[String], max_tokens: usize) {
+        let batch = if addresses.len() > max_tokens {
+            &addresses[..max_tokens]
+        } else {
+            addresses
+        };
+
+        for addr in batch {
+            // Search for the full CA — anyone tweeting it is discussing the token.
+            if let Err(e) = self.search_keyword(addr).await {
+                tracing::debug!(token = &addr[..addr.len().min(12)], error = %e, "Twitter CA search failed");
+            }
+            // Also search for the CA with a $ prefix (common crypto Twitter convention
+            // where people share "$CA" as shorthand).
+            // Skip if CA is too long for a useful search (most are 43-44 chars).
+            if addr.len() <= 44 {
+                let dollar_query = format!("${}", &addr[..addr.len().min(20)]);
+                if let Err(e) = self.search_keyword(&dollar_query).await {
+                    tracing::debug!(query = %dollar_query, error = %e, "Twitter $CA search failed");
+                }
+            }
+        }
+    }
+
     /// Search a single keyword via twitter-cli and parse results.
+    /// When `known_ca` is set, any matching tweet is attributed to that CA
+    /// even if the CA isn't extracted from the text (e.g. partial match or URL).
     async fn search_keyword(&self, keyword: &str) -> Result<()> {
+        // Detect if the keyword is itself a token CA (for poll_token_cas calls).
+        let query_ca = if keyword.len() >= 32 && keyword.len() <= 44
+            && keyword.chars().all(|c| c.is_ascii_alphanumeric())
+        {
+            Some(keyword.to_string())
+        } else {
+            None
+        };
+
         let output = tokio::process::Command::new(&self.twitter_cli_path)
             .args(["search", keyword, "--json", "--max", "20"])
             .output()
@@ -756,10 +795,15 @@ impl SocialSignal {
             };
 
             // Extract Solana CAs from the tweet text.
-            // pump.fun CAs are base58 strings ending in "pump".
-            let cas = self.extract_solana_cas(&text);
+            let mut cas = self.extract_solana_cas(&text);
+
+            // If this was a CA-specific search and no CAs extracted from text,
+            // attribute the tweet to the queried CA anyway (the tweet matched
+            // the CA in the search so it IS about this token).
             if cas.is_empty() {
-                continue;
+                if let Some(ref ca) = query_ca {
+                    cas.push(ca.clone());
+                }
             }
 
             let author = tweet.author.as_ref()
@@ -1002,9 +1046,9 @@ impl ConfluenceScorer {
         scorer
     }
 
-    /// Feed scan data into the volume spike and launch momentum signals.
+    /// Feed scan data into the volume spike, launch momentum, and accumulation signals.
     /// Call this on each scan tick to keep signal state up to date.
-    pub fn feed_scan_data(&self, token_address: &str, volume_24h: Option<f64>, holder_count: Option<u64>) {
+    pub fn feed_scan_data(&self, token_address: &str, volume_24h: Option<f64>, holder_count: Option<u64>, price_usd: Option<f64>) {
         for strategy in &self.strategies {
             match strategy {
                 StrategyKind::VolumeSpike(vs) => {
@@ -1016,6 +1060,12 @@ impl ConfluenceScorer {
                     if let Some(vol) = volume_24h {
                         let holders = holder_count.unwrap_or(0);
                         lm.record(token_address.to_string(), vol, holders);
+                    }
+                }
+                StrategyKind::Accumulation(acc) => {
+                    if let Some(holders) = holder_count {
+                        let price = price_usd.unwrap_or(0.0);
+                        acc.record_snapshot(token_address.to_string(), holders, price);
                     }
                 }
                 _ => {}
@@ -1031,6 +1081,18 @@ impl ConfluenceScorer {
             }
         }
         Ok(())
+    }
+
+    /// Poll Twitter for specific token CAs discovered during scanning.
+    /// Searches up to `max_tokens` addresses per call. This is the primary
+    /// way the social signal gets useful data — searching for exact CAs
+    /// finds people actually discussing the token.
+    pub async fn poll_social_tokens(&self, addresses: &[String], max_tokens: usize) {
+        for strategy in &self.strategies {
+            if let StrategyKind::Social(ss) = strategy {
+                ss.poll_token_cas(addresses, max_tokens).await;
+            }
+        }
     }
 
     /// Evaluate all strategies for a token and produce a composite score.
@@ -1102,4 +1164,254 @@ pub struct ConfluenceResult {
     pub signals: Vec<Signal>,
     /// Whether the score passes the confluence threshold.
     pub passed: bool,
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solagent_core::{Chain, TokenInfo};
+
+    fn make_token(address: &str, price: Option<f64>, volume: Option<f64>, mcap: Option<f64>, created_at: Option<DateTime<Utc>>) -> TokenInfo {
+        TokenInfo {
+            address: address.to_string(),
+            chain: Chain::Solana,
+            symbol: "TEST".to_string(),
+            name: "Test Token".to_string(),
+            decimals: 9,
+            price_usd: price,
+            market_cap_usd: mcap,
+            volume_24h: volume,
+            holder_count: None,
+            created_at,
+            pair_address: Some("pair123".to_string()),
+            lp_locked: None,
+            mint_authority_revoked: None,
+            freeze_authority_revoked: None,
+        }
+    }
+
+    // ─── AccumulationSignal Tests ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_accumulation_with_holder_data_scores_nonzero() {
+        let signal = AccumulationSignal::new(Chain::Solana, 10);
+        let token_ca = "test_accumulation_token";
+
+        // Record 3 snapshots: holders growing, price flat.
+        signal.record_snapshot(token_ca.to_string(), 100, 1.0);
+        signal.record_snapshot(token_ca.to_string(), 150, 1.02);
+        signal.record_snapshot(token_ca.to_string(), 200, 1.05);
+
+        let token = make_token(token_ca, Some(1.05), None, None, None);
+        let result = signal.evaluate(&token).await.unwrap();
+
+        assert_eq!(result.strategy, "accumulation");
+        assert!(result.score >= 40, "Accumulation should score >= 40 with 100% holder growth and flat price, got {}", result.score);
+    }
+
+    #[tokio::test]
+    async fn test_accumulation_no_history_returns_zero() {
+        let signal = AccumulationSignal::new(Chain::Solana, 10);
+        let token = make_token("unknown_token", Some(1.0), None, None, None);
+        let result = signal.evaluate(&token).await.unwrap();
+        assert_eq!(result.score, 0);
+    }
+
+    #[tokio::test]
+    async fn test_accumulation_single_snapshot_returns_zero() {
+        let signal = AccumulationSignal::new(Chain::Solana, 10);
+        signal.record_snapshot("token_single".to_string(), 100, 1.0);
+
+        let token = make_token("token_single", Some(1.0), None, None, None);
+        let result = signal.evaluate(&token).await.unwrap();
+        assert_eq!(result.score, 0, "Single snapshot should not produce a score");
+    }
+
+    #[tokio::test]
+    async fn test_accumulation_declining_holders_low_score() {
+        let signal = AccumulationSignal::new(Chain::Solana, 10);
+        // Holders declining — should NOT trigger accumulation.
+        signal.record_snapshot("declining".to_string(), 200, 1.0);
+        signal.record_snapshot("declining".to_string(), 150, 1.02);
+
+        let token = make_token("declining", Some(1.02), None, None, None);
+        let result = signal.evaluate(&token).await.unwrap();
+        // With declining holders (negative growth), score should be 20 (the "else" branch).
+        assert!(result.score <= 20, "Declining holders should score low, got {}", result.score);
+    }
+
+    // ─── LaunchMomentumSignal Tests ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_launch_momentum_with_holders_scores_nonzero() {
+        let signal = LaunchMomentumSignal::new(Chain::Solana, 10);
+        let token_ca = "launch_token";
+
+        // Record growing volume and holders.
+        signal.record(token_ca.to_string(), 1000.0, 50);
+        signal.record(token_ca.to_string(), 5000.0, 200);
+        signal.record(token_ca.to_string(), 15000.0, 500);
+
+        let created = Utc::now() - chrono::Duration::minutes(30); // 30 min old
+        let token = make_token(token_ca, Some(0.001), Some(15000.0), Some(50000.0), Some(created));
+        let result = signal.evaluate(&token).await.unwrap();
+
+        assert_eq!(result.strategy, "launch_momentum");
+        assert!(result.score > 0, "Launch momentum should score > 0 with growing volume + holders, got {}", result.score);
+    }
+
+    #[tokio::test]
+    async fn test_launch_momentum_no_snapshots_returns_zero() {
+        let signal = LaunchMomentumSignal::new(Chain::Solana, 10);
+        let created = Utc::now() - chrono::Duration::minutes(30);
+        let token = make_token("no_snaps", Some(0.001), Some(1000.0), Some(50000.0), Some(created));
+        let result = signal.evaluate(&token).await.unwrap();
+        assert_eq!(result.score, 0);
+    }
+
+    #[tokio::test]
+    async fn test_launch_momentum_too_old_returns_zero() {
+        let signal = LaunchMomentumSignal::new(Chain::Solana, 10);
+        let token_ca = "old_token";
+
+        signal.record(token_ca.to_string(), 1000.0, 50);
+        signal.record(token_ca.to_string(), 5000.0, 200);
+
+        // Token is 48 hours old — exceeds max_age_hours=1.
+        let created = Utc::now() - chrono::Duration::hours(48);
+        let token = make_token(token_ca, Some(0.001), Some(5000.0), Some(50000.0), Some(created));
+        let result = signal.evaluate(&token).await.unwrap();
+        assert_eq!(result.score, 0, "Old token should score 0 for launch momentum");
+    }
+
+    // ─── VolumeSpikeSignal Tests ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_volume_spike_with_enough_data_scores_nonzero() {
+        let signal = VolumeSpikeSignal::new(Chain::Solana, 3.0, 10);
+        let token_ca = "spike_token";
+
+        // 4 data points where the last is 4x the average.
+        signal.record(token_ca.to_string(), 1000.0);
+        signal.record(token_ca.to_string(), 1200.0);
+        signal.record(token_ca.to_string(), 1100.0);
+        signal.record(token_ca.to_string(), 50000.0); // Spike!
+
+        let token = make_token(token_ca, Some(0.001), Some(50000.0), None, None);
+        let result = signal.evaluate(&token).await.unwrap();
+
+        assert_eq!(result.strategy, "volume_spike");
+        assert!(result.score >= 80, "4x spike should score >= 80, got {}", result.score);
+    }
+
+    #[tokio::test]
+    async fn test_volume_spike_insufficient_data_returns_zero() {
+        let signal = VolumeSpikeSignal::new(Chain::Solana, 3.0, 10);
+        let token_ca = "low_data_token";
+
+        signal.record(token_ca.to_string(), 1000.0);
+        signal.record(token_ca.to_string(), 5000.0); // Only 2 points.
+
+        let token = make_token(token_ca, Some(0.001), Some(5000.0), None, None);
+        let result = signal.evaluate(&token).await.unwrap();
+        assert_eq!(result.score, 0, "Fewer than 3 data points should score 0");
+    }
+
+    // ─── Confluence Scorer Tests ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_confluence_weighted_scoring_accurate() {
+        let mut scorer = ConfluenceScorer::new(35.0);
+
+        // Add just accumulation and volume spike for a clean test.
+        scorer.add_strategy(
+            StrategyKind::Accumulation(AccumulationSignal::new(Chain::Solana, 10)),
+            0.20,
+        );
+        scorer.add_strategy(
+            StrategyKind::VolumeSpike(VolumeSpikeSignal::new(Chain::Solana, 3.0, 10)),
+            0.15,
+        );
+
+        // Feed data to both signals.
+        scorer.feed_scan_data("token_a", Some(10000.0), Some(100), Some(1.0));
+        scorer.feed_scan_data("token_a", Some(12000.0), Some(150), Some(1.02));
+        scorer.feed_scan_data("token_a", Some(11000.0), Some(200), Some(1.05));
+        // Volume spike: 4x+ jump
+        scorer.feed_scan_data("token_a", Some(50000.0), Some(250), Some(1.05));
+
+        let token = make_token("token_a", Some(1.05), Some(50000.0), Some(50000.0), None);
+        let result = scorer.score(&token).await.unwrap();
+
+        // Both signals should score > 0.
+        let acc_signal = result.signals.iter().find(|s| s.strategy == "accumulation").unwrap();
+        let vol_signal = result.signals.iter().find(|s| s.strategy == "volume_spike").unwrap();
+
+        assert!(acc_signal.score > 0, "Accumulation should be > 0");
+        assert!(vol_signal.score > 0, "Volume spike should be > 0");
+
+        // Verify composite is weighted correctly.
+        let expected_composite = (acc_signal.score as f64 * 0.20 + vol_signal.score as f64 * 0.15) / (0.20 + 0.15);
+        let diff = (result.composite_score as f64 - expected_composite).abs();
+        assert!(diff <= 1.0, "Composite should be within ±1 of weighted sum: got {}, expected {}", result.composite_score, expected_composite);
+    }
+
+    /// Test that feed_scan_data distributes data to all three dependent signals.
+    #[tokio::test]
+    async fn test_feed_scan_data_distributes_to_all_signals() {
+        let mut scorer = ConfluenceScorer::new(35.0);
+
+        let acc = AccumulationSignal::new(Chain::Solana, 10);
+        let lm = LaunchMomentumSignal::new(Chain::Solana, 10);
+        let vs = VolumeSpikeSignal::new(Chain::Solana, 3.0, 10);
+
+        scorer.add_strategy(StrategyKind::Accumulation(acc), 0.20);
+        scorer.add_strategy(StrategyKind::LaunchMomentum(lm), 0.20);
+        scorer.add_strategy(StrategyKind::VolumeSpike(vs), 0.15);
+
+        // Feed 4 data points with volume, holders, and price.
+        let token_ca = "dist_token";
+        scorer.feed_scan_data(token_ca, Some(10000.0), Some(100), Some(1.0));
+        scorer.feed_scan_data(token_ca, Some(12000.0), Some(150), Some(1.02));
+        scorer.feed_scan_data(token_ca, Some(11000.0), Some(200), Some(1.05));
+        scorer.feed_scan_data(token_ca, Some(50000.0), Some(300), Some(1.06));
+
+        // Evaluate and check all three scored.
+        let created = Utc::now() - chrono::Duration::minutes(30);
+        let token = make_token(token_ca, Some(1.06), Some(50000.0), Some(50000.0), Some(created));
+        let result = scorer.score(&token).await.unwrap();
+
+        let acc_score = result.signals.iter().find(|s| s.strategy == "accumulation").map(|s| s.score).unwrap_or(0);
+        let lm_score = result.signals.iter().find(|s| s.strategy == "launch_momentum").map(|s| s.score).unwrap_or(0);
+        let vs_score = result.signals.iter().find(|s| s.strategy == "volume_spike").map(|s| s.score).unwrap_or(0);
+
+        assert!(acc_score > 0, "Accumulation should score > 0 after feed_scan_data with holders, got {}", acc_score);
+        assert!(lm_score > 0, "Launch momentum should score > 0 after feed_scan_data with volume+holders, got {}", lm_score);
+        assert!(vs_score > 0, "Volume spike should score > 0 after feed_scan_data with volume, got {}", vs_score);
+    }
+
+    /// Test feed_scan_data with holder_count: None does NOT feed accumulation signal.
+    #[tokio::test]
+    async fn test_feed_scan_data_none_holders_skips_accumulation() {
+        let mut scorer = ConfluenceScorer::new(35.0);
+        scorer.add_strategy(StrategyKind::Accumulation(AccumulationSignal::new(Chain::Solana, 10)), 0.20);
+        scorer.add_strategy(StrategyKind::VolumeSpike(VolumeSpikeSignal::new(Chain::Solana, 3.0, 10)), 0.15);
+
+        // Feed without holder_count (None).
+        scorer.feed_scan_data("no_holder_token", Some(10000.0), None, Some(1.0));
+        scorer.feed_scan_data("no_holder_token", Some(12000.0), None, Some(1.02));
+        scorer.feed_scan_data("no_holder_token", Some(11000.0), None, Some(1.05));
+        scorer.feed_scan_data("no_holder_token", Some(50000.0), None, Some(1.06));
+
+        let token = make_token("no_holder_token", Some(1.06), Some(50000.0), None, None);
+        let result = scorer.score(&token).await.unwrap();
+
+        let acc_score = result.signals.iter().find(|s| s.strategy == "accumulation").map(|s| s.score).unwrap_or(0);
+        let vs_score = result.signals.iter().find(|s| s.strategy == "volume_spike").map(|s| s.score).unwrap_or(0);
+
+        assert_eq!(acc_score, 0, "Accumulation should be 0 when no holder data provided");
+        assert!(vs_score > 0, "Volume spike should still score > 0 with volume data");
+    }
 }
