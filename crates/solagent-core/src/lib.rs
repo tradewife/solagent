@@ -312,6 +312,150 @@ impl Clone for EventBus {
     }
 }
 
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_wallet_buy_event(wallet: &str, token: &str, amount: f64) -> Event {
+        Event::WalletBuy {
+            wallet: wallet.to_string(),
+            token_address: token.to_string(),
+            chain: Chain::Solana,
+            amount_usd: amount,
+            timestamp: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_eventbus_publish_subscribe_basic() {
+        let bus = EventBus::new(16);
+        let mut rx = bus.subscribe();
+
+        let event = make_wallet_buy_event("wallet1", "token1", 100.0);
+        bus.publish(event);
+
+        let received = rx.try_recv().expect("Should receive published event");
+        match received {
+            Event::WalletBuy { wallet, token_address, amount_usd, .. } => {
+                assert_eq!(wallet, "wallet1");
+                assert_eq!(token_address, "token1");
+                assert!((amount_usd - 100.0).abs() < f64::EPSILON);
+            }
+            _ => panic!("Expected WalletBuy event"),
+        }
+    }
+
+    #[test]
+    fn test_eventbus_clone_shares_channel() {
+        let bus1 = EventBus::new(16);
+        let bus2 = bus1.clone();
+
+        let mut rx1 = bus1.subscribe();
+        let mut rx2 = bus2.subscribe();
+
+        // Publish on bus2, receive on both.
+        let event = make_wallet_buy_event("w", "t", 50.0);
+        bus2.publish(event.clone());
+
+        assert!(rx1.try_recv().is_ok(), "bus1 subscriber should receive events published on bus2");
+        assert!(rx2.try_recv().is_ok(), "bus2 subscriber should receive events published on bus2");
+    }
+
+    #[test]
+    fn test_eventbus_multiple_events() {
+        let bus = EventBus::new(64);
+        let mut rx = bus.subscribe();
+
+        for i in 0..5 {
+            bus.publish(make_wallet_buy_event(&format!("w{i}"), "token1", 10.0));
+        }
+
+        let mut count = 0;
+        while rx.try_recv().is_ok() {
+            count += 1;
+        }
+        assert_eq!(count, 5, "Should receive all 5 events");
+    }
+
+    #[test]
+    fn test_eventbus_subscriber_receives_only_after_subscribe() {
+        let bus = EventBus::new(16);
+
+        // Publish before subscribing.
+        bus.publish(make_wallet_buy_event("early", "t", 1.0));
+
+        let mut rx = bus.subscribe();
+
+        // Publish after subscribing.
+        bus.publish(make_wallet_buy_event("late", "t", 2.0));
+
+        // Only the late event should be received.
+        let received = rx.try_recv().expect("Should receive late event");
+        match received {
+            Event::WalletBuy { wallet, .. } => assert_eq!(wallet, "late"),
+            _ => panic!("Expected WalletBuy event"),
+        }
+        assert!(rx.try_recv().is_err(), "Should not receive pre-subscription events");
+    }
+
+    #[test]
+    fn test_eventbus_different_event_types() {
+        let bus = EventBus::new(16);
+        let mut rx = bus.subscribe();
+
+        bus.publish(Event::WalletBuy {
+            wallet: "w1".to_string(),
+            token_address: "t1".to_string(),
+            chain: Chain::Solana,
+            amount_usd: 10.0,
+            timestamp: Utc::now(),
+        });
+        bus.publish(Event::WalletSell {
+            wallet: "w2".to_string(),
+            token_address: "t2".to_string(),
+            chain: Chain::Solana,
+            amount_usd: 20.0,
+            timestamp: Utc::now(),
+        });
+        bus.publish(Event::TokenDiscovered {
+            token: TokenInfo {
+                address: "t3".to_string(),
+                chain: Chain::Solana,
+                symbol: "TEST".to_string(),
+                name: "Test".to_string(),
+                decimals: 9,
+                price_usd: None,
+                market_cap_usd: None,
+                volume_24h: None,
+                holder_count: None,
+                created_at: None,
+                pair_address: None,
+                lp_locked: None,
+                mint_authority_revoked: None,
+                freeze_authority_revoked: None,
+            },
+            timestamp: Utc::now(),
+        });
+
+        let mut buy_count = 0;
+        let mut sell_count = 0;
+        let mut discovered_count = 0;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                Event::WalletBuy { .. } => buy_count += 1,
+                Event::WalletSell { .. } => sell_count += 1,
+                Event::TokenDiscovered { .. } => discovered_count += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(buy_count, 1);
+        assert_eq!(sell_count, 1);
+        assert_eq!(discovered_count, 1);
+    }
+}
+
 // ─── Re-exports ──────────────────────────────────────────────────────────────
 
 pub use anyhow;
