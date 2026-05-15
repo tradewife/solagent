@@ -550,16 +550,21 @@ impl VolumeSpikeSignal {
         }
     }
 
-    /// Get the current ratio of latest volume to rolling average.
+    /// Get the current ratio of latest volume to rolling historical average.
+    /// The average is computed from all data points EXCEPT the latest, making
+    /// this a true "spike vs history" comparison. Requires ≥3 data points.
     pub fn get_spike_ratio(&self, token_address: &str) -> Option<f64> {
         let vols = self.volumes.get(token_address)?;
         if vols.len() < 3 {
             return None;
         }
-        let avg: f64 = vols.iter().map(|v| v.0).sum::<f64>() / vols.len() as f64;
+        // Historical average: all points except the latest (current spike).
+        let hist_count = vols.len() - 1;
+        let hist_sum: f64 = vols.iter().take(hist_count).map(|v| v.0).sum::<f64>();
+        let hist_avg = hist_sum / hist_count as f64;
         let current = vols.back().map(|v| v.0).unwrap_or(0.0);
-        if avg > 0.0 {
-            Some(current / avg)
+        if hist_avg > 0.0 {
+            Some(current / hist_avg)
         } else {
             None
         }
@@ -580,14 +585,21 @@ impl Strategy for VolumeSpikeSignal {
                     &self.name,
                     0,
                     0.0,
-                    "Insufficient volume history".to_string(),
+                    format!(
+                        "Insufficient volume history ({} points, need ≥3)",
+                        vols.len()
+                    ),
                 ));
             }
-            let avg: f64 = vols.iter().map(|v| v.0).sum::<f64>() / vols.len() as f64;
+            // Historical average: all points except the latest (current spike).
+            // This makes spike detection meaningful — comparing current to prior history.
+            let hist_count = vols.len() - 1;
+            let hist_sum: f64 = vols.iter().take(hist_count).map(|v| v.0).sum::<f64>();
+            let hist_avg = hist_sum / hist_count as f64;
             let current = vols.back().map(|v| v.0).unwrap_or(0.0);
 
-            if avg > 0.0 {
-                let ratio = current / avg;
+            if hist_avg > 0.0 {
+                let ratio = current / hist_avg;
                 if ratio >= self.threshold {
                     // Scale score proportionally: 3x = 80, 5x+ = 100.
                     let raw = 50.0 + (ratio / self.threshold * 30.0).min(50.0);
@@ -1328,6 +1340,116 @@ mod tests {
         let token = make_token(token_ca, Some(0.001), Some(5000.0), None, None);
         let result = signal.evaluate(&token).await.unwrap();
         assert_eq!(result.score, 0, "Fewer than 3 data points should score 0");
+    }
+
+    /// Test: With exactly 3 data points and a clear spike (latest ≥3x historical avg),
+    /// the signal scores ≥80. Validates VAL-SIG-004.
+    #[tokio::test]
+    async fn test_volume_spike_three_points_clear_spike_scores_80_plus() {
+        let signal = VolumeSpikeSignal::new(Chain::Solana, 3.0, 10);
+        let token_ca = "spike_3pt_token";
+
+        // 3 data points: historical avg = (1000+1200)/2 = 1100, current = 50000 → ratio = 45.5x
+        signal.record(token_ca.to_string(), 1000.0);
+        signal.record(token_ca.to_string(), 1200.0);
+        signal.record(token_ca.to_string(), 50000.0); // Spike!
+
+        let token = make_token(token_ca, Some(0.001), Some(50000.0), None, None);
+        let result = signal.evaluate(&token).await.unwrap();
+
+        assert_eq!(result.strategy, "volume_spike");
+        assert!(result.score >= 80, "3-point clear spike (≥3x historical avg) should score ≥80, got {}", result.score);
+    }
+
+    /// Test: With exactly 3 data points but NO spike (volume near historical avg),
+    /// the signal scores low (≤50).
+    #[tokio::test]
+    async fn test_volume_spike_three_points_no_spike_scores_low() {
+        let signal = VolumeSpikeSignal::new(Chain::Solana, 3.0, 10);
+        let token_ca = "nospike_3pt_token";
+
+        // 3 data points: historical avg = (1000+1200)/2 = 1100, current = 1300 → ratio = 1.18x
+        signal.record(token_ca.to_string(), 1000.0);
+        signal.record(token_ca.to_string(), 1200.0);
+        signal.record(token_ca.to_string(), 1300.0);
+
+        let token = make_token(token_ca, Some(0.001), Some(1300.0), None, None);
+        let result = signal.evaluate(&token).await.unwrap();
+
+        assert!(result.score <= 50, "3-point no-spike should score ≤50, got {}", result.score);
+    }
+
+    /// Test: Volume history accumulates correctly across multiple record() calls,
+    /// respecting the rolling window (window_size).
+    #[tokio::test]
+    async fn test_volume_spike_history_accumulates_respects_window() {
+        let signal = VolumeSpikeSignal::new(Chain::Solana, 3.0, 5); // window_size=5
+        let token_ca = "window_token";
+
+        // Record 7 data points — only last 5 should be kept.
+        for vol in [100.0, 200.0, 300.0, 400.0, 500.0, 600.0, 700.0] {
+            signal.record(token_ca.to_string(), vol);
+        }
+
+        // With window_size=5, we have [300, 400, 500, 600, 700].
+        // Historical avg (excluding latest) = (300+400+500+600)/4 = 450.
+        // Current = 700, ratio = 700/450 = 1.56x. Below threshold, should score low.
+        let token = make_token(token_ca, Some(0.001), Some(700.0), None, None);
+        let result = signal.evaluate(&token).await.unwrap();
+
+        // Score should be based on only the last 5 points.
+        // ratio = 1.56x < threshold*0.66 (1.98) → score should be 10 (the "else" branch).
+        assert!(result.score <= 50, "Windowed data with no spike should score low, got {}", result.score);
+
+        // Verify get_spike_ratio is consistent.
+        let ratio = signal.get_spike_ratio(token_ca);
+        assert!(ratio.is_some(), "Should have a spike ratio with 5 points");
+        let r = ratio.unwrap();
+        assert!((r - 1.556).abs() < 0.1, "Spike ratio should be ~1.56x, got {r}");
+    }
+
+    /// Test: get_spike_ratio returns None for tokens with <3 data points,
+    /// and returns the correct ratio for tokens with ≥3 points.
+    #[tokio::test]
+    async fn test_volume_spike_get_spike_ratio() {
+        let signal = VolumeSpikeSignal::new(Chain::Solana, 3.0, 10);
+
+        // No data → None.
+        assert!(signal.get_spike_ratio("unknown").is_none());
+
+        // 1 point → None (needs ≥3).
+        signal.record("ratio_token".to_string(), 1000.0);
+        assert!(signal.get_spike_ratio("ratio_token").is_none());
+
+        // 2 points → None (needs ≥3).
+        signal.record("ratio_token".to_string(), 1200.0);
+        assert!(signal.get_spike_ratio("ratio_token").is_none());
+
+        // 3 points → Some(ratio).
+        signal.record("ratio_token".to_string(), 6000.0);
+        let ratio = signal.get_spike_ratio("ratio_token");
+        assert!(ratio.is_some(), "Should return ratio with 3 data points");
+        // Historical avg = (1000+1200)/2 = 1100. Current = 6000. Ratio = 6000/1100 = 5.45x
+        let r = ratio.unwrap();
+        assert!((r - 5.45).abs() < 0.1, "Spike ratio should be ~5.45x, got {r}");
+    }
+
+    /// Test: Single data point returns score 0 (minimum is 3).
+    #[tokio::test]
+    async fn test_volume_spike_single_point_returns_zero() {
+        let signal = VolumeSpikeSignal::new(Chain::Solana, 3.0, 10);
+        let token_ca = "single_pt";
+
+        signal.record(token_ca.to_string(), 100000.0); // Huge volume but only 1 point.
+
+        let token = make_token(token_ca, Some(0.001), Some(100000.0), None, None);
+        let result = signal.evaluate(&token).await.unwrap();
+        assert_eq!(result.score, 0, "Single data point should always score 0, got {}", result.score);
+        assert!(
+            result.reason.contains("Insufficient"),
+            "Reason should mention insufficient data, got: {}",
+            result.reason
+        );
     }
 
     // ─── Confluence Scorer Tests ─────────────────────────────────────────
