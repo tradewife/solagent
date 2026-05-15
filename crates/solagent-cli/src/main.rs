@@ -243,6 +243,8 @@ enum DbAction {
     Reset,
     /// Show database stats
     Stats,
+    /// Show evaluation statistics
+    EvalStats,
 }
 
 #[tokio::main]
@@ -860,6 +862,38 @@ async fn main() -> Result<()> {
                 println!("  Open positions:      {}", positions.len());
                 println!("  Total trades:        {}", pnl.total_trades);
                 println!("  Total PnL:           ${:.2}", pnl.total_pnl);
+            }
+            DbAction::EvalStats => {
+                let pool = solagent_portfolio::db::init_pool(DEFAULT_DB_PATH).await?;
+                let pm = solagent_portfolio::PortfolioManager::new(pool);
+
+                let stats = pm.get_eval_stats().await?;
+
+                if stats.total_evaluations == 0 {
+                    println!("No evaluations recorded yet.");
+                    return Ok(());
+                }
+
+                println!("Evaluation Statistics:");
+                println!("  Total evaluations:   {}", stats.total_evaluations);
+                println!("  Passed:              {} ({:.1}%)", stats.passed_evaluations, stats.pass_rate * 100.0);
+                println!("  Failed:              {}", stats.failed_evaluations);
+                println!("  Avg confluence:      {:.1}", stats.avg_confluence_score);
+                println!("  Avg safety:          {:.1}", stats.avg_safety_score);
+
+                if !stats.top_tokens.is_empty() {
+                    println!("\n  Top-scoring tokens:");
+                    println!("  {:<45} {:>10} {:>8}", "Token", "Avg Conf", "Evals");
+                    println!("  {}", "-".repeat(65));
+                    for (addr, avg, count) in &stats.top_tokens {
+                        let display_addr = if addr.len() > 44 {
+                            format!("{}...{}", &addr[..20], &addr[addr.len()-20..])
+                        } else {
+                            addr.clone()
+                        };
+                        println!("  {:<45} {:>10.1} {:>8}", display_addr, avg, count);
+                    }
+                }
             }
         },
     }

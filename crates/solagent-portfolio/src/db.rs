@@ -80,6 +80,18 @@ CREATE TABLE IF NOT EXISTS snapshots (
     created_at TEXT NOT NULL
 );
 
+-- Evaluation results persisted for every evaluate() call
+CREATE TABLE IF NOT EXISTS evaluations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    token_address TEXT NOT NULL,
+    confluence_score INTEGER NOT NULL,
+    safety_score INTEGER NOT NULL,
+    signal_scores TEXT NOT NULL DEFAULT '{}',
+    passed INTEGER NOT NULL DEFAULT 0,
+    reasoning TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_wallets_label ON wallets(label);
 CREATE INDEX IF NOT EXISTS idx_wallets_score ON wallets(score DESC);
 CREATE INDEX IF NOT EXISTS idx_wallets_chain ON wallets(chain);
@@ -88,6 +100,8 @@ CREATE INDEX IF NOT EXISTS idx_positions_token ON positions(token_address);
 CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
 CREATE INDEX IF NOT EXISTS idx_trades_token ON trades(token_address);
 CREATE INDEX IF NOT EXISTS idx_trades_executed ON trades(executed_at);
+CREATE INDEX IF NOT EXISTS idx_evaluations_token ON evaluations(token_address);
+CREATE INDEX IF NOT EXISTS idx_evaluations_created ON evaluations(created_at);
 "#;
 
 /// Open a SQLite pool and run all migrations.

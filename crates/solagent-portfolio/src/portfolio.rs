@@ -7,6 +7,35 @@ use solagent_core::Chain;
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
+// ─── Evaluation Record ───────────────────────────────────────────────────────
+
+/// A persisted evaluation result for a token.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvaluationRecord {
+    pub id: i64,
+    pub token_address: String,
+    pub confluence_score: u8,
+    pub safety_score: u8,
+    /// JSON object: {"whale_consensus": N, "accumulation": N, "launch_momentum": N, "volume_spike": N, "social": N}
+    pub signal_scores: String,
+    pub passed: bool,
+    pub reasoning: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Statistics over all persisted evaluations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvalStats {
+    pub total_evaluations: i64,
+    pub passed_evaluations: i64,
+    pub failed_evaluations: i64,
+    pub pass_rate: f64,
+    pub avg_confluence_score: f64,
+    pub avg_safety_score: f64,
+    /// Top-scoring tokens by confluence (token_address, avg_confluence, eval_count).
+    pub top_tokens: Vec<(String, f64, i64)>,
+}
+
 // ─── Position Status ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -361,6 +390,105 @@ impl PortfolioManager {
         .await?;
         Ok(())
     }
+
+    // ─── Evaluation Persistence ──────────────────────────────────────────
+
+    /// Insert an evaluation result into the evaluations table.
+    /// `signal_scores` should be a JSON object like {"whale_consensus": 30, ...}.
+    pub async fn insert_evaluation(
+        &self,
+        token_address: &str,
+        confluence_score: u8,
+        safety_score: u8,
+        signal_scores: &str,
+        passed: bool,
+        reasoning: &str,
+    ) -> Result<i64> {
+        let now_str = Utc::now().to_rfc3339();
+        let passed_int = if passed { 1 } else { 0 };
+
+        let result = sqlx::query(
+            r#"INSERT INTO evaluations (token_address, confluence_score, safety_score,
+               signal_scores, passed, reasoning, created_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
+        )
+        .bind(token_address)
+        .bind(confluence_score as i32)
+        .bind(safety_score as i32)
+        .bind(signal_scores)
+        .bind(passed_int)
+        .bind(reasoning)
+        .bind(&now_str)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Query evaluations by token address, ordered by most recent first.
+    pub async fn get_evaluations_by_token(
+        &self,
+        token_address: &str,
+        limit: i64,
+    ) -> Result<Vec<EvaluationRecord>> {
+        let rows = sqlx::query_as::<_, EvaluationRow>(
+            "SELECT * FROM evaluations WHERE token_address = ?1 ORDER BY created_at DESC LIMIT ?2",
+        )
+        .bind(token_address)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(|r| r.into_record()).collect())
+    }
+
+    /// Get aggregate statistics over all evaluations.
+    pub async fn get_eval_stats(&self) -> Result<EvalStats> {
+        let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM evaluations")
+            .fetch_one(&self.pool)
+            .await?;
+
+        let passed: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM evaluations WHERE passed = 1")
+            .fetch_one(&self.pool)
+            .await?;
+
+        // Use COALESCE so empty tables return 0.0 instead of NULL.
+        let (avg_confluence, avg_safety): (f64, f64) = sqlx::query_as(
+            "SELECT COALESCE(AVG(confluence_score), 0.0), COALESCE(AVG(safety_score), 0.0) FROM evaluations",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        // Top 5 tokens by average confluence score (min 1 evaluation).
+        let top_rows: Vec<(String, f64, i64)> = sqlx::query_as(
+            r#"SELECT token_address, AVG(confluence_score) as avg_c, COUNT(*) as cnt
+               FROM evaluations
+               GROUP BY token_address
+               ORDER BY avg_c DESC
+               LIMIT 5"#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let total_evals = total.0;
+        let passed_evals = passed.0;
+        let failed_evals = total_evals - passed_evals;
+        let pass_rate = if total_evals > 0 {
+            passed_evals as f64 / total_evals as f64
+        } else {
+            0.0
+        };
+
+        Ok(EvalStats {
+            total_evaluations: total_evals,
+            passed_evaluations: passed_evals,
+            failed_evaluations: failed_evals,
+            pass_rate,
+            avg_confluence_score: avg_confluence,
+            avg_safety_score: avg_safety,
+            top_tokens: top_rows,
+        })
+    }
 }
 
 // ─── Internal Row Types ──────────────────────────────────────────────────────
@@ -458,5 +586,181 @@ impl SnapshotRow {
                 .map(|dt| dt.to_utc())
                 .unwrap_or_default(),
         }
+    }
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct EvaluationRow {
+    id: i64,
+    token_address: String,
+    confluence_score: i32,
+    safety_score: i32,
+    signal_scores: String,
+    passed: i32,
+    reasoning: String,
+    created_at: String,
+}
+
+impl EvaluationRow {
+    fn into_record(self) -> EvaluationRecord {
+        EvaluationRecord {
+            id: self.id,
+            token_address: self.token_address,
+            confluence_score: self.confluence_score.clamp(0, 255) as u8,
+            safety_score: self.safety_score.clamp(0, 255) as u8,
+            signal_scores: self.signal_scores,
+            passed: self.passed != 0,
+            reasoning: self.reasoning,
+            created_at: DateTime::parse_from_rfc3339(&self.created_at)
+                .map(|dt| dt.to_utc())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: create an in-memory pool with migrations.
+    async fn test_pool() -> SqlitePool {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(crate::db::MIGRATION_SQL)
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn test_evaluations_table_created_on_startup() {
+        // If this doesn't panic, the migration (including evaluations table) worked.
+        let pool = test_pool().await;
+
+        // Verify the evaluations table exists by querying its schema.
+        let row: (String,) = sqlx::query_as(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='evaluations'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(row.0, "evaluations", "evaluations table should exist after migration");
+    }
+
+    #[tokio::test]
+    async fn test_insert_and_query_evaluation() {
+        let pool = test_pool().await;
+        let pm = PortfolioManager::new(pool);
+
+        let signal_scores = r#"{"whale_consensus":30,"accumulation":0,"launch_momentum":0,"volume_spike":80,"social":0}"#;
+
+        let id = pm.insert_evaluation(
+            "TokenABC123",
+            45,
+            72,
+            signal_scores,
+            false,
+            "confluence(45<65)",
+        ).await.unwrap();
+
+        assert!(id > 0, "Insert should return a positive row ID");
+
+        let evals = pm.get_evaluations_by_token("TokenABC123", 10).await.unwrap();
+        assert_eq!(evals.len(), 1);
+        assert_eq!(evals[0].token_address, "TokenABC123");
+        assert_eq!(evals[0].confluence_score, 45);
+        assert_eq!(evals[0].safety_score, 72);
+        assert!(!evals[0].passed);
+        assert_eq!(evals[0].reasoning, "confluence(45<65)");
+
+        // Verify signal_scores is valid JSON.
+        let parsed: serde_json::Value = serde_json::from_str(&evals[0].signal_scores).unwrap();
+        assert_eq!(parsed["whale_consensus"], 30);
+        assert_eq!(parsed["volume_spike"], 80);
+    }
+
+    #[tokio::test]
+    async fn test_query_evaluations_empty() {
+        let pool = test_pool().await;
+        let pm = PortfolioManager::new(pool);
+
+        let evals = pm.get_evaluations_by_token("nonexistent", 10).await.unwrap();
+        assert!(evals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_eval_stats_empty() {
+        let pool = test_pool().await;
+        let pm = PortfolioManager::new(pool);
+
+        let stats = pm.get_eval_stats().await.unwrap();
+        assert_eq!(stats.total_evaluations, 0);
+        assert_eq!(stats.passed_evaluations, 0);
+        assert_eq!(stats.failed_evaluations, 0);
+        assert!((stats.pass_rate - 0.0).abs() < f64::EPSILON);
+        assert!((stats.avg_confluence_score - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_eval_stats_with_data() {
+        let pool = test_pool().await;
+        let pm = PortfolioManager::new(pool);
+
+        // Insert 5 evaluations: 2 passed, 3 failed.
+        let signal_scores = "{}";
+        pm.insert_evaluation("token_A", 70, 80, signal_scores, true, "passed").await.unwrap();
+        pm.insert_evaluation("token_A", 65, 75, signal_scores, true, "passed").await.unwrap();
+        pm.insert_evaluation("token_B", 30, 50, signal_scores, false, "failed").await.unwrap();
+        pm.insert_evaluation("token_B", 25, 55, signal_scores, false, "failed").await.unwrap();
+        pm.insert_evaluation("token_C", 20, 40, signal_scores, false, "failed").await.unwrap();
+
+        let stats = pm.get_eval_stats().await.unwrap();
+        assert_eq!(stats.total_evaluations, 5);
+        assert_eq!(stats.passed_evaluations, 2);
+        assert_eq!(stats.failed_evaluations, 3);
+        assert!((stats.pass_rate - 0.4).abs() < 0.01, "pass_rate should be 0.4, got {}", stats.pass_rate);
+
+        // Average confluence: (70+65+30+25+20)/5 = 42.0
+        assert!((stats.avg_confluence_score - 42.0).abs() < 0.1,
+            "avg_confluence_score should be 42.0, got {}", stats.avg_confluence_score);
+
+        // Average safety: (80+75+50+55+40)/5 = 60.0
+        assert!((stats.avg_safety_score - 60.0).abs() < 0.1,
+            "avg_safety_score should be 60.0, got {}", stats.avg_safety_score);
+
+        // Top token should be token_A (avg 67.5).
+        assert!(!stats.top_tokens.is_empty(), "Should have top tokens");
+        assert_eq!(stats.top_tokens[0].0, "token_A");
+        assert!((stats.top_tokens[0].1 - 67.5).abs() < 0.1);
+        assert_eq!(stats.top_tokens[0].2, 2); // 2 evaluations
+    }
+
+    #[tokio::test]
+    async fn test_evaluations_multiple_same_token() {
+        let pool = test_pool().await;
+        let pm = PortfolioManager::new(pool);
+
+        // Insert 3 evaluations for the same token.
+        for i in 0..3 {
+            pm.insert_evaluation(
+                "same_token",
+                10 * (i + 1),
+                20 * (i + 1),
+                "{}",
+                i == 2,
+                &format!("eval {i}"),
+            ).await.unwrap();
+        }
+
+        let evals = pm.get_evaluations_by_token("same_token", 10).await.unwrap();
+        assert_eq!(evals.len(), 3);
+
+        // Should be ordered by most recent first.
+        assert_eq!(evals[0].confluence_score, 30);
+        assert_eq!(evals[1].confluence_score, 20);
+        assert_eq!(evals[2].confluence_score, 10);
     }
 }

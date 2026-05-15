@@ -897,6 +897,26 @@ impl Agent {
                                 // Evaluate each token.
                                 match self.evaluate(token).await {
                                     Ok(result) => {
+                                        // Persist every evaluation to SQLite.
+                                        let signal_scores_json = serde_json::json!({
+                                            "whale_consensus": result.signals.iter().find(|s| s.strategy == "whale_consensus").map(|s| s.score).unwrap_or(0),
+                                            "accumulation": result.signals.iter().find(|s| s.strategy == "accumulation").map(|s| s.score).unwrap_or(0),
+                                            "launch_momentum": result.signals.iter().find(|s| s.strategy == "launch_momentum").map(|s| s.score).unwrap_or(0),
+                                            "volume_spike": result.signals.iter().find(|s| s.strategy == "volume_spike").map(|s| s.score).unwrap_or(0),
+                                            "social": result.signals.iter().find(|s| s.strategy == "social").map(|s| s.score).unwrap_or(0),
+                                        }).to_string();
+
+                                        if let Err(e) = self.subsystems.portfolio.insert_evaluation(
+                                            &result.token_address,
+                                            result.confluence_score,
+                                            result.safety_score,
+                                            &signal_scores_json,
+                                            result.passed,
+                                            &result.reasoning,
+                                        ).await {
+                                            tracing::warn!(error = %e, "Failed to persist evaluation to DB");
+                                        }
+
                                         if result.passed {
                                             self.log_decision(Decision {
                                                 id: Uuid::new_v4(),
