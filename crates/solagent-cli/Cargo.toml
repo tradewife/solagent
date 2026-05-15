@@ -8,6 +8,11 @@ solagent-core = { path = "../solagent-core" }
 solagent-agent = { path = "../solagent-agent" }
 solagent-data = { path = "../solagent-data" }
 solagent-portfolio = { path = "../solagent-portfolio" }
+solagent-signals = { path = "../solagent-signals" }
+solagent-safety = { path = "../solagent-safety" }
+solagent-risk = { path = "../solagent-risk" }
+solagent-exec = { path = "../solagent-exec" }
+solagent-chain-solana = { path = "../solagent-chain-solana" }
 clap = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -17,3 +22,5 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
+ctrlc = "3"
+solana-sdk = { workspace = true }

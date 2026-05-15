@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 solagent-core = { path = "../solagent-core" }
+solagent-data = { path = "../solagent-data" }
 solana-sdk = { workspace = true }
 solana-client = { workspace = true }
 spl-token = { workspace = true }
@@ -16,3 +17,4 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 ed25519-dalek = { workspace = true }
 base64 = { workspace = true }
+bincode = "1"

@@ -1,3 +1,7 @@
+# SolAgent Local Configuration
+# This file is gitignored. Put your real keys and wallet here.
+# Copy from config/default.toml and override.
+
 [agent]
 name = "solagent"
 poll_interval_secs = 30
@@ -7,21 +11,19 @@ log_level = "info"
 [chains.solana]
 rpc_urls = ["https://api.mainnet-beta.solana.com"]
 ws_url = "wss://api.mainnet-beta.solana.com"
-helius_api_key = ""
-private_key_bs58 = ""
+helius_api_key = ""  # Set HELIUS_API_KEY env var instead, or paste here
+private_key_bs58 = ""  # Your trading wallet private key in base58 (or use config/trading-wallet.json)
 
 [risk]
-# Tuned for small wallet (< 1 SOL, ~$150)
 max_position_size_usd = 15.0
 max_portfolio_risk_pct = 25.0
 max_daily_loss_usd = 15.0
 max_drawdown_pct = 15.0
 max_open_positions = 3
 default_stop_loss_pct = 15.0
-default_take_profit_pct = 300.0
+default_take_profit_pct = 40.0
 cooldown_secs = 300
 safety_score_threshold = 70
-trailing_stop_pct = 15.0
 
 [strategies]
 active_strategies = ["whale_consensus", "accumulation", "launch_momentum", "volume_spike", "social"]

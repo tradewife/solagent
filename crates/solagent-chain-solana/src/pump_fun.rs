@@ -84,35 +84,125 @@ pub fn classify_instruction(data: &[u8]) -> Option<&'static [u8; 8]> {
 }
 
 /// Parse a pump.fun buy instruction from raw instruction data.
+///
+/// Pump.fun buy instruction data layout (after 8-byte discriminator):
+///   - [8..16] u64: token_amount
+///   - [16..24] u64: max_sol_cost
+///
+/// Accounts (in order):
+///   0: mint
+///   1: bonding_curve
+///   2: associated_bonding_curve
+///   3: associated_user
 pub fn parse_buy_event(
-    _data: &[u8],
-    _accounts: &[String],
-    _signature: String,
-    _slot: u64,
-    _block_time: Option<i64>,
+    data: &[u8],
+    accounts: &[String],
+    signature: String,
+    slot: u64,
+    block_time: Option<i64>,
 ) -> Option<PumpBuyEvent> {
-    // TODO: Deserialize accounts and data fields from the instruction.
-    todo!("Deserialize buy instruction accounts and data")
+    if data.len() < 24 || accounts.len() < 4 {
+        return None;
+    }
+    let token_amount = u64::from_le_bytes(data[8..16].try_into().ok()?);
+    let max_sol_cost = u64::from_le_bytes(data[16..24].try_into().ok()?);
+
+    Some(PumpBuyEvent {
+        mint: accounts[0].clone(),
+        bonding_curve: accounts[1].clone(),
+        associated_bonding_curve: accounts[2].clone(),
+        token_amount,
+        max_sol_cost,
+        signature,
+        slot,
+        block_time,
+    })
 }
 
 /// Parse a pump.fun sell instruction from raw instruction data.
+///
+/// Pump.fun sell instruction data layout (after 8-byte discriminator):
+///   - [8..16] u64: token_amount
+///   - [16..24] u64: min_sol_output
 pub fn parse_sell_event(
-    _data: &[u8],
-    _accounts: &[String],
-    _signature: String,
-    _slot: u64,
-    _block_time: Option<i64>,
+    data: &[u8],
+    accounts: &[String],
+    signature: String,
+    slot: u64,
+    block_time: Option<i64>,
 ) -> Option<PumpSellEvent> {
-    todo!("Deserialize sell instruction accounts and data")
+    if data.len() < 24 || accounts.len() < 4 {
+        return None;
+    }
+    let token_amount = u64::from_le_bytes(data[8..16].try_into().ok()?);
+    let min_sol_output = u64::from_le_bytes(data[16..24].try_into().ok()?);
+
+    Some(PumpSellEvent {
+        mint: accounts[0].clone(),
+        bonding_curve: accounts[1].clone(),
+        associated_bonding_curve: accounts[2].clone(),
+        token_amount,
+        min_sol_output,
+        signature,
+        slot,
+        block_time,
+    })
 }
 
 /// Parse a pump.fun create instruction from raw instruction data.
+///
+/// Pump.fun create instruction data layout (after 8-byte discriminator):
+///   - [8..12] u32: name_len
+///   - [12..12+name_len] bytes: name
+///   - [next 4] u32: symbol_len
+///   - [next+symbol_len] bytes: symbol
+///   - [next 4] u32: uri_len
+///   - [next+uri_len] bytes: uri
 pub fn parse_create_event(
-    _data: &[u8],
-    _accounts: &[String],
-    _signature: String,
-    _slot: u64,
-    _block_time: Option<i64>,
+    data: &[u8],
+    accounts: &[String],
+    signature: String,
+    slot: u64,
+    block_time: Option<i64>,
 ) -> Option<PumpCreateEvent> {
-    todo!("Deserialize create instruction accounts and data")
+    if data.len() < 12 || accounts.len() < 4 {
+        return None;
+    }
+
+    let mut offset = 8;
+
+    // Read name.
+    let name_len = u32::from_le_bytes(data[offset..offset+4].try_into().ok()?) as usize;
+    offset += 4;
+    if data.len() < offset + name_len { return None; }
+    let name = String::from_utf8_lossy(&data[offset..offset+name_len]).to_string();
+    offset += name_len;
+
+    // Read symbol.
+    if data.len() < offset + 4 { return None; }
+    let symbol_len = u32::from_le_bytes(data[offset..offset+4].try_into().ok()?) as usize;
+    offset += 4;
+    if data.len() < offset + symbol_len { return None; }
+    let symbol = String::from_utf8_lossy(&data[offset..offset+symbol_len]).to_string();
+    offset += symbol_len;
+
+    // Read uri.
+    if data.len() < offset + 4 { return None; }
+    let uri_len = u32::from_le_bytes(data[offset..offset+4].try_into().ok()?) as usize;
+    offset += 4;
+    if data.len() < offset + uri_len { return None; }
+    let uri = String::from_utf8_lossy(&data[offset..offset+uri_len]).to_string();
+
+    Some(PumpCreateEvent {
+        mint: accounts[0].clone(),
+        bonding_curve: accounts[1].clone(),
+        associated_bonding_curve: accounts[2].clone(),
+        name,
+        symbol,
+        uri,
+        creator: accounts.get(3).cloned().unwrap_or_default(),
+        signature,
+        slot,
+        block_time,
+    })
 }

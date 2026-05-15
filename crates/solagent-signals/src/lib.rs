@@ -1,35 +1,127 @@
 //! # solagent-signals
 //!
-//! Signal engine with strategy trait and confluence scoring.
+//! Signal engine with strategy trait, four implemented signal detectors,
+//! and confluence scoring.
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use solagent_core::{Chain, Signal, TokenInfo};
-use std::collections::VecDeque;
+use solagent_core::{Chain, Event, EventBus, Signal, TokenInfo};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::RwLock;
 
 // ─── Strategy Trait ──────────────────────────────────────────────────────────
 
 /// A strategy evaluates market conditions for a token and returns a signal score (0-100).
 #[allow(async_fn_in_trait)]
 pub trait Strategy: Send + Sync {
-    /// Name of the strategy.
     fn name(&self) -> &str;
-
-    /// Evaluate the strategy for the given token, returning a signal.
     async fn evaluate(&self, token: &TokenInfo) -> Result<Signal>;
+}
+
+// ─── Wallet Score Provider ───────────────────────────────────────────────────
+
+/// Trait for providing wallet scores from a registry.
+///
+/// The async variant is the real interface. Sync implementations are
+/// available for testing.
+#[allow(async_fn_in_trait)]
+pub trait WalletScoreProvider: Send + Sync {
+    /// Get the composite score (0-100) for a wallet, or None if unknown.
+    fn get_score(&self, address: &str) -> Option<f64>;
+    /// Check if a wallet is in the registry.
+    fn is_known(&self, address: &str) -> bool;
+}
+
+/// A simple in-memory wallet score provider for testing.
+pub struct InMemoryWalletScores {
+    scores: HashMap<String, f64>,
+}
+
+impl InMemoryWalletScores {
+    pub fn new() -> Self {
+        Self {
+            scores: HashMap::new(),
+        }
+    }
+
+    pub fn insert(&mut self, address: String, score: f64) {
+        self.scores.insert(address, score);
+    }
+}
+
+impl WalletScoreProvider for InMemoryWalletScores {
+    fn get_score(&self, address: &str) -> Option<f64> {
+        self.scores.get(address).copied()
+    }
+    fn is_known(&self, address: &str) -> bool {
+        self.scores.contains_key(address)
+    }
+}
+
+/// SQLite-backed wallet score cache that loads scores from the wallet registry
+/// into memory. Refreshes periodically via `refresh()`.
+///
+/// This bridges the async `WalletRegistry` (SQLite) to the sync `WalletScoreProvider`
+/// trait used by `WhaleConsensusSignal`.
+pub struct RegistryScoreCache {
+    scores: DashMap<String, f64>,
+    pool: sqlx::SqlitePool,
+}
+
+impl RegistryScoreCache {
+    /// Create a new cache backed by the given SQLite pool.
+    pub fn new(pool: sqlx::SqlitePool) -> Self {
+        Self {
+            scores: DashMap::new(),
+            pool,
+        }
+    }
+
+    /// Load all wallet scores from SQLite into the in-memory cache.
+    /// Call this on startup and periodically (e.g. every 5 minutes).
+    pub async fn refresh(&self) -> Result<()> {
+        let rows = sqlx::query_as::<_, (String, f64)>(
+            "SELECT address, score FROM wallets WHERE score > 0",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        self.scores.clear();
+        for (address, score) in &rows {
+            self.scores.insert(address.clone(), *score);
+        }
+
+        tracing::info!(count = rows.len(), "Refreshed wallet score cache");
+        Ok(())
+    }
+
+    /// Get the number of cached wallets.
+    pub fn len(&self) -> usize {
+        self.scores.len()
+    }
+}
+
+impl WalletScoreProvider for RegistryScoreCache {
+    fn get_score(&self, address: &str) -> Option<f64> {
+        self.scores.get(address).map(|g| *g)
+    }
+
+    fn is_known(&self, address: &str) -> bool {
+        self.scores.contains_key(address)
+    }
 }
 
 // ─── Whale Consensus Signal ──────────────────────────────────────────────────
 
 /// Tracks a sliding window of wallet buys per token to detect whale consensus.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct WalletBuyRecord {
     wallet: String,
     timestamp: DateTime<Utc>,
-    #[allow(dead_code)]
     amount_usd: f64,
 }
 
@@ -37,21 +129,43 @@ struct WalletBuyRecord {
 /// within a configurable time window.
 pub struct WhaleConsensusSignal {
     name: String,
-    /// Token address -> recent buys
+    /// Token address -> recent buys.
     buys: Arc<DashMap<String, VecDeque<WalletBuyRecord>>>,
-    /// Minimum number of distinct wallets to trigger
+    /// Minimum number of distinct wallets to trigger.
     min_wallets: usize,
-    /// Window duration in minutes
+    /// Window duration in minutes.
     window_minutes: i64,
-    /// Minimum buy amount per wallet
+    /// Minimum buy amount per wallet (USD).
     #[allow(dead_code)]
     min_buy_usd: f64,
     #[allow(dead_code)]
     chain: Chain,
+    /// Wallet score provider (from registry).
+    wallet_scores: Arc<RwLock<Box<dyn WalletScoreProvider>>>,
+}
+
+impl Clone for WhaleConsensusSignal {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            buys: Arc::clone(&self.buys),
+            min_wallets: self.min_wallets,
+            window_minutes: self.window_minutes,
+            min_buy_usd: self.min_buy_usd,
+            chain: self.chain,
+            wallet_scores: Arc::clone(&self.wallet_scores),
+        }
+    }
 }
 
 impl WhaleConsensusSignal {
-    pub fn new(chain: Chain, min_wallets: usize, window_minutes: i64, min_buy_usd: f64) -> Self {
+    pub fn new(
+        chain: Chain,
+        min_wallets: usize,
+        window_minutes: i64,
+        min_buy_usd: f64,
+        wallet_scores: Box<dyn WalletScoreProvider>,
+    ) -> Self {
         Self {
             name: "whale_consensus".to_string(),
             buys: Arc::new(DashMap::new()),
@@ -59,6 +173,7 @@ impl WhaleConsensusSignal {
             window_minutes,
             min_buy_usd,
             chain,
+            wallet_scores: Arc::new(RwLock::new(wallet_scores)),
         }
     }
 
@@ -70,6 +185,44 @@ impl WhaleConsensusSignal {
             timestamp: Utc::now(),
             amount_usd,
         });
+    }
+
+    /// Subscribe to the event bus and auto-record WalletBuy events.
+    /// Returns a join handle for the background task.
+    pub fn subscribe_to_events(self: &Arc<Self>, event_bus: &EventBus) -> tokio::task::JoinHandle<()> {
+        let mut rx = event_bus.subscribe();
+        let signal = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(Event::WalletBuy {
+                        wallet,
+                        token_address,
+                        amount_usd,
+                        ..
+                    }) => {
+                        let scores = signal.wallet_scores.read().await;
+                        if scores.is_known(&wallet) {
+                            drop(scores);
+                            tracing::debug!(
+                                wallet = &wallet[..wallet.len().min(12)],
+                                token = &token_address[..token_address.len().min(12)],
+                                amount_usd,
+                                "Recording smart wallet buy for whale consensus"
+                            );
+                            signal.record_buy(token_address, wallet, amount_usd);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(n, "Wallet buy event channel lagged");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        break;
+                    }
+                }
+            }
+        })
     }
 
     /// Prune expired records outside the time window.
@@ -90,15 +243,41 @@ impl Strategy for WhaleConsensusSignal {
 
     async fn evaluate(&self, token: &TokenInfo) -> Result<Signal> {
         self.prune_stale(&token.address);
+
+        let scores = self.wallet_scores.read().await;
         let score = if let Some(buys) = self.buys.get(&token.address) {
-            let distinct_wallets: std::collections::HashSet<&str> =
+            let distinct_wallets: HashSet<&str> =
                 buys.iter().map(|b| b.wallet.as_str()).collect();
             let count = distinct_wallets.len();
+
             if count >= self.min_wallets {
-                let ratio = (count as f64 / self.min_wallets as f64).min(1.0);
-                (ratio * 100.0) as u8
+                // Sum wallet scores for wallets we know about.
+                let wallet_score_sum: f64 = distinct_wallets
+                    .iter()
+                    .map(|w| scores.get_score(w).unwrap_or(50.0))
+                    .sum();
+                let max_possible = distinct_wallets.len() as f64 * 100.0;
+                let quality_ratio = if max_possible > 0.0 {
+                    wallet_score_sum / max_possible
+                } else {
+                    0.5
+                };
+
+                // Recency multiplier: more recent buys = higher score.
+                let newest = buys.back().map(|b| b.timestamp).unwrap_or_default();
+                let oldest = buys.front().map(|b| b.timestamp).unwrap_or_default();
+                let span_mins = (newest - oldest).num_minutes().max(1) as f64;
+                let recency_mult = 1.0 / (1.0 + span_mins / self.window_minutes as f64);
+
+                // Amount multiplier: larger buys = higher score.
+                let total_amount: f64 = buys.iter().map(|b| b.amount_usd).sum();
+                let amount_mult = (total_amount / 1000.0).min(2.0);
+
+                let base = (count as f64 / self.min_wallets as f64).min(3.0) * 33.0;
+                let raw = base * quality_ratio * recency_mult * amount_mult;
+                raw.clamp(0.0, 100.0) as u8
             } else {
-                ((count as f64 / self.min_wallets as f64) * 50.0) as u8
+                ((count as f64 / self.min_wallets as f64) * 50.0).clamp(0.0, 100.0) as u8
             }
         } else {
             0
@@ -120,7 +299,6 @@ impl Strategy for WhaleConsensusSignal {
 /// Detects accumulation patterns: holder growth vs. price stability.
 pub struct AccumulationSignal {
     name: String,
-    /// Token address -> (holder_count, price, timestamp) history
     history: Arc<DashMap<String, VecDeque<(u64, f64, DateTime<Utc>)>>>,
     max_history: usize,
     #[allow(dead_code)]
@@ -168,11 +346,13 @@ impl Strategy for AccumulationSignal {
             let last = hist.back().unwrap();
             let holder_growth = (last.0 as f64 - first.0 as f64) / first.0.max(1) as f64;
             let price_change = (last.1 - first.1) / first.1.max(0.0001);
-            // High holder growth + low price change = accumulation
+
             if holder_growth > 0.2 && price_change.abs() < 0.1 {
                 80
             } else if holder_growth > 0.1 && price_change.abs() < 0.2 {
                 60
+            } else if holder_growth > 0.05 && price_change.abs() < 0.3 {
+                40
             } else {
                 20
             }
@@ -196,9 +376,15 @@ impl Strategy for AccumulationSignal {
 /// Detects momentum in newly launched tokens (volume and holder rate).
 pub struct LaunchMomentumSignal {
     name: String,
-    /// Token address -> (volume, holder_count, timestamp)
     snapshots: Arc<DashMap<String, VecDeque<(f64, u64, DateTime<Utc>)>>>,
     max_snapshots: usize,
+    /// Minimum liquidity (USD) for a launch to qualify.
+    min_liquidity: f64,
+    /// Minimum holder count to qualify.
+    #[allow(dead_code)]
+    min_holders: u64,
+    /// Maximum age in hours to be considered a "launch".
+    max_age_hours: i64,
     #[allow(dead_code)]
     chain: Chain,
 }
@@ -209,6 +395,27 @@ impl LaunchMomentumSignal {
             name: "launch_momentum".to_string(),
             snapshots: Arc::new(DashMap::new()),
             max_snapshots,
+            min_liquidity: 5000.0,
+            min_holders: 50,
+            max_age_hours: 1,
+            chain,
+        }
+    }
+
+    pub fn with_filters(
+        chain: Chain,
+        max_snapshots: usize,
+        min_liquidity: f64,
+        min_holders: u64,
+        max_age_hours: i64,
+    ) -> Self {
+        Self {
+            name: "launch_momentum".to_string(),
+            snapshots: Arc::new(DashMap::new()),
+            max_snapshots,
+            min_liquidity,
+            min_holders,
+            max_age_hours,
             chain,
         }
     }
@@ -229,6 +436,37 @@ impl Strategy for LaunchMomentumSignal {
     }
 
     async fn evaluate(&self, token: &TokenInfo) -> Result<Signal> {
+        // Check age filter.
+        if let Some(created) = token.created_at {
+            let age_hours = (Utc::now() - created).num_hours();
+            if age_hours > self.max_age_hours {
+                return Ok(Signal::new(
+                    token.address.clone(),
+                    token.chain,
+                    &self.name,
+                    0,
+                    0.0,
+                    format!("Token too old ({age_hours}h > {}h max)", self.max_age_hours),
+                ));
+            }
+        }
+
+        // Check liquidity filter.
+        if let Some(_vol) = token.volume_24h {
+            if let Some(mc) = token.market_cap_usd {
+                if mc < self.min_liquidity {
+                    return Ok(Signal::new(
+                        token.address.clone(),
+                        token.chain,
+                        &self.name,
+                        0,
+                        0.0,
+                        format!("MC ${mc:.0} below ${} threshold", self.min_liquidity),
+                    ));
+                }
+            }
+        }
+
         let score = if let Some(snaps) = self.snapshots.get(&token.address) {
             if snaps.len() < 2 {
                 return Ok(Signal::new(
@@ -242,10 +480,18 @@ impl Strategy for LaunchMomentumSignal {
             }
             let first = snaps.front().unwrap();
             let last = snaps.back().unwrap();
+
             let volume_rate = last.0 / first.0.max(1.0);
             let holder_rate = last.1 as f64 / first.1.max(1) as f64;
+
+            // Holder growth rate (holders/min).
+            let span_mins = (last.2 - first.2).num_minutes().max(1) as f64;
+            let holder_growth_rate = (last.1 as f64 - first.1 as f64) / span_mins;
+
             let composite = (volume_rate + holder_rate) / 2.0;
-            (composite.min(2.0) * 50.0) as u8
+            let momentum_bonus = if holder_growth_rate > 10.0 { 20.0 } else if holder_growth_rate > 5.0 { 10.0 } else { 0.0 };
+
+            (composite.min(2.0) * 40.0 + momentum_bonus).clamp(0.0, 100.0) as u8
         } else {
             0
         };
@@ -263,11 +509,10 @@ impl Strategy for LaunchMomentumSignal {
 
 // ─── Volume Spike Signal ─────────────────────────────────────────────────────
 
-/// Detects when current volume exceeds 3x the rolling average.
+/// Detects when current volume exceeds a threshold multiplier over the rolling average.
 pub struct VolumeSpikeSignal {
     name: String,
     threshold: f64,
-    /// Token address -> (volume, timestamp)
     volumes: Arc<DashMap<String, VecDeque<(f64, DateTime<Utc>)>>>,
     window_size: usize,
     #[allow(dead_code)]
@@ -293,6 +538,21 @@ impl VolumeSpikeSignal {
             vols.pop_front();
         }
     }
+
+    /// Get the current ratio of latest volume to rolling average.
+    pub fn get_spike_ratio(&self, token_address: &str) -> Option<f64> {
+        let vols = self.volumes.get(token_address)?;
+        if vols.len() < 3 {
+            return None;
+        }
+        let avg: f64 = vols.iter().map(|v| v.0).sum::<f64>() / vols.len() as f64;
+        let current = vols.back().map(|v| v.0).unwrap_or(0.0);
+        if avg > 0.0 {
+            Some(current / avg)
+        } else {
+            None
+        }
+    }
 }
 
 impl Strategy for VolumeSpikeSignal {
@@ -314,12 +574,20 @@ impl Strategy for VolumeSpikeSignal {
             }
             let avg: f64 = vols.iter().map(|v| v.0).sum::<f64>() / vols.len() as f64;
             let current = vols.back().map(|v| v.0).unwrap_or(0.0);
-            if avg > 0.0 && current / avg >= self.threshold {
-                80
-            } else if avg > 0.0 && current / avg >= self.threshold * 0.66 {
-                50
+
+            if avg > 0.0 {
+                let ratio = current / avg;
+                if ratio >= self.threshold {
+                    // Scale score proportionally: 3x = 80, 5x+ = 100.
+                    let raw = 50.0 + (ratio / self.threshold * 30.0).min(50.0);
+                    raw.clamp(0.0, 100.0) as u8
+                } else if ratio >= self.threshold * 0.66 {
+                    50
+                } else {
+                    10
+                }
             } else {
-                10
+                0
             }
         } else {
             0
@@ -336,13 +604,68 @@ impl Strategy for VolumeSpikeSignal {
     }
 }
 
-// ─── Social Signal ───────────────────────────────────────────────────────────
+// ─── Social Signal (Twitter) ─────────────────────────────────────────────────
 
-/// Placeholder for Twitter/social media signal integration.
+/// A tweet from twitter-cli's JSON output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TweetResult {
+    id: Option<String>,
+    text: Option<String>,
+    author: Option<TweetAuthor>,
+    metrics: Option<TweetMetrics>,
+    #[serde(rename = "createdAtISO")]
+    created_at_iso: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TweetAuthor {
+    #[serde(rename = "screenName")]
+    screen_name: Option<String>,
+    verified: Option<bool>,
+    #[serde(rename = "followersCount")]
+    followers_count: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TweetMetrics {
+    likes: Option<i64>,
+    retweets: Option<i64>,
+    replies: Option<i64>,
+    views: Option<i64>,
+    quotes: Option<i64>,
+    bookmarks: Option<i64>,
+}
+
+/// Tracks social mentions of a token within a sliding window.
+#[derive(Debug)]
+struct MentionRecord {
+    #[allow(dead_code)]
+    tweet_id: String,
+    author: String,
+    engagement: f64,
+    timestamp: DateTime<Utc>,
+}
+
+/// Social momentum signal using twitter-cli.
+///
+/// Polls `twitter search` for Solana CA patterns (base58 addresses ending in
+/// "pump") and keyword terms. Tracks mention velocity and engagement to score
+/// social momentum.
 pub struct SocialSignal {
     name: String,
     #[allow(dead_code)]
     chain: Chain,
+    mentions: Arc<DashMap<String, VecDeque<MentionRecord>>>,
+    /// Max mentions to keep per token.
+    max_mentions: usize,
+    /// Window in minutes for counting mentions.
+    window_minutes: i64,
+    /// Minimum mentions to trigger a signal.
+    min_mentions: usize,
+    /// Path to twitter-cli binary.
+    twitter_cli_path: String,
+    /// Search keywords in addition to CA extraction.
+    search_keywords: Vec<String>,
 }
 
 impl SocialSignal {
@@ -350,7 +673,194 @@ impl SocialSignal {
         Self {
             name: "social".to_string(),
             chain,
+            mentions: Arc::new(DashMap::new()),
+            max_mentions: 200,
+            window_minutes: 60,
+            min_mentions: 3,
+            twitter_cli_path: "twitter".to_string(),
+            search_keywords: vec![
+                "solana memecoin".to_string(),
+                "pump.fun launch".to_string(),
+                "$SOL gem".to_string(),
+            ],
         }
+    }
+
+    /// Configure with custom twitter-cli path and keywords.
+    pub fn with_config(
+        chain: Chain,
+        twitter_cli_path: String,
+        search_keywords: Vec<String>,
+        window_minutes: i64,
+        min_mentions: usize,
+    ) -> Self {
+        Self {
+            name: "social".to_string(),
+            chain,
+            mentions: Arc::new(DashMap::new()),
+            max_mentions: 200,
+            window_minutes,
+            min_mentions,
+            twitter_cli_path,
+            search_keywords,
+        }
+    }
+
+    /// Run a search cycle: query twitter-cli for each keyword, extract CAs,
+    /// and record mentions.
+    pub async fn poll(&self) -> Result<()> {
+        for keyword in &self.search_keywords {
+            if let Err(e) = self.search_keyword(keyword).await {
+                tracing::warn!(keyword, error = %e, "Twitter search failed");
+            }
+        }
+        Ok(())
+    }
+
+    /// Search a single keyword via twitter-cli and parse results.
+    async fn search_keyword(&self, keyword: &str) -> Result<()> {
+        let output = tokio::process::Command::new(&self.twitter_cli_path)
+            .args(["search", keyword, "--json", "--max", "20"])
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::debug!(keyword, %stderr, "twitter-cli search returned non-zero");
+            return Ok(());
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // twitter-cli wraps output in { ok: true, data: [...] }
+        #[derive(Deserialize)]
+        struct SearchResponse {
+            data: Option<Vec<TweetResult>>,
+        }
+
+        let resp: SearchResponse = match serde_json::from_str(&stdout) {
+            Ok(r) => r,
+            Err(_) => return Ok(()), // Not JSON or malformed -- skip.
+        };
+
+        let tweets = match resp.data {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+
+        let now = Utc::now();
+        for tweet in tweets {
+            let text = match &tweet.text {
+                Some(t) => t.clone(),
+                None => continue,
+            };
+
+            // Extract Solana CAs from the tweet text.
+            // pump.fun CAs are base58 strings ending in "pump".
+            let cas = self.extract_solana_cas(&text);
+            if cas.is_empty() {
+                continue;
+            }
+
+            let author = tweet.author.as_ref()
+                .and_then(|a| a.screen_name.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+
+            let engagement = Self::compute_engagement(&tweet);
+
+            for ca in cas {
+                let tweet_id = tweet.id.clone().unwrap_or_else(|| "unknown".to_string());
+                let mut mentions = self.mentions.entry(ca).or_default();
+                mentions.push_back(MentionRecord {
+                    tweet_id,
+                    author: author.clone(),
+                    engagement,
+                    timestamp: now,
+                });
+                while mentions.len() > self.max_mentions {
+                    mentions.pop_front();
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Extract Solana token addresses (CAs) from tweet text.
+    ///
+    /// Matches pump.fun addresses: base58 strings 32-44 chars ending in "pump".
+    /// Also matches generic base58 addresses 32-44 chars long.
+    fn extract_solana_cas(&self, text: &str) -> Vec<String> {
+        let mut cas = Vec::new();
+        for word in text.split_whitespace() {
+            // Strip trailing punctuation.
+            let cleaned = word.trim_end_matches(|c: char| c == '.' || c == ',' || c == '!' || c == '?' || c == ':' || c == ';' || c == ')');
+            // pump.fun addresses end with "pump" and are 32-44 chars of base58.
+            let is_pump = cleaned.len() >= 32 && cleaned.len() <= 44 && cleaned.ends_with("pump");
+            let is_base58 = cleaned.len() >= 32 && cleaned.len() <= 44
+                && cleaned.chars().all(|c| c.is_ascii_alphanumeric());
+            if is_pump || is_base58 {
+                // Reject common false positives.
+                if cleaned.starts_with("http") || cleaned.starts_with("https") {
+                    continue;
+                }
+                cas.push(cleaned.to_string());
+            }
+        }
+        cas
+    }
+
+    /// Compute an engagement score from tweet metrics.
+    ///
+    /// Formula: likes * 1.0 + retweets * 3.0 + replies * 2.0 + quotes * 2.5
+    /// This gives higher weight to amplification actions (retweets, quotes).
+    fn compute_engagement(tweet: &TweetResult) -> f64 {
+        let m = match &tweet.metrics {
+            Some(m) => m,
+            None => return 0.0,
+        };
+        let likes = m.likes.unwrap_or(0) as f64;
+        let retweets = m.retweets.unwrap_or(0) as f64;
+        let replies = m.replies.unwrap_or(0) as f64;
+        let quotes = m.quotes.unwrap_or(0) as f64;
+        likes + retweets * 3.0 + replies * 2.0 + quotes * 2.5
+    }
+
+    /// Prune mentions outside the time window.
+    fn prune_stale(&self, token_address: &str) {
+        if let Some(mut mentions) = self.mentions.get_mut(token_address) {
+            let cutoff = Utc::now() - chrono::Duration::minutes(self.window_minutes);
+            while mentions.front().is_some_and(|m| m.timestamp < cutoff) {
+                mentions.pop_front();
+            }
+        }
+    }
+
+    /// Get the mention count for a token in the current window.
+    pub fn get_mention_count(&self, token_address: &str) -> usize {
+        self.prune_stale(token_address);
+        self.mentions.get(token_address).map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Run a background polling loop.
+    pub fn run_polling(self: &Arc<Self>, interval_secs: u64, mut shutdown: tokio::sync::watch::Receiver<bool>) -> tokio::task::JoinHandle<()> {
+        let signal = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        if let Err(e) = signal.poll().await {
+                            tracing::error!(error = %e, "Social signal poll failed");
+                        }
+                    }
+                    _ = shutdown.changed() => {
+                        tracing::info!("Social signal polling shutting down");
+                        return;
+                    }
+                }
+            }
+        })
     }
 }
 
@@ -359,8 +869,62 @@ impl Strategy for SocialSignal {
         &self.name
     }
 
-    async fn evaluate(&self, _token: &TokenInfo) -> Result<Signal> {
-        todo!("Integrate Twitter API for social sentiment analysis")
+    async fn evaluate(&self, token: &TokenInfo) -> Result<Signal> {
+        self.prune_stale(&token.address);
+
+        let score = if let Some(mentions) = self.mentions.get(&token.address) {
+            let count = mentions.len();
+            if count < self.min_mentions {
+                return Ok(Signal::new(
+                    token.address.clone(),
+                    token.chain,
+                    &self.name,
+                    0,
+                    0.0,
+                    format!("Social mentions ({count}) below threshold ({})", self.min_mentions),
+                ));
+            }
+
+            // Distinct authors mentioning this token.
+            let distinct_authors: HashSet<&str> = mentions.iter().map(|m| m.author.as_str()).collect();
+            let author_count = distinct_authors.len();
+
+            // Total engagement across all mentions.
+            let total_engagement: f64 = mentions.iter().map(|m| m.engagement).sum();
+
+            // Mention velocity: how many per minute.
+            let span_mins = if mentions.len() >= 2 {
+                let first = mentions.front().unwrap().timestamp;
+                let last = mentions.back().unwrap().timestamp;
+                (last - first).num_minutes().max(1) as f64
+            } else {
+                self.window_minutes as f64
+            };
+            let velocity = count as f64 / span_mins;
+
+            // Score components:
+            // - Mention count: more mentions = higher score (capped at 40)
+            // - Author diversity: more unique authors = higher quality (capped at 30)
+            // - Engagement: higher engagement = stronger signal (capped at 20)
+            // - Velocity: faster mentions = more timely (capped at 10)
+            let count_score = (count as f64 / self.min_mentions as f64 * 20.0).min(40.0);
+            let author_score = (author_count as f64 * 5.0).min(30.0);
+            let engagement_score = (total_engagement.log10().max(0.0) * 5.0).min(20.0);
+            let velocity_score = (velocity * 10.0).min(10.0);
+
+            (count_score + author_score + engagement_score + velocity_score).clamp(0.0, 100.0) as u8
+        } else {
+            0
+        };
+
+        Ok(Signal::new(
+            token.address.clone(),
+            token.chain,
+            &self.name,
+            score,
+            0.5,
+            format!("Social momentum: {score}/100"),
+        ))
     }
 }
 
@@ -407,7 +971,6 @@ pub struct ConfluenceScorer {
 }
 
 impl ConfluenceScorer {
-    /// Create a new confluence scorer with strategies and their weights.
     pub fn new(threshold: f64) -> Self {
         Self {
             strategies: Vec::new(),
@@ -420,6 +983,54 @@ impl ConfluenceScorer {
     pub fn add_strategy(&mut self, strategy: StrategyKind, weight: f64) {
         self.weights.push(weight);
         self.strategies.push(strategy);
+    }
+
+    /// Build a scorer from config with default weights.
+    pub fn from_config(
+        whale_consensus: WhaleConsensusSignal,
+        accumulation: AccumulationSignal,
+        launch_momentum: LaunchMomentumSignal,
+        volume_spike: VolumeSpikeSignal,
+        weights: &SignalWeights,
+        threshold: f64,
+    ) -> Self {
+        let mut scorer = Self::new(threshold);
+        scorer.add_strategy(StrategyKind::WhaleConsensus(whale_consensus), weights.whale_consensus);
+        scorer.add_strategy(StrategyKind::Accumulation(accumulation), weights.accumulation);
+        scorer.add_strategy(StrategyKind::LaunchMomentum(launch_momentum), weights.launch_momentum);
+        scorer.add_strategy(StrategyKind::VolumeSpike(volume_spike), weights.volume_spike);
+        scorer
+    }
+
+    /// Feed scan data into the volume spike and launch momentum signals.
+    /// Call this on each scan tick to keep signal state up to date.
+    pub fn feed_scan_data(&self, token_address: &str, volume_24h: Option<f64>, holder_count: Option<u64>) {
+        for strategy in &self.strategies {
+            match strategy {
+                StrategyKind::VolumeSpike(vs) => {
+                    if let Some(vol) = volume_24h {
+                        vs.record(token_address.to_string(), vol);
+                    }
+                }
+                StrategyKind::LaunchMomentum(lm) => {
+                    if let Some(vol) = volume_24h {
+                        let holders = holder_count.unwrap_or(0);
+                        lm.record(token_address.to_string(), vol, holders);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Poll the social signal (twitter search). Call periodically.
+    pub async fn poll_social(&self) -> Result<()> {
+        for strategy in &self.strategies {
+            if let StrategyKind::Social(ss) = strategy {
+                ss.poll().await?;
+            }
+        }
+        Ok(())
     }
 
     /// Evaluate all strategies for a token and produce a composite score.
@@ -457,6 +1068,28 @@ impl ConfluenceScorer {
             signals,
             passed: composite >= self.threshold,
         })
+    }
+}
+
+/// Configurable signal weights for confluence scoring.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignalWeights {
+    pub whale_consensus: f64,
+    pub accumulation: f64,
+    pub launch_momentum: f64,
+    pub volume_spike: f64,
+    pub social: f64,
+}
+
+impl Default for SignalWeights {
+    fn default() -> Self {
+        Self {
+            whale_consensus: 0.30,
+            accumulation: 0.20,
+            launch_momentum: 0.20,
+            volume_spike: 0.15,
+            social: 0.15,
+        }
     }
 }
 

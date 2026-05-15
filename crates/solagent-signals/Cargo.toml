@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 solagent-core = { path = "../solagent-core" }
 solagent-data = { path = "../solagent-data" }
+solagent-portfolio = { path = "../solagent-portfolio" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
@@ -13,3 +14,4 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 dashmap = { workspace = true }
+sqlx = { workspace = true, features = ["runtime-tokio", "sqlite"] }

@@ -1,9 +1,11 @@
 //! # solagent-exec
 //!
 //! Execution engine with pre-flight checks, retry logic, and quality tracking.
+//! Supports Solana (via Jupiter V6) and Base (via Uniswap — stub).
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use base64::Engine;
 use solagent_core::{Chain, Trade, TradeSide};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -103,13 +105,32 @@ impl Default for ExecutionConfig {
 pub struct ExecutionEngine {
     config: ExecutionConfig,
     quality: Arc<RwLock<ExecutionQuality>>,
+    jupiter: Option<solagent_data::JupiterClient>,
+    solana_provider: Option<Arc<solagent_chain_solana::SolanaProvider>>,
 }
 
 impl ExecutionEngine {
+    /// Create a new execution engine with no chain providers (for dry-run or testing).
     pub fn new(config: ExecutionConfig) -> Self {
         Self {
             config,
             quality: Arc::new(RwLock::new(ExecutionQuality::default())),
+            jupiter: None,
+            solana_provider: None,
+        }
+    }
+
+    /// Create a fully-wired execution engine for Solana.
+    pub fn new_solana(
+        config: ExecutionConfig,
+        jupiter: solagent_data::JupiterClient,
+        solana_provider: Arc<solagent_chain_solana::SolanaProvider>,
+    ) -> Self {
+        Self {
+            config,
+            quality: Arc::new(RwLock::new(ExecutionQuality::default())),
+            jupiter: Some(jupiter),
+            solana_provider: Some(solana_provider),
         }
     }
 
@@ -139,12 +160,19 @@ impl ExecutionEngine {
             ),
         });
 
-        // Slippage estimate.
-        let estimated_impact = (size_usd / 10_000.0).min(5.0); // Simplified.
+        // Provider available.
+        let provider_ok = match _chain {
+            Chain::Solana => self.jupiter.is_some() && self.solana_provider.is_some(),
+            Chain::Base => false,
+        };
         checks.push(PreflightCheck {
-            name: "slippage".to_string(),
-            passed: estimated_impact < (self.config.base_slippage_bps as f64 / 100.0),
-            details: format!("Estimated price impact: {estimated_impact:.2}%"),
+            name: "provider".to_string(),
+            passed: provider_ok,
+            details: if provider_ok {
+                "Chain provider available".to_string()
+            } else {
+                format!("{_chain} provider not configured")
+            },
         });
 
         checks
@@ -278,18 +306,16 @@ impl ExecutionEngine {
     /// Dispatch a buy to the appropriate chain provider.
     async fn dispatch_buy(
         &self,
-        _chain: Chain,
-        _token_address: &str,
-        _size_usd: f64,
-        _slippage_bps: u32,
-        _current_price: f64,
+        chain: Chain,
+        token_address: &str,
+        size_usd: f64,
+        slippage_bps: u32,
+        current_price: f64,
     ) -> Result<Trade> {
-        match _chain {
-            Chain::Solana => {
-                todo!("Dispatch buy via SolanaProvider -> Jupiter")
-            }
+        match chain {
+            Chain::Solana => self.dispatch_solana_buy(token_address, size_usd, slippage_bps, current_price).await,
             Chain::Base => {
-                todo!("Dispatch buy via BaseProvider -> Uniswap")
+                anyhow::bail!("Base execution not yet implemented");
             }
         }
     }
@@ -297,24 +323,146 @@ impl ExecutionEngine {
     /// Dispatch a sell to the appropriate chain provider.
     async fn dispatch_sell(
         &self,
-        _chain: Chain,
-        _token_address: &str,
-        _token_amount: f64,
-        _slippage_bps: u32,
-        _current_price: f64,
+        chain: Chain,
+        token_address: &str,
+        token_amount: f64,
+        slippage_bps: u32,
+        current_price: f64,
     ) -> Result<Trade> {
-        match _chain {
-            Chain::Solana => {
-                todo!("Dispatch sell via SolanaProvider -> Jupiter")
-            }
+        match chain {
+            Chain::Solana => self.dispatch_solana_sell(token_address, token_amount, slippage_bps, current_price).await,
             Chain::Base => {
-                todo!("Dispatch sell via BaseProvider -> Uniswap")
+                anyhow::bail!("Base execution not yet implemented");
             }
         }
+    }
+
+    /// Execute a Solana buy via Jupiter V6.
+    async fn dispatch_solana_buy(
+        &self,
+        token_address: &str,
+        size_usd: f64,
+        slippage_bps: u32,
+        current_price: f64,
+    ) -> Result<Trade> {
+        let jupiter = self.jupiter.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Jupiter client not configured"))?;
+        let provider = self.solana_provider.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Solana provider not configured"))?;
+
+        // SOL mint address.
+        let sol_mint = "So11111111111111111111111111111111111111112";
+        // Convert USD amount to lamports (approximate using current SOL price).
+        let lamports = (size_usd / current_price * 1_000_000_000.0) as u64;
+
+        // Get quote from Jupiter.
+        let quote = jupiter.get_quote(sol_mint, token_address, lamports, slippage_bps).await?;
+        tracing::info!(
+            input_lamports = lamports,
+            output_amount = &quote.out_amount,
+            price_impact = &quote.price_impact_pct,
+            "Jupiter quote received"
+        );
+
+        // Get swap transaction from Jupiter.
+        let user_pubkey = provider.pubkeys().to_string();
+        let swap_tx = jupiter.get_swap_transaction(&quote, &user_pubkey).await?;
+
+        // Deserialize, sign, and send the transaction.
+        let tx_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&swap_tx.swap_transaction)?;
+        let mut tx: solana_sdk::transaction::Transaction =
+            bincode::deserialize(&tx_bytes)?;
+        tx.sign(&[provider.keypair()], tx.message.recent_blockhash);
+        let signature = provider.sign_and_send(&tx).await?;
+
+        let token_amount = quote.out_amount.parse::<f64>().unwrap_or(0.0);
+        Ok(Trade {
+            id: solagent_core::uuid::Uuid::new_v4(),
+            token_address: token_address.to_string(),
+            chain: Chain::Solana,
+            side: TradeSide::Buy,
+            size_usd,
+            token_amount,
+            price: current_price,
+            tx_signature: Some(signature.to_string()),
+            slippage_bps: Some(slippage_bps as u64),
+            executed_at: solagent_core::chrono::Utc::now(),
+            latency_ms: None,
+        })
+    }
+
+    /// Execute a Solana sell via Jupiter V6.
+    async fn dispatch_solana_sell(
+        &self,
+        token_address: &str,
+        token_amount: f64,
+        slippage_bps: u32,
+        current_price: f64,
+    ) -> Result<Trade> {
+        let jupiter = self.jupiter.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Jupiter client not configured"))?;
+        let provider = self.solana_provider.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Solana provider not configured"))?;
+
+        let sol_mint = "So11111111111111111111111111111111111111112";
+        // Convert token amount to smallest unit (assume 6 decimals for SPL tokens).
+        let token_units = (token_amount * 1_000_000.0) as u64;
+
+        let quote = jupiter.get_quote(token_address, sol_mint, token_units, slippage_bps).await?;
+        let user_pubkey = provider.pubkeys().to_string();
+        let swap_tx = jupiter.get_swap_transaction(&quote, &user_pubkey).await?;
+
+        let tx_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&swap_tx.swap_transaction)?;
+        let mut tx: solana_sdk::transaction::Transaction =
+            bincode::deserialize(&tx_bytes)?;
+        tx.sign(&[provider.keypair()], tx.message.recent_blockhash);
+        let signature = provider.sign_and_send(&tx).await?;
+
+        let size_usd = token_amount * current_price;
+        Ok(Trade {
+            id: solagent_core::uuid::Uuid::new_v4(),
+            token_address: token_address.to_string(),
+            chain: Chain::Solana,
+            side: TradeSide::Sell,
+            size_usd,
+            token_amount,
+            price: current_price,
+            tx_signature: Some(signature.to_string()),
+            slippage_bps: Some(slippage_bps as u64),
+            executed_at: solagent_core::chrono::Utc::now(),
+            latency_ms: None,
+        })
+    }
+
+    /// Get a quote from Jupiter without executing.
+    pub async fn get_quote(
+        &self,
+        input_mint: &str,
+        output_mint: &str,
+        amount: u64,
+        slippage_bps: u32,
+    ) -> Result<solagent_data::JupiterQuote> {
+        let jupiter = self.jupiter.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Jupiter client not configured"))?;
+        Ok(jupiter.get_quote(input_mint, output_mint, amount, slippage_bps).await?)
     }
 
     /// Get a snapshot of execution quality metrics.
     pub async fn quality(&self) -> ExecutionQuality {
         self.quality.read().await.clone()
+    }
+
+    /// Get SOL balance in lamports. Returns None if provider not configured.
+    pub async fn get_sol_balance(&self) -> Option<u64> {
+        let provider = self.solana_provider.as_ref()?;
+        let pubkey = provider.pubkeys();
+        provider.get_balance(&pubkey).await.ok()
+    }
+
+    /// Get the Solana wallet public key, if configured.
+    pub fn solana_pubkey(&self) -> Option<solana_sdk::pubkey::Pubkey> {
+        self.solana_provider.as_ref().map(|p| p.pubkeys())
     }
 }

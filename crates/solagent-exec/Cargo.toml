@@ -13,3 +13,6 @@ tracing = { workspace = true }
 serde = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
+base64 = { workspace = true }
+bincode = "1"
+solana-sdk = { workspace = true }

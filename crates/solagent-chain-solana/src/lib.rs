@@ -5,6 +5,7 @@
 pub mod pump_fun;
 
 use anyhow::Result;
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use solana_client::rpc_request::TokenAccountsFilter;
 use solana_sdk::{
@@ -99,30 +100,79 @@ impl SolanaProvider {
     pub async fn get_token_balance(&self, address: &Pubkey, token_mint: &str) -> Result<u64> {
         let rpc = self.get_rpc().await;
         let mint_pubkey: Pubkey = token_mint.parse()?;
-        let token_accounts = rpc.get_token_accounts_by_owner_with_commitment(
+        let resp = rpc.get_token_accounts_by_owner_with_commitment(
             address,
             TokenAccountsFilter::Mint(mint_pubkey),
             self.commitment,
         )?;
-        // Parse token balance from token accounts.
-        // TODO: implement proper UiAccountData parsing for token amounts.
-        let _ = token_accounts;
-        todo!("Parse token balance from get_token_accounts_by_owner response")
+
+        // Parse the token balance from the first matching token account.
+        let Some(account) = resp.value.first() else {
+            return Ok(0); // No token account = 0 balance.
+        };
+
+        // Re-serialize and parse as generic JSON to extract amount reliably.
+        let account_json = serde_json::to_value(&account.account)?;
+        if let Some(data_val) = account_json.get("parsed").and_then(|p| p.get("info")) {
+            // Try tokenAmount.amount first (standard parsed format).
+            if let Some(amt) = data_val.get("tokenAmount").and_then(|t| t.get("amount")) {
+                if let Some(s) = amt.as_str() {
+                    if let Ok(v) = s.parse::<u64>() { return Ok(v); }
+                }
+            }
+            // Fallback: direct "amount" field.
+            if let Some(amt) = data_val.get("amount") {
+                if let Some(s) = amt.as_str() {
+                    if let Ok(v) = s.parse::<u64>() { return Ok(v); }
+                }
+                if let Some(v) = amt.as_u64() { return Ok(v); }
+            }
+        }
+
+        // Legacy base64 data: decode the SPL Token Account structure.
+        // The amount field is at bytes 64-72 (u64 LE).
+        if let Some(b64) = account_json.get("data").and_then(|d| {
+            // data is [base64_string, encoding] array.
+            d.as_array().and_then(|a| a.first()).and_then(|v| v.as_str())
+        }) {
+            if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(b64) {
+                if decoded.len() >= 72 {
+                    let amount = u64::from_le_bytes(
+                        decoded[64..72].try_into().unwrap_or([0u8; 8])
+                    );
+                    return Ok(amount);
+                }
+            }
+        }
+
+        Ok(0)
     }
 
-    /// Build a swap transaction (delegates to Jupiter integration).
+    /// Build a swap transaction using Jupiter V6 quote API.
+    /// This is a convenience method; the execution engine typically calls Jupiter directly.
     pub async fn build_swap_tx(
         &self,
-        _input_mint: &str,
-        _output_mint: &str,
-        _amount: u64,
-        _slippage_bps: u32,
+        input_mint: &str,
+        output_mint: &str,
+        amount: u64,
+        slippage_bps: u32,
     ) -> Result<Transaction> {
-        let _rpc = self.get_rpc().await;
-        todo!("Build swap tx via Jupiter API integration")
-    }
+        let jupiter = solagent_data::JupiterClient::new(
+            "https://quote-api.jup.ag/v6".to_string(),
+        );
 
-    /// Sign and send a transaction.
+        let quote = jupiter.get_quote(input_mint, output_mint, amount, slippage_bps).await?;
+        let swap_tx = jupiter.get_swap_transaction(
+            &quote,
+            &self.keypair().pubkey().to_string(),
+        ).await?;
+
+        let tx_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&swap_tx.swap_transaction)?;
+        let mut tx: Transaction = bincode::deserialize(&tx_bytes)?;
+        tx.sign(&[self.keypair()], tx.message.recent_blockhash);
+        Ok(tx)
+    }    /// Sign and send a transaction.
     pub async fn sign_and_send(&self, tx: &Transaction) -> Result<Signature> {
         let rpc = self.get_rpc().await;
         let signature = rpc.send_and_confirm_transaction(tx)?;
@@ -155,13 +205,13 @@ impl ChainProvider for SolanaProvider {
         self.get_token_balance(address, token_mint).await
     }
 
-    async fn sign_and_send(&self, _tx: &[u8]) -> Result<Signature> {
-        let _rpc = self.get_rpc().await;
-        todo!("Deserialize transaction from bytes and send")
+    async fn sign_and_send(&self, tx: &[u8]) -> Result<Signature> {
+        let transaction: Transaction = bincode::deserialize(tx)?;
+        self.sign_and_send(&transaction).await
     }
 
-    async fn simulate_tx(&self, _tx: &[u8]) -> Result<SimulateResult> {
-        let _rpc = self.get_rpc().await;
-        todo!("Deserialize transaction from bytes and simulate")
+    async fn simulate_tx(&self, tx: &[u8]) -> Result<SimulateResult> {
+        let transaction: Transaction = bincode::deserialize(tx)?;
+        self.simulate_tx(&transaction).await
     }
 }

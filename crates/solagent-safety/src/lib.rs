@@ -1,6 +1,8 @@
 //! # solagent-safety
 //!
 //! Safety scoring system with individual checks for token risk assessment.
+//! Includes an async evaluator that fetches live data from Birdeye and
+//! checks the dev-wallet blacklist from the portfolio database.
 
 use serde::{Deserialize, Serialize};
 use solagent_core::Chain;
@@ -41,6 +43,22 @@ impl SafetyReport {
             self.total_score = (weighted / weight_sum).round() as u8;
         }
         self.passed = self.total_score >= self.threshold;
+    }
+
+    /// Get a summary of failed checks.
+    pub fn failed_checks(&self) -> Vec<&CheckResult> {
+        self.checks.iter().filter(|c| !c.passed).collect()
+    }
+
+    /// Get a formatted summary string.
+    pub fn summary(&self) -> String {
+        let status = if self.passed { "PASS" } else { "FAIL" };
+        let mut s = format!("Safety: {}/{} [{}]", self.total_score, self.threshold, status);
+        for c in &self.checks {
+            let mark = if c.passed { "+" } else { "-" };
+            s.push_str(&format!("\n  {} {}: {} ({})", mark, c.name, c.score, c.details));
+        }
+        s
     }
 }
 
@@ -307,5 +325,166 @@ impl SafetyScorer {
 impl Default for SafetyScorer {
     fn default() -> Self {
         Self::new(60)
+    }
+}
+
+// ─── Dev Blacklist Check ─────────────────────────────────────────────────────
+
+/// Check if the deployer/dev wallet is on the blacklist.
+pub fn check_dev_blacklisted(is_blacklisted: bool) -> CheckResult {
+    CheckResult {
+        name: "dev_blacklist".to_string(),
+        score: if is_blacklisted { 0 } else { 100 },
+        weight: 1.5,
+        passed: !is_blacklisted,
+        details: if is_blacklisted {
+            "Dev wallet is BLACKLISTED — known rug puller".to_string()
+        } else {
+            "Dev wallet is clean".to_string()
+        },
+    }
+}
+
+// ─── Async Safety Evaluator ─────────────────────────────────────────────────
+
+/// A dev blacklist checker that wraps a SQLite pool query.
+/// Checks if a deployer address is on the dev_blacklist table.
+#[derive(Clone)]
+pub struct DevBlacklistChecker {
+    pool: sqlx::SqlitePool,
+}
+
+impl DevBlacklistChecker {
+    pub fn new(pool: sqlx::SqlitePool) -> Self {
+        Self { pool }
+    }
+
+    pub async fn is_blacklisted(&self, address: &str, chain: Chain) -> bool {
+        let result: Result<(i64,), sqlx::Error> = sqlx::query_as(
+            "SELECT COUNT(*) FROM dev_blacklist WHERE address = ?1 AND chain = ?2",
+        )
+        .bind(address)
+        .bind(chain.to_string())
+        .fetch_one(&self.pool)
+        .await;
+        match result {
+            Ok((count,)) => count > 0,
+            Err(_) => false,
+        }
+    }
+}
+
+/// Re-export for backward compat. Prefer `DevBlacklistChecker`.
+pub type SqliteDevBlacklist = DevBlacklistChecker;
+
+/// Async safety evaluator that fetches live data from Birdeye and runs all checks.
+pub struct SafetyEvaluator {
+    pub threshold: u8,
+    pub birdeye: solagent_data::BirdeyeClient,
+    pub dev_blacklist: DevBlacklistChecker,
+}
+
+impl SafetyEvaluator {
+    pub fn new(
+        threshold: u8,
+        birdeye: solagent_data::BirdeyeClient,
+        dev_blacklist: DevBlacklistChecker,
+    ) -> Self {
+        Self {
+            threshold,
+            birdeye,
+            dev_blacklist,
+        }
+    }
+
+    /// Evaluate a token's safety by fetching live data from Birdeye.
+    ///
+    /// `deployer_address` is optional -- if provided, checks the dev blacklist.
+    /// Returns a full `SafetyReport` with all check results.
+    pub async fn evaluate(
+        &self,
+        token_address: &str,
+        chain: Chain,
+        deployer_address: Option<&str>,
+    ) -> SafetyReport {
+        let mut checks = Vec::new();
+
+        // Fetch Birdeye security data.
+        let security_result = self.birdeye.get_token_security(token_address).await;
+        match security_result {
+            Ok(sec) => {
+                checks.push(check_mint_authority(sec.mint_authority.as_deref()));
+                checks.push(check_freeze_authority(sec.freeze_authority.as_deref()));
+                checks.push(check_honeypot(sec.is_honeypot));
+                checks.push(check_tax(
+                    sec.buy_tax.map(|t| t * 100.0),
+                    sec.sell_tax.map(|t| t * 100.0),
+                ));
+                let holder_pcts: Vec<f64> = sec.top_holders.iter().map(|h| h.pct).collect();
+                checks.push(check_holder_concentration(holder_pcts));
+            }
+            Err(e) => {
+                tracing::warn!(token = token_address, error = %e, "Birdeye security fetch failed");
+                checks.push(CheckResult {
+                    name: "mint_authority".into(), score: 50, weight: 1.5, passed: false,
+                    details: "Security data unavailable".into(),
+                });
+                checks.push(CheckResult {
+                    name: "freeze_authority".into(), score: 50, weight: 1.5, passed: false,
+                    details: "Security data unavailable".into(),
+                });
+                checks.push(check_honeypot(None));
+                checks.push(check_tax(None, None));
+                checks.push(check_holder_concentration(vec![]));
+            }
+        }
+
+        // Fetch top holders for dev holdings analysis.
+        let holders_result = self.birdeye.get_top_holders(token_address).await;
+        match holders_result {
+            Ok(holders) => {
+                if let Some(deployer) = deployer_address {
+                    let dev_holdings_pct = holders.iter()
+                        .find(|h| h.owner == deployer)
+                        .map(|h| h.pct)
+                        .unwrap_or(0.0);
+                    checks.push(check_dev_wallet(dev_holdings_pct));
+                } else {
+                    let top_holder_pct = holders.first().map(|h| h.pct).unwrap_or(0.0);
+                    checks.push(check_dev_wallet(top_holder_pct));
+                }
+                if checks.iter().all(|c| c.name != "holder_concentration") {
+                    let holder_pcts: Vec<f64> = holders.iter().map(|h| h.pct).collect();
+                    checks.push(check_holder_concentration(holder_pcts));
+                }
+            }
+            Err(e) => {
+                tracing::warn!(token = token_address, error = %e, "Birdeye holders fetch failed");
+                checks.push(check_dev_wallet(0.0));
+            }
+        }
+
+        // LP lock check -- not available from Birdeye directly.
+        checks.push(CheckResult {
+            name: "lp_lock".into(), score: 50, weight: 2.0, passed: false,
+            details: "LP lock data not available from Birdeye".into(),
+        });
+
+        // Dev blacklist check.
+        if let Some(deployer) = deployer_address {
+            let blacklisted = self.dev_blacklist.is_blacklisted(deployer, chain).await;
+            checks.push(check_dev_blacklisted(blacklisted));
+        }
+
+        let mut report = SafetyReport {
+            token_address: token_address.to_string(),
+            chain,
+            checks,
+            total_score: 0,
+            passed: false,
+            threshold: self.threshold,
+        };
+        report.compute_total();
+        report
     }
 }

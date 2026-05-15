@@ -27,3 +27,7 @@ Thumbs.db
 
 # Build artifacts
 dist/
+trading-wallet.json
+
+# Logs
+logs/

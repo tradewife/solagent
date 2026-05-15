@@ -1,6 +1,7 @@
 //! # solagent-risk
 //!
 //! Risk management with position sizing, drawdown limits, and circuit breaker.
+//! Integrates with the portfolio manager for live portfolio state.
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -37,15 +38,33 @@ impl std::fmt::Display for CircuitBreaker {
 /// All configurable risk parameters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RiskConfig {
+    /// Max position size in USD (absolute cap).
     pub max_position_size_usd: f64,
+    /// Percentage of portfolio risked per trade (e.g. 2.0 = 2%).
+    pub per_trade_pct: f64,
+    /// Max percentage of portfolio in any single token (e.g. 5.0 = 5%).
+    pub max_per_token_pct: f64,
+    /// Max portfolio risk as percentage.
     pub max_portfolio_risk_pct: f64,
+    /// Max daily loss in USD.
     pub max_daily_loss_usd: f64,
+    /// Max daily loss as percentage of portfolio.
+    pub max_daily_loss_pct: f64,
+    /// Drawdown percentage from peak that triggers halt.
     pub max_drawdown_pct: f64,
+    /// Maximum number of concurrent open positions.
     pub max_open_positions: usize,
+    /// Default stop loss percentage (e.g. 20.0 = -20%).
     pub default_stop_loss_pct: f64,
+    /// Default take profit percentage (e.g. 50.0 = +50%).
     pub default_take_profit_pct: f64,
+    /// Trailing stop percentage from peak (e.g. 10.0 = -10% from high).
+    pub trailing_stop_pct: f64,
+    /// Cooldown in seconds after a loss trade.
     pub cooldown_secs: u64,
+    /// Warning threshold as percentage of drawdown.
     pub warning_threshold_pct: f64,
+    /// Halt threshold as percentage of drawdown.
     pub halt_threshold_pct: f64,
 }
 
@@ -53,15 +72,40 @@ impl Default for RiskConfig {
     fn default() -> Self {
         Self {
             max_position_size_usd: 500.0,
+            per_trade_pct: 2.0,
+            max_per_token_pct: 5.0,
             max_portfolio_risk_pct: 10.0,
             max_daily_loss_usd: 200.0,
-            max_drawdown_pct: 15.0,
+            max_daily_loss_pct: 5.0,
+            max_drawdown_pct: 10.0,
             max_open_positions: 10,
             default_stop_loss_pct: 20.0,
-            default_take_profit_pct: 100.0,
+            default_take_profit_pct: 50.0,
+            trailing_stop_pct: 10.0,
             cooldown_secs: 300,
-            warning_threshold_pct: 70.0,
-            halt_threshold_pct: 90.0,
+            warning_threshold_pct: 7.0,
+            halt_threshold_pct: 10.0,
+        }
+    }
+}
+
+impl From<solagent_core::RiskConfig> for RiskConfig {
+    fn from(c: solagent_core::RiskConfig) -> Self {
+        Self {
+            max_position_size_usd: c.max_position_size_usd,
+            per_trade_pct: 2.0,
+            max_per_token_pct: 5.0,
+            max_portfolio_risk_pct: c.max_portfolio_risk_pct,
+            max_daily_loss_usd: c.max_daily_loss_usd,
+            max_daily_loss_pct: 5.0,
+            max_drawdown_pct: c.max_drawdown_pct,
+            max_open_positions: c.max_open_positions,
+            default_stop_loss_pct: c.default_stop_loss_pct,
+            default_take_profit_pct: c.default_take_profit_pct,
+            trailing_stop_pct: c.trailing_stop_pct,
+            cooldown_secs: c.cooldown_secs,
+            warning_threshold_pct: c.max_drawdown_pct * 0.7,
+            halt_threshold_pct: c.max_drawdown_pct,
         }
     }
 }
@@ -299,5 +343,163 @@ impl RiskManager {
     /// Get the decision log.
     pub fn decision_log(&self) -> Vec<RiskReport> {
         self.decision_log.read().clone()
+    }
+
+    // ─── Position Sizing ─────────────────────────────────────────────────
+
+    /// Calculate the position size for a new trade based on portfolio value.
+    pub fn calculate_position_size(&self, portfolio_value: f64) -> f64 {
+        let by_pct = portfolio_value * self.config.per_trade_pct / 100.0;
+        let by_token_cap = portfolio_value * self.config.max_per_token_pct / 100.0;
+        let absolute_cap = self.config.max_position_size_usd;
+
+        by_pct.min(by_token_cap).min(absolute_cap)
+    }
+
+    // ─── Dynamic Exit Profiles ──────────────────────────────────────────
+
+    /// Select exit profile based on token characteristics.
+    /// Cascading: first match wins.
+    pub fn select_exit_profile(
+        market_cap: Option<f64>,
+        age_hours: Option<f64>,
+        confluence_score: u8,
+    ) -> ExitProfile {
+        let mcap = market_cap.unwrap_or(f64::MAX);
+        let age = age_hours.unwrap_or(f64::MAX);
+
+        if mcap < 100_000.0 && age < 1.0 && confluence_score >= 80 {
+            ExitProfile::moonbag()
+        } else if mcap < 1_000_000.0 && age < 24.0 && confluence_score >= 70 {
+            ExitProfile::runner()
+        } else if mcap < 10_000_000.0 || age < 168.0 {
+            ExitProfile::swing()
+        } else {
+            ExitProfile::conservative()
+        }
+    }
+
+    /// Calculate SL/TP/trailing for a position based on its exit profile.
+    /// Returns (stop_loss_price, take_profit_price, trailing_stop_pct).
+    /// take_profit_price is None when we ride purely on trailing stop.
+    pub fn calculate_exit(
+        entry_price: f64,
+        market_cap: Option<f64>,
+        age_hours: Option<f64>,
+        confluence_score: u8,
+    ) -> (f64, Option<f64>, f64) {
+        let profile = Self::select_exit_profile(market_cap, age_hours, confluence_score);
+        let sl = entry_price * (1.0 - profile.stop_loss_pct / 100.0);
+        let tp = profile.take_profit_pct
+            .map(|pct| entry_price * (1.0 + pct / 100.0));
+        (sl, tp, profile.trailing_stop_pct)
+    }
+}
+
+// ─── Exit Profile ────────────────────────────────────────────────────────────
+
+/// Dynamic exit strategy based on token characteristics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExitProfile {
+    pub name: String,
+    /// Stop loss percentage (e.g. 20.0 = -20%).
+    pub stop_loss_pct: f64,
+    /// Take profit percentage (None = no hard TP, ride the trailing stop).
+    pub take_profit_pct: Option<f64>,
+    /// Trailing stop percentage from peak (e.g. 25.0 = -25% from peak).
+    pub trailing_stop_pct: f64,
+}
+
+impl ExitProfile {
+    /// Moonbag: tiny cap, brand new, strong signal. Ride it hard.
+    /// No hard TP -- let the 25% trailing stop do the work.
+    pub fn moonbag() -> Self {
+        Self {
+            name: "moonbag".to_string(),
+            stop_loss_pct: 20.0,
+            take_profit_pct: None,
+            trailing_stop_pct: 25.0,
+        }
+    }
+
+    /// Runner: small cap, fresh launch, decent signal.
+    /// Hard TP at 500% (6x) as backstop, 20% trailing does most exits.
+    pub fn runner() -> Self {
+        Self {
+            name: "runner".to_string(),
+            stop_loss_pct: 15.0,
+            take_profit_pct: Some(500.0),
+            trailing_stop_pct: 20.0,
+        }
+    }
+
+    /// Swing: mid-cap or a few days old. Tighter parameters.
+    pub fn swing() -> Self {
+        Self {
+            name: "swing".to_string(),
+            stop_loss_pct: 12.0,
+            take_profit_pct: Some(200.0),
+            trailing_stop_pct: 15.0,
+        }
+    }
+
+    /// Conservative: large cap or weak signal. Take profits early.
+    pub fn conservative() -> Self {
+        Self {
+            name: "conservative".to_string(),
+            stop_loss_pct: 10.0,
+            take_profit_pct: Some(50.0),
+            trailing_stop_pct: 10.0,
+        }
+    }
+}
+
+// ─── RiskManager continued (methods that use ExitProfile) ─────────────────────
+
+impl RiskManager {
+    /// Check if a position should be stopped out.
+    ///
+    /// Returns `Some(reason)` if the position should be closed, `None` otherwise.
+    /// `trailing_stop_pct` is per-position (from ExitProfile), not the global default.
+    pub fn check_stop_conditions(
+        &self,
+        current_price: f64,
+        entry_price: f64,
+        stop_loss: Option<f64>,
+        take_profit: Option<f64>,
+        peak_price: Option<f64>,
+        trailing_stop_pct: f64,
+    ) -> Option<String> {
+        // Hard stop loss.
+        let sl = stop_loss.unwrap_or_else(|| entry_price * (1.0 - self.config.default_stop_loss_pct / 100.0));
+        if current_price <= sl {
+            return Some(format!("Stop loss hit: ${current_price:.6} <= ${sl:.6}"));
+        }
+
+        // Take profit (may be None for moonbag profile).
+        if let Some(tp) = take_profit {
+            if current_price >= tp {
+                return Some(format!("Take profit hit: ${current_price:.6} >= ${tp:.6}"));
+            }
+        }
+
+        // Trailing stop -- uses the per-position trailing pct.
+        if let Some(peak) = peak_price {
+            if peak > entry_price {
+                let trail = peak * (1.0 - trailing_stop_pct / 100.0);
+                if current_price <= trail {
+                    return Some(format!(
+                        "Trailing stop hit: ${current_price:.6} <= ${trail:.6} (peak: ${peak:.6}, trail: -{trailing_stop_pct:.0}%)"
+                    ));
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Check if the circuit breaker would allow a new trade.
+    pub fn can_trade(&self) -> bool {
+        !matches!(self.circuit_breaker(), CircuitBreaker::Halted)
     }
 }

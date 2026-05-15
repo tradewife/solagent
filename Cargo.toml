@@ -68,3 +68,9 @@ base64 = "0.22"
 rand = "0.9"
 dashmap = "6"
 parking_lot = "0.12"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+panic = "abort"

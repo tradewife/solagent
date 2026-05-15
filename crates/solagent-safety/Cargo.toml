@@ -6,7 +6,9 @@ edition.workspace = true
 [dependencies]
 solagent-core = { path = "../solagent-core" }
 solagent-data = { path = "../solagent-data" }
+solagent-portfolio = { path = "../solagent-portfolio" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 anyhow = { workspace = true }
+sqlx = { workspace = true }

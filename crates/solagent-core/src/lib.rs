@@ -63,6 +63,7 @@ pub struct RiskConfig {
     pub max_open_positions: usize,
     pub default_stop_loss_pct: f64,
     pub default_take_profit_pct: f64,
+    pub trailing_stop_pct: f64,
     pub cooldown_secs: u64,
     pub safety_score_threshold: u8,
 }
