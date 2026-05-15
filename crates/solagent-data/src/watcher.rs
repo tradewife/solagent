@@ -25,14 +25,20 @@ pub struct WatcherConfig {
     pub poll_interval: Duration,
     pub max_wallets: usize,
     pub min_value_usd: f64,
+    /// Delay between individual wallet polls within a cycle.
+    pub stagger_delay: Duration,
+    /// Duration to sleep the entire poll cycle when a 429 is encountered.
+    pub rate_limit_backoff: Duration,
 }
 
 impl Default for WatcherConfig {
     fn default() -> Self {
         Self {
-            poll_interval: Duration::from_secs(60),
-            max_wallets: 20,
+            poll_interval: Duration::from_secs(120),
+            max_wallets: 10,
             min_value_usd: 0.0,
+            stagger_delay: Duration::from_secs(3),
+            rate_limit_backoff: Duration::from_secs(30),
         }
     }
 }
@@ -129,16 +135,29 @@ impl WalletWatcher {
     async fn poll_all(&self) -> Result<()> {
         let wallets = self.watched.read().await.clone();
         for wallet in &wallets {
-            if let Err(e) = self.poll_wallet(wallet).await {
-                tracing::warn!(
-                    wallet = &wallet.address[..wallet.address.len().min(12)],
-                    error = %e,
-                    "Failed to poll wallet"
-                );
+            match self.poll_wallet(wallet).await {
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if err_str.contains("429") {
+                        tracing::warn!(
+                            wallet = &wallet.address[..wallet.address.len().min(12)],
+                            "Rate limited by Helius, backing off for {:?}",
+                            self.config.rate_limit_backoff
+                        );
+                        tokio::time::sleep(self.config.rate_limit_backoff).await;
+                    } else {
+                        tracing::warn!(
+                            wallet = &wallet.address[..wallet.address.len().min(12)],
+                            error = %e,
+                            "Failed to poll wallet"
+                        );
+                    }
+                }
+                Ok(()) => {}
             }
-            // Stagger requests to avoid Helius 429 rate limiting.
-            // Helius free tier: ~1 req/sec sustained. 20 wallets × 1.5s = 30s per cycle.
-            tokio::time::sleep(Duration::from_millis(1500)).await;
+            // Stagger requests to respect Helius free tier (~1 req/sec sustained).
+            // 10 wallets × 3s = 30s per cycle, leaving 90s idle before next cycle.
+            tokio::time::sleep(self.config.stagger_delay).await;
         }
         Ok(())
     }
