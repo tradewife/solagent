@@ -20,13 +20,16 @@ max_open_positions = 3
 default_stop_loss_pct = 15.0
 default_take_profit_pct = 300.0
 cooldown_secs = 300
-safety_score_threshold = 70
+safety_score_threshold = 60
 trailing_stop_pct = 15.0
 
 [strategies]
 active_strategies = ["whale_consensus", "accumulation", "launch_momentum", "volume_spike", "social"]
-confluence_threshold = 65.0
+confluence_threshold = 35.0
 min_signal_count = 2
+progressive_threshold_failures = 50
+progressive_threshold_step = 5.0
+progressive_threshold_floor = 20.0
 
 [data]
 jupiter_api_url = "https://quote-api.jup.ag/v6"

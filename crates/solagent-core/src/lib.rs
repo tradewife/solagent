@@ -51,8 +51,23 @@ pub struct BaseConfig {
 pub struct StrategiesConfig {
     pub active_strategies: Vec<String>,
     pub confluence_threshold: f64,
+    #[serde(default = "default_min_signal_count")]
     pub min_signal_count: usize,
+    /// Number of consecutive failures before lowering threshold.
+    #[serde(default = "default_progressive_failures")]
+    pub progressive_threshold_failures: u32,
+    /// Step to lower threshold by each time the failure count is reached.
+    #[serde(default = "default_progressive_step")]
+    pub progressive_threshold_step: f64,
+    /// Minimum threshold — never go below this value.
+    #[serde(default = "default_progressive_floor")]
+    pub progressive_threshold_floor: f64,
 }
+
+fn default_min_signal_count() -> usize { 2 }
+fn default_progressive_failures() -> u32 { 50 }
+fn default_progressive_step() -> f64 { 5.0 }
+fn default_progressive_floor() -> f64 { 20.0 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RiskConfig {

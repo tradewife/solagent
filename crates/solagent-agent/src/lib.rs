@@ -78,6 +78,117 @@ impl Default for AgentConfig {
     }
 }
 
+// ─── Progressive Threshold Lowering ──────────────────────────────────────────
+
+/// Progressive confluence threshold lowering as a safety net.
+///
+/// After N consecutive failed evaluations, lowers the confluence threshold
+/// by a fixed step, down to a configurable floor. Resets to the original
+/// value after a successful trade.
+///
+/// This ensures the agent will eventually execute trades even if signals
+/// are weak, while the auto-tuner works on improving signal quality.
+#[derive(Debug, Clone)]
+pub struct ProgressiveThreshold {
+    /// The original threshold from config.
+    original: f64,
+    /// The current (possibly lowered) threshold.
+    current: f64,
+    /// Minimum threshold — never go below this.
+    floor: f64,
+    /// Step to lower by each time the failure count is reached.
+    step: f64,
+    /// How many consecutive failures before lowering by one step.
+    failures_before_lowering: u32,
+    /// Current count of consecutive failures since last success/reset.
+    consecutive_failures: u32,
+}
+
+impl ProgressiveThreshold {
+    /// Create a new progressive threshold.
+    pub fn new(
+        original: f64,
+        floor: f64,
+        step: f64,
+        failures_before_lowering: u32,
+    ) -> Self {
+        Self {
+            original,
+            current: original,
+            floor,
+            step,
+            failures_before_lowering,
+            consecutive_failures: 0,
+        }
+    }
+
+    /// Create with default values: step=5, floor=20, failures=50.
+    pub fn with_original(original: f64) -> Self {
+        Self::new(original, 20.0, 5.0, 50)
+    }
+
+    /// Create from config values.
+    pub fn from_config(
+        original: f64,
+        failures: u32,
+        step: f64,
+        floor: f64,
+    ) -> Self {
+        Self::new(original, floor, step, failures)
+    }
+
+    /// Get the current effective threshold.
+    pub fn current(&self) -> f64 {
+        self.current
+    }
+
+    /// Get the original (config) threshold.
+    pub fn original(&self) -> f64 {
+        self.original
+    }
+
+    /// Record a failed evaluation (confluence score < threshold).
+    /// Returns true if the threshold was lowered.
+    pub fn record_failure(&mut self) -> bool {
+        self.consecutive_failures += 1;
+        if self.consecutive_failures >= self.failures_before_lowering
+            && self.current > self.floor
+        {
+            let old = self.current;
+            self.current = (self.current - self.step).max(self.floor);
+            self.consecutive_failures = 0; // Reset counter after each lowering
+            tracing::warn!(
+                old_threshold = old,
+                new_threshold = self.current,
+                floor = self.floor,
+                "Progressive threshold lowered after {} consecutive failures",
+                self.failures_before_lowering,
+            );
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Record a successful trade. Resets threshold to original config value.
+    pub fn record_success(&mut self) {
+        if self.current != self.original {
+            tracing::warn!(
+                old_threshold = self.current,
+                new_threshold = self.original,
+                "Progressive threshold RESET to original after successful trade"
+            );
+        }
+        self.current = self.original;
+        self.consecutive_failures = 0;
+    }
+
+    /// Check if the threshold has been lowered from the original.
+    pub fn is_lowered(&self) -> bool {
+        (self.current - self.original).abs() > f64::EPSILON && self.current < self.original
+    }
+}
+
 // ─── Per-Position Exit Tracking ───────────────────────────────────────────────
 
 /// Tracks exit parameters for an open position (peak price + trailing stop).
@@ -120,6 +231,9 @@ pub struct Agent {
     position_exits: Arc<tokio::sync::RwLock<std::collections::HashMap<String, PositionExit>>>,
     /// Recently-evaluated tokens with cooldown (address -> last eval time).
     eval_cooldown: Arc<tokio::sync::RwLock<std::collections::HashMap<String, DateTime<Utc>>>>,
+    /// Progressive threshold lowering: lowers confluence threshold after
+    /// N consecutive failed evaluations, resets on successful trade.
+    progressive_threshold: Arc<tokio::sync::RwLock<ProgressiveThreshold>>,
 }
 
 impl Agent {
@@ -127,6 +241,7 @@ impl Agent {
     pub fn new(config: AgentConfig, subsystems: AgentSubsystems) -> Self {
         let event_bus = subsystems.event_bus.clone();
         let _ = event_bus;
+        let progressive = ProgressiveThreshold::with_original(subsystems.confluence_threshold);
         Self {
             state: Arc::new(tokio::sync::RwLock::new(AgentState::Scanning)),
             config,
@@ -135,6 +250,7 @@ impl Agent {
             running: Arc::new(tokio::sync::RwLock::new(false)),
             position_exits: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             eval_cooldown: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            progressive_threshold: Arc::new(tokio::sync::RwLock::new(progressive)),
         }
     }
 
@@ -142,6 +258,7 @@ impl Agent {
     pub fn new_minimal(config: AgentConfig, event_bus: EventBus) -> Self {
         // This is used when the agent is created without full subsystems.
         // The subsystems field won't be usable, but scan/monitor won't be called.
+        let threshold = 65.0;
         Self {
             state: Arc::new(tokio::sync::RwLock::new(AgentState::Scanning)),
             config,
@@ -166,8 +283,8 @@ impl Agent {
                     sqlx::SqlitePool::connect_lazy("sqlite::memory:").unwrap(),
                 ),
                 event_bus,
-                confluence: std::sync::Mutex::new(solagent_signals::ConfluenceScorer::new(65.0)),
-                confluence_threshold: 65.0,
+                confluence: std::sync::Mutex::new(solagent_signals::ConfluenceScorer::new(threshold)),
+                confluence_threshold: threshold,
                 watcher: None,
                 gmgn: solagent_data::GmgnClient::new(),
             }),
@@ -175,6 +292,9 @@ impl Agent {
             running: Arc::new(tokio::sync::RwLock::new(false)),
             position_exits: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             eval_cooldown: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            progressive_threshold: Arc::new(tokio::sync::RwLock::new(
+                ProgressiveThreshold::with_original(threshold),
+            )),
         }
     }
 
@@ -343,7 +463,9 @@ impl Agent {
         let confluence_result = confluence.score(token).await?;
         drop(confluence);
 
-        let confluence_passed = confluence_result.passed;
+        // Use progressive threshold (may be lowered after many failures).
+        let effective_threshold = self.progressive_threshold.read().await.current();
+        let confluence_passed = confluence_result.composite_score as f64 >= effective_threshold;
         let confluence_score = confluence_result.composite_score;
         let signals = confluence_result.signals;
 
@@ -361,7 +483,7 @@ impl Agent {
         let reasons = if !safety_passed {
             format!("safety({safety_score}<{})", self.subsystems.safety.threshold)
         } else if !confluence_passed {
-            format!("confluence({confluence_score}<{})", self.subsystems.confluence_threshold)
+            format!("confluence({confluence_score}<{effective_threshold:.0})")
         } else {
             "all passed".to_string()
         };
@@ -370,8 +492,9 @@ impl Agent {
             token = &token.address,
             safety_score,
             confluence_score,
+            effective_threshold = effective_threshold,
             status,
-            "Evaluation: [{status}] safety={safety_score} confluence={confluence_score} signals=[{}] ({reasons})",
+            "Evaluation: [{status}] safety={safety_score} confluence={confluence_score}/{effective_threshold:.0} signals=[{}] ({reasons})",
             signal_summary.join(", "),
         );
 
@@ -382,7 +505,7 @@ impl Agent {
             safety_score,
             signals,
             passed,
-            reasoning: format!("Safety: {safety_score}/100, Confluence: {confluence_score}/100 [{reasons}]", ),
+            reasoning: format!("Safety: {safety_score}/100, Confluence: {confluence_score}/100 (threshold={effective_threshold:.0}) [{reasons}]", ),
             market_cap: token.market_cap_usd,
             age_hours,
         })
@@ -791,8 +914,14 @@ impl Agent {
                                             // Risk check.
                                             match self.risk_check(&result).await {
                                                 Ok(true) => {
-                                                    if let Err(e) = self.execute(&result).await {
-                                                        tracing::error!(error = %e, "Execution failed");
+                                                    match self.execute(&result).await {
+                                                        Ok(()) => {
+                                                            // Successful trade — reset progressive threshold.
+                                                            self.progressive_threshold.write().await.record_success();
+                                                        }
+                                                        Err(e) => {
+                                                            tracing::error!(error = %e, "Execution failed");
+                                                        }
                                                     }
                                                 }
                                                 Ok(false) => {
@@ -805,6 +934,9 @@ impl Agent {
                                                     tracing::error!(error = %e, "Risk check error");
                                                 }
                                             }
+                                        } else {
+                                            // Evaluation failed — record for progressive threshold.
+                                            self.progressive_threshold.write().await.record_failure();
                                         }
                                     }
                                     Err(e) => {
@@ -875,4 +1007,153 @@ pub struct EvaluationResult {
     pub market_cap: Option<f64>,
     /// Token age in hours (from pair creation time).
     pub age_hours: Option<f64>,
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ─── ProgressiveThreshold Tests ──────────────────────────────────────
+
+    #[test]
+    fn test_progressive_threshold_starts_at_original() {
+        let pt = ProgressiveThreshold::new(35.0, 20.0, 5.0, 50);
+        assert!((pt.current() - 35.0).abs() < f64::EPSILON);
+        assert!((pt.original() - 35.0).abs() < f64::EPSILON);
+        assert!(!pt.is_lowered());
+    }
+
+    #[test]
+    fn test_progressive_threshold_with_original_default() {
+        let pt = ProgressiveThreshold::with_original(35.0);
+        assert!((pt.current() - 35.0).abs() < f64::EPSILON);
+        assert!((pt.original() - 35.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_progressive_threshold_lowers_after_n_failures() {
+        let mut pt = ProgressiveThreshold::new(35.0, 20.0, 5.0, 50);
+
+        // Record 49 failures — should NOT lower yet.
+        for _ in 0..49 {
+            let lowered = pt.record_failure();
+            assert!(!lowered);
+        }
+        assert!((pt.current() - 35.0).abs() < f64::EPSILON, "Should not lower before 50 failures");
+
+        // 50th failure — should lower to 30.
+        let lowered = pt.record_failure();
+        assert!(lowered, "Should lower on 50th failure");
+        assert!((pt.current() - 30.0).abs() < f64::EPSILON, "Should be 30 after first lowering, got {}", pt.current());
+        assert!(pt.is_lowered());
+    }
+
+    #[test]
+    fn test_progressive_threshold_respects_floor() {
+        // Start at 30, step=5, floor=25 → can only lower once (30→25).
+        let mut pt = ProgressiveThreshold::new(30.0, 25.0, 5.0, 10);
+
+        // 10 failures → lower to 25 (at floor).
+        for _ in 0..10 {
+            pt.record_failure();
+        }
+        assert!((pt.current() - 25.0).abs() < f64::EPSILON, "Should be at floor 25, got {}", pt.current());
+
+        // Another 10 failures → should stay at floor.
+        for _ in 0..10 {
+            let lowered = pt.record_failure();
+            assert!(!lowered, "Should NOT lower below floor");
+        }
+        assert!((pt.current() - 25.0).abs() < f64::EPSILON, "Should still be at floor 25, got {}", pt.current());
+    }
+
+    #[test]
+    fn test_progressive_threshold_resets_on_success() {
+        let mut pt = ProgressiveThreshold::new(35.0, 20.0, 5.0, 50);
+
+        // Lower to 30.
+        for _ in 0..50 {
+            pt.record_failure();
+        }
+        assert!((pt.current() - 30.0).abs() < f64::EPSILON);
+
+        // Record success — should reset to 35.
+        pt.record_success();
+        assert!((pt.current() - 35.0).abs() < f64::EPSILON, "Should reset to original 35, got {}", pt.current());
+        assert!(!pt.is_lowered());
+    }
+
+    #[test]
+    fn test_progressive_threshold_stepwise_lowering() {
+        // Start at 35, step=5, floor=20, failures=10 → should lower in steps: 35→30→25→20.
+        let mut pt = ProgressiveThreshold::new(35.0, 20.0, 5.0, 10);
+
+        // First lowering: 35→30 after 10 failures.
+        for _ in 0..10 {
+            pt.record_failure();
+        }
+        assert!((pt.current() - 30.0).abs() < f64::EPSILON, "First lowering: should be 30, got {}", pt.current());
+
+        // Second lowering: 30→25 after another 10 failures.
+        for _ in 0..10 {
+            pt.record_failure();
+        }
+        assert!((pt.current() - 25.0).abs() < f64::EPSILON, "Second lowering: should be 25, got {}", pt.current());
+
+        // Third lowering: 25→20 (at floor) after another 10 failures.
+        for _ in 0..10 {
+            pt.record_failure();
+        }
+        assert!((pt.current() - 20.0).abs() < f64::EPSILON, "Third lowering: should be at floor 20, got {}", pt.current());
+
+        // No more lowering possible.
+        for _ in 0..10 {
+            let lowered = pt.record_failure();
+            assert!(!lowered, "Should not lower below floor");
+        }
+        assert!((pt.current() - 20.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_progressive_threshold_consecutive_counter_resets_on_success() {
+        let mut pt = ProgressiveThreshold::new(35.0, 20.0, 5.0, 50);
+
+        // 30 failures.
+        for _ in 0..30 {
+            pt.record_failure();
+        }
+        assert!((pt.current() - 35.0).abs() < f64::EPSILON, "Should not have lowered yet");
+
+        // Success resets the counter.
+        pt.record_success();
+
+        // 30 more failures — should still be at 35 (counter reset, need 50 fresh).
+        for _ in 0..30 {
+            pt.record_failure();
+        }
+        assert!((pt.current() - 35.0).abs() < f64::EPSILON, "Should still be at 35 after success reset");
+
+        // 20 more failures = 50 total since last success → should lower.
+        for _ in 0..19 {
+            pt.record_failure();
+        }
+        assert!((pt.current() - 35.0).abs() < f64::EPSILON, "Should not lower before 50");
+        let lowered = pt.record_failure(); // 50th
+        assert!(lowered, "Should lower on 50th failure after success reset");
+        assert!((pt.current() - 30.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_progressive_threshold_exact_floor_step() {
+        // When current - step would go below floor, clamp to floor.
+        let mut pt = ProgressiveThreshold::new(23.0, 20.0, 5.0, 10);
+
+        for _ in 0..10 {
+            pt.record_failure();
+        }
+        // 23 - 5 = 18, but floor is 20, so should clamp to 20.
+        assert!((pt.current() - 20.0).abs() < f64::EPSILON, "Should clamp to floor 20, got {}", pt.current());
+    }
 }
