@@ -9,7 +9,7 @@ pub mod wallet;
 pub use db::{init_pool, MIGRATION_SQL};
 pub use portfolio::{
     DailySnapshot, EvalStats, EvaluationRecord, PnlSummary, PortfolioManager,
-    PortfolioPosition, PositionStatus,
+    PortfolioPosition, PositionStatus, TwitterAccount,
 };
 pub use wallet::{
     DevBlacklistEntry, WalletEntry, WalletLabel, WalletRegistry,

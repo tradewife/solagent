@@ -380,6 +380,28 @@ impl Agent {
                 .map(|ms| chrono::DateTime::from_timestamp_millis(ms))
                 .flatten();
 
+            // Extract Twitter handles from DexScreener social links and upsert
+            // into the twitter_accounts table for curated timeline polling.
+            if let Some(ref info) = pair.info {
+                let handles = solagent_signals::extract_twitter_handles(&info.socials);
+                if !handles.is_empty() {
+                    tracing::debug!(
+                        token = &pair.base_token.address[..pair.base_token.address.len().min(12)],
+                        handles = handles.join(","),
+                        "Extracted Twitter handles from DexScreener socials"
+                    );
+                    for handle in &handles {
+                        if let Err(e) = self.subsystems.portfolio.upsert_twitter_account(
+                            handle,
+                            Some(&pair.base_token.address),
+                            None,
+                        ).await {
+                            tracing::debug!(handle, error = %e, "Failed to upsert Twitter account");
+                        }
+                    }
+                }
+            }
+
             tokens.push(TokenInfo {
                 address: pair.base_token.address.clone(),
                 chain: Chain::Solana,
@@ -860,6 +882,29 @@ impl Agent {
                     // Poll social signal (twitter search) each scan cycle.
                     if let Err(e) = self.subsystems.confluence.lock().unwrap().poll_social().await {
                         tracing::debug!(error = %e, "Social signal poll skipped");
+                    }
+
+                    // Poll curated Twitter account timelines for token-specific mentions.
+                    // These are handles extracted from DexScreener social links.
+                    match self.subsystems.portfolio.get_stale_twitter_accounts(60, 10).await {
+                        Ok(accounts) => {
+                            if !accounts.is_empty() {
+                                let handles: Vec<String> = accounts.iter().map(|a| a.handle.clone()).collect();
+                                let count = self.subsystems.confluence.lock().unwrap().poll_social_accounts(&handles).await;
+                                if count > 0 {
+                                    tracing::info!(count, handles = handles.len(), "Curated Twitter accounts mentioned tokens");
+                                }
+                                // Mark accounts as polled.
+                                for account in &accounts {
+                                    if let Err(e) = self.subsystems.portfolio.mark_twitter_account_polled(&account.handle).await {
+                                        tracing::debug!(handle = %account.handle, error = %e, "Failed to mark Twitter account as polled");
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(error = %e, "Failed to get stale Twitter accounts");
+                        }
                     }
 
                     match self.scan().await {

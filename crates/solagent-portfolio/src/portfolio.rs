@@ -7,6 +7,22 @@ use solagent_core::Chain;
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
+// ─── Twitter Account ─────────────────────────────────────────────────────────
+
+/// A curated Twitter account extracted from DexScreener social links.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TwitterAccount {
+    pub id: i64,
+    pub handle: String,
+    /// Token address that first referenced this account.
+    pub source_token: Option<String>,
+    pub followers_count: Option<i64>,
+    pub last_polled_at: Option<DateTime<Utc>>,
+    pub mention_count: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 // ─── Evaluation Record ───────────────────────────────────────────────────────
 
 /// A persisted evaluation result for a token.
@@ -112,6 +128,11 @@ pub struct PortfolioManager {
 impl PortfolioManager {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
+    }
+
+    /// Get a reference to the underlying SQLite pool.
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
     }
 
     /// Open a new position.
@@ -489,6 +510,103 @@ impl PortfolioManager {
             top_tokens: top_rows,
         })
     }
+
+    // ─── Twitter Account Management ─────────────────────────────────────
+
+    /// Upsert a Twitter account into the twitter_accounts table.
+    /// If the handle already exists, updates source_token and followers_count.
+    /// Returns the row ID.
+    pub async fn upsert_twitter_account(
+        &self,
+        handle: &str,
+        source_token: Option<&str>,
+        followers_count: Option<i64>,
+    ) -> Result<i64> {
+        let now_str = Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            r#"INSERT INTO twitter_accounts (handle, source_token, followers_count, created_at, updated_at)
+               VALUES (?1, ?2, ?3, ?4, ?4)
+               ON CONFLICT(handle) DO UPDATE SET
+                 source_token = COALESCE(excluded.source_token, twitter_accounts.source_token),
+                 followers_count = COALESCE(excluded.followers_count, twitter_accounts.followers_count),
+                 updated_at = excluded.updated_at"#,
+        )
+        .bind(handle)
+        .bind(source_token)
+        .bind(followers_count)
+        .bind(&now_str)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Get all Twitter accounts, optionally filtered by whether they've been polled.
+    /// Returns handles sorted by last_polled_at ASC (oldest-first) for polling priority.
+    pub async fn get_twitter_accounts(&self, limit: i64) -> Result<Vec<TwitterAccount>> {
+        let rows = sqlx::query_as::<_, TwitterAccountRow>(
+            "SELECT * FROM twitter_accounts ORDER BY last_polled_at ASC NULLS FIRST LIMIT ?1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(|r| r.into_account()).collect())
+    }
+
+    /// Get handles that need polling (never polled or polled more than N minutes ago).
+    pub async fn get_stale_twitter_accounts(&self, max_age_minutes: i64, limit: i64) -> Result<Vec<TwitterAccount>> {
+        let cutoff = Utc::now() - chrono::Duration::minutes(max_age_minutes);
+        let cutoff_str = cutoff.to_rfc3339();
+
+        let rows = sqlx::query_as::<_, TwitterAccountRow>(
+            r#"SELECT * FROM twitter_accounts
+               WHERE last_polled_at IS NULL OR last_polled_at < ?1
+               ORDER BY last_polled_at ASC NULLS FIRST
+               LIMIT ?2"#,
+        )
+        .bind(&cutoff_str)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(|r| r.into_account()).collect())
+    }
+
+    /// Mark a Twitter account as polled at the current time.
+    pub async fn mark_twitter_account_polled(&self, handle: &str) -> Result<()> {
+        let now_str = Utc::now().to_rfc3339();
+        sqlx::query(
+            "UPDATE twitter_accounts SET last_polled_at = ?1, updated_at = ?1 WHERE handle = ?2",
+        )
+        .bind(&now_str)
+        .bind(handle)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Increment the mention count for a Twitter account.
+    pub async fn increment_twitter_mention_count(&self, handle: &str, count: i64) -> Result<()> {
+        let now_str = Utc::now().to_rfc3339();
+        sqlx::query(
+            "UPDATE twitter_accounts SET mention_count = mention_count + ?1, updated_at = ?2 WHERE handle = ?3",
+        )
+        .bind(count)
+        .bind(&now_str)
+        .bind(handle)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Get the count of Twitter accounts in the table.
+    pub async fn get_twitter_account_count(&self) -> Result<i64> {
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM twitter_accounts")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count)
+    }
 }
 
 // ─── Internal Row Types ──────────────────────────────────────────────────────
@@ -612,6 +730,39 @@ impl EvaluationRow {
             passed: self.passed != 0,
             reasoning: self.reasoning,
             created_at: DateTime::parse_from_rfc3339(&self.created_at)
+                .map(|dt| dt.to_utc())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct TwitterAccountRow {
+    id: i64,
+    handle: String,
+    source_token: Option<String>,
+    followers_count: Option<i64>,
+    last_polled_at: Option<String>,
+    mention_count: i64,
+    created_at: String,
+    updated_at: String,
+}
+
+impl TwitterAccountRow {
+    fn into_account(self) -> TwitterAccount {
+        TwitterAccount {
+            id: self.id,
+            handle: self.handle,
+            source_token: self.source_token,
+            followers_count: self.followers_count,
+            last_polled_at: self.last_polled_at
+                .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                .map(|dt| dt.to_utc()),
+            mention_count: self.mention_count,
+            created_at: DateTime::parse_from_rfc3339(&self.created_at)
+                .map(|dt| dt.to_utc())
+                .unwrap_or_default(),
+            updated_at: DateTime::parse_from_rfc3339(&self.updated_at)
                 .map(|dt| dt.to_utc())
                 .unwrap_or_default(),
         }

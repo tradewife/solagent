@@ -102,6 +102,22 @@ CREATE INDEX IF NOT EXISTS idx_trades_token ON trades(token_address);
 CREATE INDEX IF NOT EXISTS idx_trades_executed ON trades(executed_at);
 CREATE INDEX IF NOT EXISTS idx_evaluations_token ON evaluations(token_address);
 CREATE INDEX IF NOT EXISTS idx_evaluations_created ON evaluations(created_at);
+
+-- Curated Twitter accounts extracted from DexScreener social links.
+-- These are polled periodically for token-specific mentions.
+CREATE TABLE IF NOT EXISTS twitter_accounts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    handle TEXT NOT NULL UNIQUE,
+    source_token TEXT,
+    followers_count INTEGER,
+    last_polled_at TEXT,
+    mention_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_twitter_accounts_handle ON twitter_accounts(handle);
+CREATE INDEX IF NOT EXISTS idx_twitter_accounts_last_polled ON twitter_accounts(last_polled_at);
 "#;
 
 /// Open a SQLite pool and run all migrations.
