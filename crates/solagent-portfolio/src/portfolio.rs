@@ -610,6 +610,37 @@ impl PortfolioManager {
         Ok(count)
     }
 
+    /// Get an open position by token address.
+    pub async fn get_position_by_token(&self, token_address: &str) -> Result<Option<PortfolioPosition>> {
+        let row = sqlx::query_as::<_, PositionRow>(
+            "SELECT * FROM positions WHERE token_address = ?1 AND status = 'open' LIMIT 1",
+        )
+        .bind(token_address)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.into_position()))
+    }
+
+    /// Update token_amount and size_usd for an existing position (e.g. after decimals fix).
+    pub async fn update_position_amounts(
+        &self,
+        position_id: &str,
+        token_amount: f64,
+        size_usd: f64,
+    ) -> Result<()> {
+        let now_str = Utc::now().to_rfc3339();
+        sqlx::query(
+            "UPDATE positions SET token_amount = ?1, size_usd = ?2, updated_at = ?3 WHERE id = ?4",
+        )
+        .bind(token_amount)
+        .bind(size_usd)
+        .bind(&now_str)
+        .bind(position_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     // ─── On-Chain Reconciliation ─────────────────────────────────────────
 
     /// Reconcile positions by scanning the wallet's on-chain token accounts.
@@ -639,15 +670,10 @@ impl PortfolioManager {
                 continue;
             }
 
-            // Skip if already recorded as an open position.
-            if recorded_tokens.contains(mint) {
-                continue;
-            }
-
             let token_amount = *raw_amount as f64 / 10f64.powi(*decimals as i32);
 
             // Try to get current price from DexScreener.
-            let (current_price, market_cap) = match dex.get_token_info(mint).await {
+            let (current_price, _market_cap) = match dex.get_token_info(mint).await {
                 Ok(Some(pair)) => {
                     let price = pair.price_usd
                         .and_then(|p| p.parse::<f64>().ok())
@@ -659,6 +685,31 @@ impl PortfolioManager {
 
             let size_usd = token_amount * current_price;
 
+            // Update existing positions that may have stale token_amount/size_usd
+            // (e.g. from before the per-token decimals fix).
+            if recorded_tokens.contains(mint) {
+                match self.get_position_by_token(mint).await {
+                    Ok(Some(existing)) => {
+                        let amount_changed = (existing.token_amount - token_amount).abs() > token_amount * 0.01;
+                        if amount_changed {
+                            tracing::info!(
+                                mint = %mint,
+                                old_amount = existing.token_amount,
+                                new_amount = token_amount,
+                                old_size_usd = existing.size_usd,
+                                new_size_usd = size_usd,
+                                "Updating existing position with corrected on-chain balance"
+                            );
+                            self.update_position_amounts(&existing.id, token_amount, size_usd).await?;
+                            reconciled += 1;
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
             tracing::info!(
                 mint = %mint,
                 token_amount,
@@ -668,19 +719,17 @@ impl PortfolioManager {
             );
 
             // Create position record with conservative defaults.
-            // Use stop_loss at -15% and no take_profit (monitor loop will manage).
             let sl = if current_price > 0.0 {
                 Some(current_price * 0.85)
             } else {
                 None
             };
 
-            // Determine appropriate exit profile based on market cap.
-            let profile = if let Some(mc) = market_cap {
+            let profile = if let Some(mc) = _market_cap {
                 solagent_risk::RiskManager::select_exit_profile(
                     Some(mc),
-                    None, // age unknown for reconciled positions
-                    50,   // default confluence score
+                    None,
+                    50,
                 )
             } else {
                 solagent_risk::ExitProfile::swing()
