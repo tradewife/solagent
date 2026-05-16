@@ -189,10 +189,20 @@ impl DexScreenerClient {
         );
         let resp: DexTokenResponse = self.client.get_json(&url).await?;
         Ok(resp.pairs.and_then(|mut p| {
+            // Score pairs by liquidity × volume/liquidity ratio.
+            // This penalizes pools with high liquidity but zero real volume
+            // (e.g. manipulated or dead pools where price is meaningless).
             p.sort_by(|a, b| {
-                let liq_a = a.liquidity.as_ref().and_then(|l| l.usd).unwrap_or(0.0);
-                let liq_b = b.liquidity.as_ref().and_then(|l| l.usd).unwrap_or(0.0);
-                liq_b.partial_cmp(&liq_a).unwrap_or(std::cmp::Ordering::Equal)
+                let score = |pair: &DexPair| -> f64 {
+                    let liq = pair.liquidity.as_ref().and_then(|l| l.usd).unwrap_or(0.0);
+                    let vol = pair.volume.as_ref().and_then(|v| v.h24).unwrap_or(0.0);
+                    if liq <= 0.0 { return 0.0; }
+                    let ratio = (vol / liq).min(1.0);
+                    liq * ratio
+                };
+                let score_a = score(a);
+                let score_b = score(b);
+                score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
             });
             p.into_iter().next()
         }))
