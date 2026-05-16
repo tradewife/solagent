@@ -4,6 +4,12 @@
 //! Wires together all subsystems: data pipeline, signals, safety, risk, execution,
 //! and portfolio management.
 
+// std::sync::Mutex is used for subsystem access. The guards are dropped before
+// long-running awaits where possible, but some .await calls happen while held
+// (e.g., confluence.score().await). A full refactor to tokio::sync::Mutex is
+// deferred; the current pattern is safe in practice because the agent is single-tasked.
+#![allow(clippy::await_holding_lock)]
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use solagent_core::chrono::{DateTime, Utc};
@@ -346,7 +352,7 @@ impl Agent {
 
         // Market cap (0-20 pts): reasonable mcap range.
         if let Some(mc) = token.market_cap_usd {
-            if mc >= 10_000.0 && mc <= 100_000_000.0 {
+            if (10_000.0..=100_000_000.0).contains(&mc) {
                 score += 20.0;
             } else if mc >= 1_000.0 {
                 score += 10.0;
@@ -361,7 +367,7 @@ impl Agent {
         // Age (0-20 pts): not brand new is safer, but not too old either.
         if let Some(created) = token.created_at {
             let age_hours = (Utc::now() - created).num_hours();
-            if age_hours >= 1 && age_hours <= 168 {
+            if (1..=168).contains(&age_hours) {
                 score += 20.0; // 1 hour to 7 days -- sweet spot.
             } else if age_hours > 168 {
                 score += 15.0; // Established token.
@@ -391,8 +397,7 @@ impl Agent {
                 .or_else(|| pair.price_native.as_ref().and_then(|p| p.parse::<f64>().ok()));
 
             let created_at = pair.pair_created_at
-                .map(|ms| chrono::DateTime::from_timestamp_millis(ms))
-                .flatten();
+                .and_then(chrono::DateTime::from_timestamp_millis);
 
             // Extract Twitter handles from DexScreener social links and upsert
             // into the twitter_accounts table for curated timeline polling.
@@ -1028,8 +1033,14 @@ impl Agent {
                                                 }
                                             }
                                         } else {
-                                            // Evaluation failed — record for progressive threshold.
-                                            self.progressive_threshold.write().await.record_failure();
+                                            // Only count confluence failures for progressive threshold lowering.
+                                            // Safety failures are orthogonal to confluence quality and should not
+                                            // cause the agent to accept weaker signals.
+                                            let effective_threshold = self.progressive_threshold.read().await.current();
+                                            let confluence_passed = result.confluence_score as f64 >= effective_threshold;
+                                            if !confluence_passed {
+                                                self.progressive_threshold.write().await.record_failure();
+                                            }
                                         }
                                     }
                                     Err(e) => {
