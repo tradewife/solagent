@@ -489,7 +489,7 @@ impl ExecutionEngine {
 
     /// Get all SPL token balances for the wallet (mint_address, raw_amount).
     /// Returns None if the Solana provider is not configured.
-    pub async fn get_all_token_balances(&self) -> Option<Vec<(String, u64)>> {
+    pub async fn get_all_token_balances(&self) -> Option<Vec<(String, u64, u8)>> {
         let provider = self.solana_provider.as_ref()?;
         match provider.get_all_token_balances().await {
             Ok(balances) => {
@@ -513,6 +513,6 @@ impl ExecutionEngine {
         let Some(balances) = self.get_all_token_balances().await else {
             anyhow::bail!("Cannot reconcile: Solana provider not configured");
         };
-        portfolio.reconcile_positions(&balances, 6, dex).await
+        portfolio.reconcile_positions(&balances, dex).await
     }
 }

@@ -150,9 +150,9 @@ impl SolanaProvider {
         Ok(0)
     }
 
-    /// List all SPL token accounts owned by this wallet, returning (mint_address, raw_amount).
+    /// List all SPL token accounts owned by this wallet, returning (mint_address, raw_amount, decimals).
     /// Falls back from Helius to public RPC on failure.
-    pub async fn get_all_token_balances(&self) -> Result<Vec<(String, u64)>> {
+    pub async fn get_all_token_balances(&self) -> Result<Vec<(String, u64, u8)>> {
         match self.get_all_token_balances_inner().await {
             Ok(balances) => Ok(balances),
             Err(e) => {
@@ -162,7 +162,7 @@ impl SolanaProvider {
         }
     }
 
-    async fn get_all_token_balances_inner(&self) -> Result<Vec<(String, u64)>> {
+    async fn get_all_token_balances_inner(&self) -> Result<Vec<(String, u64, u8)>> {
         let address = self.pubkeys();
         let rpc = self.get_rpc().await;
         // Use ProgramId filter for the SPL Token program to get all token accounts.
@@ -186,7 +186,7 @@ impl SolanaProvider {
                     .and_then(|s| s.parse::<u64>().ok());
                 if let (Some(mint), Some(amount)) = (mint, amount) {
                     if amount > 0 {
-                        balances.push((mint, amount));
+                        balances.push((mint, amount, 6));  // default 6 decimals for parsed path
                     }
                     continue;
                 }
@@ -205,7 +205,7 @@ impl SolanaProvider {
                         decoded[64..72].try_into().unwrap_or([0u8; 8])
                     );
                     if amount > 0 {
-                        balances.push((mint, amount));
+                        balances.push((mint, amount, 6));  // default 6 decimals for fallback path
                     }
                 }
             }
@@ -219,7 +219,7 @@ impl SolanaProvider {
     /// (ATAs). The `ProgramId` filter used by the Solana RPC `getTokenAccountsByOwner` only
     /// returns accounts owned directly by the wallet's keypair — not ATAs owned by the
     /// ATA program `ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL`.
-    async fn get_all_token_balances_public(&self) -> Result<Vec<(String, u64)>> {
+    async fn get_all_token_balances_public(&self) -> Result<Vec<(String, u64, u8)>> {
         let pubkey = self.keypair.pubkey().to_string();
         tracing::info!(wallet = %pubkey, "Fetching token balances via spl-token CLI");
 
@@ -252,6 +252,8 @@ impl SolanaProvider {
             amount: String,
             #[allow(dead_code)]
             decimals: u8,
+            #[serde(rename = "uiAmount")]
+            ui_amount: f64,
         }
         #[derive(::serde::Deserialize)]
         struct SplTokenAccountsOutput {
@@ -263,10 +265,9 @@ impl SolanaProvider {
 
         let mut balances = Vec::new();
         for account in parsed.accounts {
-            if let Ok(raw_amount) = account.token_amount.amount.parse::<u64>() {
-                if raw_amount > 0 {
-                    balances.push((account.mint, raw_amount));
-                }
+            if account.token_amount.ui_amount > 0.0 {
+                let raw = (account.token_amount.ui_amount * 10f64.powi(account.token_amount.decimals as i32)) as u64;
+                balances.push((account.mint, raw, account.token_amount.decimals));
             }
         }
 

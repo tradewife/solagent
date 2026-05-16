@@ -621,8 +621,8 @@ impl PortfolioManager {
     /// Returns the number of positions reconciled (newly created).
     pub async fn reconcile_positions(
         &self,
-        on_chain_balances: &[(String, u64)],
-        token_decimals: u8,
+        on_chain_balances: &[(String, u64, u8)],
+        
         dex: &solagent_data::DexScreenerClient,
     ) -> Result<usize> {
         let open_positions = self.get_open_positions().await?;
@@ -633,7 +633,7 @@ impl PortfolioManager {
 
         let mut reconciled = 0usize;
 
-        for (mint, raw_amount) in on_chain_balances {
+        for (mint, raw_amount, decimals) in on_chain_balances {
             // Skip SOL — only handle SPL tokens.
             if mint == "So11111111111111111111111111111111111111112" {
                 continue;
@@ -644,7 +644,7 @@ impl PortfolioManager {
                 continue;
             }
 
-            let token_amount = *raw_amount as f64 / 10f64.powi(token_decimals as i32);
+            let token_amount = *raw_amount as f64 / 10f64.powi(*decimals as i32);
 
             // Try to get current price from DexScreener.
             let (current_price, market_cap) = match dex.get_token_info(mint).await {

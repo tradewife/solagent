@@ -493,21 +493,21 @@ impl RiskManager {
         }
 
         // Take profit (may be None for moonbag profile).
-        if let Some(tp) = take_profit {
-            if current_price >= tp {
-                return Some(format!("Take profit hit: ${current_price:.6} >= ${tp:.6}"));
-            }
+        if let Some(tp) = take_profit
+            && current_price >= tp
+        {
+            return Some(format!("Take profit hit: ${current_price:.6} >= ${tp:.6}"));
         }
 
         // Trailing stop -- uses the per-position trailing pct.
-        if let Some(peak) = peak_price {
-            if peak > entry_price {
-                let trail = peak * (1.0 - trailing_stop_pct / 100.0);
-                if current_price <= trail {
-                    return Some(format!(
-                        "Trailing stop hit: ${current_price:.6} <= ${trail:.6} (peak: ${peak:.6}, trail: -{trailing_stop_pct:.0}%)"
-                    ));
-                }
+        if let Some(peak) = peak_price
+            && peak > entry_price
+        {
+            let trail = peak * (1.0 - trailing_stop_pct / 100.0);
+            if current_price <= trail {
+                return Some(format!(
+                    "Trailing stop hit: ${current_price:.6} <= ${trail:.6} (peak: ${peak:.6}, trail: -{trailing_stop_pct:.0}%)"
+                ));
             }
         }
 

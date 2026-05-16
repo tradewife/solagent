@@ -135,25 +135,22 @@ impl WalletWatcher {
     async fn poll_all(&self) -> Result<()> {
         let wallets = self.watched.read().await.clone();
         for wallet in &wallets {
-            match self.poll_wallet(wallet).await {
-                Err(e) => {
-                    let err_str = e.to_string();
-                    if err_str.contains("429") {
-                        tracing::warn!(
-                            wallet = &wallet.address[..wallet.address.len().min(12)],
-                            "Rate limited by Helius, backing off for {:?}",
-                            self.config.rate_limit_backoff
-                        );
-                        tokio::time::sleep(self.config.rate_limit_backoff).await;
-                    } else {
-                        tracing::warn!(
-                            wallet = &wallet.address[..wallet.address.len().min(12)],
-                            error = %e,
-                            "Failed to poll wallet"
-                        );
-                    }
+            if let Err(e) = self.poll_wallet(wallet).await {
+                let err_str = e.to_string();
+                if err_str.contains("429") {
+                    tracing::warn!(
+                        wallet = &wallet.address[..wallet.address.len().min(12)],
+                        "Rate limited by Helius, backing off for {:?}",
+                        self.config.rate_limit_backoff
+                    );
+                    tokio::time::sleep(self.config.rate_limit_backoff).await;
+                } else {
+                    tracing::warn!(
+                        wallet = &wallet.address[..wallet.address.len().min(12)],
+                        error = %e,
+                        "Failed to poll wallet"
+                    );
                 }
-                Ok(()) => {}
             }
             // Stagger requests to respect Helius free tier (~1 req/sec sustained).
             // 10 wallets × 3s = 30s per cycle, leaving 90s idle before next cycle.
@@ -205,30 +202,29 @@ impl WalletWatcher {
             .unwrap_or_else(Utc::now);
 
         // Strategy 1: Use events.swap if available.
-        if let Some(events) = &tx.events {
-            if let Some(swap) = &events.swap {
-                if let Some(details) = self.parse_swap_event(swap, &wallet.address) {
-                    let amount_sol = details.sol_lamports as f64 / 1_000_000_000.0;
-                    let event = if details.is_buy {
-                        Event::WalletBuy {
-                            wallet: wallet.address.clone(),
-                            token_address: details.token_mint,
-                            chain: wallet.chain,
-                            amount_usd: amount_sol,
-                            timestamp: ts,
-                        }
-                    } else {
-                        Event::WalletSell {
-                            wallet: wallet.address.clone(),
-                            token_address: details.token_mint,
-                            chain: wallet.chain,
-                            amount_usd: amount_sol,
-                            timestamp: ts,
-                        }
-                    };
-                    return vec![event];
+        if let Some(events) = &tx.events
+            && let Some(swap) = &events.swap
+            && let Some(details) = self.parse_swap_event(swap, &wallet.address)
+        {
+            let amount_sol = details.sol_lamports as f64 / 1_000_000_000.0;
+            let event = if details.is_buy {
+                Event::WalletBuy {
+                    wallet: wallet.address.clone(),
+                    token_address: details.token_mint,
+                    chain: wallet.chain,
+                    amount_usd: amount_sol,
+                    timestamp: ts,
                 }
-            }
+            } else {
+                Event::WalletSell {
+                    wallet: wallet.address.clone(),
+                    token_address: details.token_mint,
+                    chain: wallet.chain,
+                    amount_usd: amount_sol,
+                    timestamp: ts,
+                }
+            };
+            return vec![event];
         }
 
         // Strategy 2: Analyze tokenTransfers for swap patterns.

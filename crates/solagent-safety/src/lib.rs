@@ -285,6 +285,7 @@ impl SafetyScorer {
     /// Compute the full safety report for a token.
     /// The caller should supply all available data; missing fields will produce
     /// moderate scores (not pass/fail on their own unless critical).
+    #[allow(clippy::too_many_arguments)]
     pub fn compute_score(
         &self,
         token_address: &str,

@@ -45,10 +45,10 @@ pub fn extract_twitter_handles(socials: &[serde_json::Value]) -> Vec<String> {
 
         // Extract handle from URL.
         let url = social.get("url").and_then(|v| v.as_str()).unwrap_or("");
-        if let Some(handle) = extract_handle_from_url(url) {
-            if !handles.contains(&handle) {
-                handles.push(handle);
-            }
+        if let Some(handle) = extract_handle_from_url(url)
+            && !handles.contains(&handle)
+        {
+            handles.push(handle);
         }
     }
 
@@ -389,6 +389,7 @@ impl Strategy for WhaleConsensusSignal {
 /// Detects accumulation patterns: holder growth vs. price stability.
 pub struct AccumulationSignal {
     name: String,
+    #[allow(clippy::type_complexity)]
     history: Arc<DashMap<String, VecDeque<(u64, f64, DateTime<Utc>)>>>,
     max_history: usize,
     #[allow(dead_code)]
@@ -466,6 +467,7 @@ impl Strategy for AccumulationSignal {
 /// Detects momentum in newly launched tokens (volume and holder rate).
 pub struct LaunchMomentumSignal {
     name: String,
+    #[allow(clippy::type_complexity)]
     snapshots: Arc<DashMap<String, VecDeque<(f64, u64, DateTime<Utc>)>>>,
     max_snapshots: usize,
     /// Minimum liquidity (USD) for a launch to qualify.
@@ -542,19 +544,18 @@ impl Strategy for LaunchMomentumSignal {
         }
 
         // Check liquidity filter.
-        if let Some(_vol) = token.volume_24h {
-            if let Some(mc) = token.market_cap_usd {
-                if mc < self.min_liquidity {
-                    return Ok(Signal::new(
-                        token.address.clone(),
-                        token.chain,
-                        &self.name,
-                        0,
-                        0.0,
-                        format!("MC ${mc:.0} below ${} threshold", self.min_liquidity),
-                    ));
-                }
-            }
+        if let Some(_vol) = token.volume_24h
+            && let Some(mc) = token.market_cap_usd
+            && mc < self.min_liquidity
+        {
+            return Ok(Signal::new(
+                token.address.clone(),
+                token.chain,
+                &self.name,
+                0,
+                0.0,
+                format!("MC ${mc:.0} below ${} threshold", self.min_liquidity),
+            ));
         }
 
         let score = if let Some(snaps) = self.snapshots.get(&token.address) {
@@ -603,6 +604,7 @@ impl Strategy for LaunchMomentumSignal {
 pub struct VolumeSpikeSignal {
     name: String,
     threshold: f64,
+    #[allow(clippy::type_complexity)]
     volumes: Arc<DashMap<String, VecDeque<(f64, DateTime<Utc>)>>>,
     window_size: usize,
     #[allow(dead_code)]
@@ -902,10 +904,10 @@ impl SocialSignal {
             // If this was a CA-specific search and no CAs extracted from text,
             // attribute the tweet to the queried CA anyway (the tweet matched
             // the CA in the search so it IS about this token).
-            if cas.is_empty() {
-                if let Some(ref ca) = query_ca {
-                    cas.push(ca.clone());
-                }
+            if cas.is_empty()
+                && let Some(ref ca) = query_ca
+            {
+                cas.push(ca.clone());
             }
 
             let author = tweet.author.as_ref()
@@ -940,7 +942,7 @@ impl SocialSignal {
         let mut cas = Vec::new();
         for word in text.split_whitespace() {
             // Strip trailing punctuation.
-            let cleaned = word.trim_end_matches(|c: char| c == '.' || c == ',' || c == '!' || c == '?' || c == ':' || c == ';' || c == ')');
+            let cleaned = word.trim_end_matches(['.', ',', '!', '?', ':', ';', ')']);
             // pump.fun addresses end with "pump" and are 32-44 chars of base58.
             let is_pump = cleaned.len() >= 32 && cleaned.len() <= 44 && cleaned.ends_with("pump");
             let is_base58 = cleaned.len() >= 32 && cleaned.len() <= 44

@@ -169,14 +169,14 @@ impl DexScreenerClient {
                 "{}/latest/dex/tokens/{}",
                 self.base_url, boost.token_address
             );
-            if let Ok(resp) = self.client.get_json::<DexTokenResponse>(&token_url).await {
-                if let Some(pairs) = resp.pairs {
-                    let chain_pairs: Vec<DexPair> = pairs
-                        .into_iter()
-                        .filter(|p| p.chain_id == chain)
-                        .collect();
-                    all_pairs.extend(chain_pairs);
-                }
+            if let Ok(resp) = self.client.get_json::<DexTokenResponse>(&token_url).await
+                && let Some(pairs) = resp.pairs
+            {
+                let chain_pairs: Vec<DexPair> = pairs
+                    .into_iter()
+                    .filter(|p| p.chain_id == chain)
+                    .collect();
+                all_pairs.extend(chain_pairs);
             }
         }
         Ok(all_pairs)
