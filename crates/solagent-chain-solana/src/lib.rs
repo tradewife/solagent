@@ -115,15 +115,18 @@ impl SolanaProvider {
         let account_json = serde_json::to_value(&account.account)?;
         if let Some(data_val) = account_json.get("parsed").and_then(|p| p.get("info")) {
             // Try tokenAmount.amount first (standard parsed format).
-            if let Some(amt) = data_val.get("tokenAmount").and_then(|t| t.get("amount")) {
-                if let Some(s) = amt.as_str() {
-                    if let Ok(v) = s.parse::<u64>() { return Ok(v); }
-                }
+            if let Some(amt) = data_val.get("tokenAmount").and_then(|t| t.get("amount"))
+                && let Some(s) = amt.as_str()
+                && let Ok(v) = s.parse::<u64>()
+            {
+                return Ok(v);
             }
             // Fallback: direct "amount" field.
             if let Some(amt) = data_val.get("amount") {
-                if let Some(s) = amt.as_str() {
-                    if let Ok(v) = s.parse::<u64>() { return Ok(v); }
+                if let Some(s) = amt.as_str()
+                    && let Ok(v) = s.parse::<u64>()
+                {
+                    return Ok(v);
                 }
                 if let Some(v) = amt.as_u64() { return Ok(v); }
             }
@@ -134,18 +137,70 @@ impl SolanaProvider {
         if let Some(b64) = account_json.get("data").and_then(|d| {
             // data is [base64_string, encoding] array.
             d.as_array().and_then(|a| a.first()).and_then(|v| v.as_str())
-        }) {
-            if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(b64) {
-                if decoded.len() >= 72 {
+        })
+            && let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(b64)
+            && decoded.len() >= 72
+        {
+            let amount = u64::from_le_bytes(
+                decoded[64..72].try_into().unwrap_or([0u8; 8])
+            );
+            return Ok(amount);
+        }
+
+        Ok(0)
+    }
+
+    /// List all SPL token accounts owned by this wallet, returning (mint_address, token_amount).
+    pub async fn get_all_token_balances(&self) -> Result<Vec<(String, u64)>> {
+        let address = self.pubkeys();
+        let rpc = self.get_rpc().await;
+        // Use ProgramId filter for the SPL Token program to get all token accounts.
+        let spl_token_program: Pubkey = spl_token::ID;
+        let resp = rpc.get_token_accounts_by_owner_with_commitment(
+            &address,
+            TokenAccountsFilter::ProgramId(spl_token_program),
+            self.commitment,
+        )?;
+
+        let mut balances = Vec::new();
+        for account in resp.value {
+            let account_json = serde_json::to_value(&account.account)?;
+
+            // Try parsed format first.
+            if let Some(data_val) = account_json.get("parsed").and_then(|p| p.get("info")) {
+                let mint = data_val.get("mint").and_then(|m| m.as_str()).map(|s| s.to_string());
+                let amount = data_val.get("tokenAmount")
+                    .and_then(|t| t.get("amount"))
+                    .and_then(|s| s.as_str())
+                    .and_then(|s| s.parse::<u64>().ok());
+                if let (Some(mint), Some(amount)) = (mint, amount) {
+                    if amount > 0 {
+                        balances.push((mint, amount));
+                    }
+                    continue;
+                }
+            }
+
+            // Fallback: extract mint from account data (bytes 0-32) and amount (bytes 64-72).
+            if let Some(b64) = account_json.get("data").and_then(|d| {
+                d.as_array().and_then(|a| a.first()).and_then(|v| v.as_str())
+            }) {
+                if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(b64)
+                    && decoded.len() >= 72
+                {
+                    let mint_bytes: [u8; 32] = decoded[0..32].try_into().unwrap_or([0u8; 32]);
+                    let mint = bs58::encode(mint_bytes).into_string();
                     let amount = u64::from_le_bytes(
                         decoded[64..72].try_into().unwrap_or([0u8; 8])
                     );
-                    return Ok(amount);
+                    if amount > 0 {
+                        balances.push((mint, amount));
+                    }
                 }
             }
         }
 
-        Ok(0)
+        Ok(balances)
     }
 
     /// Build a swap transaction using Jupiter V6 quote API.
@@ -181,6 +236,9 @@ impl SolanaProvider {
 
     /// Sign and send a versioned transaction (V0 with Address Lookup Tables).
     /// Jupiter V6 returns V0 transactions that require this method.
+    ///
+    /// Includes retry with exponential backoff for confirmation (1s, 2s, 4s)
+    /// and falls back to the public Solana RPC if the primary RPC fails.
     pub async fn sign_and_send_versioned(
         &self,
         vtx: &solana_sdk::transaction::VersionedTransaction,
@@ -192,13 +250,114 @@ impl SolanaProvider {
             ..Default::default()
         };
         let signature = rpc.send_transaction_with_config(vtx, config)?;
-        // Wait for confirmation.
-        let confirmed = rpc.confirm_transaction(&signature)?;
-        if confirmed {
-            Ok(signature)
-        } else {
-            anyhow::bail!("Transaction {} was not confirmed", signature);
+
+        // Confirm the transaction with retry + exponential backoff.
+        // Use the primary RPC first, then fall back to public Solana RPC.
+        let backoff_secs = [1, 2, 4];
+        for (i, delay) in backoff_secs.iter().enumerate() {
+            let attempt = i + 1;
+            // Sleep before retrying (skip on first attempt since we just sent).
+            if i > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(*delay)).await;
+            }
+
+            // Try primary RPC first.
+            match rpc.confirm_transaction(&signature) {
+                Ok(true) => {
+                    tracing::info!(
+                        signature = %signature,
+                        attempt,
+                        "Transaction confirmed via primary RPC"
+                    );
+                    return Ok(signature);
+                }
+                Ok(false) => {
+                    tracing::warn!(
+                        signature = %signature,
+                        attempt,
+                        "Transaction not yet confirmed (retrying)"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        signature = %signature,
+                        attempt,
+                        error = %e,
+                        "Primary RPC confirmation failed, trying public RPC"
+                    );
+                    // Fall through to public RPC fallback.
+                }
+            }
+
+            // Fall back to public Solana RPC for confirmation.
+            match self.confirm_via_public_rpc(&signature).await {
+                Ok(true) => {
+                    tracing::info!(
+                        signature = %signature,
+                        attempt,
+                        "Transaction confirmed via public RPC fallback"
+                    );
+                    return Ok(signature);
+                }
+                Ok(false) => {
+                    tracing::warn!(
+                        signature = %signature,
+                        attempt,
+                        "Public RPC: transaction not yet confirmed (retrying)"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        signature = %signature,
+                        attempt,
+                        error = %e,
+                        "Public RPC confirmation also failed"
+                    );
+                }
+            }
         }
+
+        // Final attempt: if all retries exhausted, still try the public RPC one more time.
+        // Even if confirmation fails, the transaction may have been submitted successfully.
+        // Return the signature so the caller can record the trade — the monitor loop
+        // will reconcile positions from on-chain state.
+        match self.confirm_via_public_rpc(&signature).await {
+            Ok(true) => {
+                tracing::info!(signature = %signature, "Transaction confirmed via public RPC on final attempt");
+                Ok(signature)
+            }
+            Ok(false) => {
+                tracing::warn!(
+                    signature = %signature,
+                    "Transaction MAY have succeeded but could not be confirmed. Returning signature for reconciliation."
+                );
+                // Return the signature anyway — the transaction was submitted.
+                // The reconcile_positions() method will catch on-chain positions later.
+                Ok(signature)
+            }
+            Err(e) => {
+                tracing::error!(
+                    signature = %signature,
+                    error = %e,
+                    "All confirmation attempts exhausted, returning signature for reconciliation"
+                );
+                // Still return Ok — the send itself succeeded.
+                Ok(signature)
+            }
+        }
+    }
+
+    /// Confirm a transaction via the public Solana RPC (api.mainnet-beta.solana.com).
+    async fn confirm_via_public_rpc(&self, signature: &Signature) -> Result<bool> {
+        let public_rpc = RpcClient::new_with_commitment(
+            "https://api.mainnet-beta.solana.com".to_string(),
+            self.commitment,
+        );
+        public_rpc.confirm_transaction(signature).map_err(|e| {
+            anyhow::anyhow!("Public RPC confirm failed: {e}")
+        })
     }
 
     /// Simulate a transaction without sending it.

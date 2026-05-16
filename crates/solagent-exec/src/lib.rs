@@ -461,7 +461,7 @@ impl ExecutionEngine {
     ) -> Result<solagent_data::JupiterQuote> {
         let jupiter = self.jupiter.as_ref()
             .ok_or_else(|| anyhow::anyhow!("Jupiter client not configured"))?;
-        Ok(jupiter.get_quote(input_mint, output_mint, amount, slippage_bps).await?)
+        jupiter.get_quote(input_mint, output_mint, amount, slippage_bps).await
     }
 
     /// Get a snapshot of execution quality metrics.
@@ -485,5 +485,34 @@ impl ExecutionEngine {
     /// Get the Solana wallet public key, if configured.
     pub fn solana_pubkey(&self) -> Option<solana_sdk::pubkey::Pubkey> {
         self.solana_provider.as_ref().map(|p| p.pubkeys())
+    }
+
+    /// Get all SPL token balances for the wallet (mint_address, raw_amount).
+    /// Returns None if the Solana provider is not configured.
+    pub async fn get_all_token_balances(&self) -> Option<Vec<(String, u64)>> {
+        let provider = self.solana_provider.as_ref()?;
+        match provider.get_all_token_balances().await {
+            Ok(balances) => {
+                tracing::info!(count = balances.len(), "Fetched on-chain token balances");
+                Some(balances)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to get on-chain token balances");
+                None
+            }
+        }
+    }
+
+    /// Reconcile on-chain token holdings with portfolio DB records.
+    /// Creates position records for any tokens held on-chain but missing from DB.
+    pub async fn reconcile_positions(
+        &self,
+        portfolio: &solagent_portfolio::PortfolioManager,
+        dex: &solagent_data::DexScreenerClient,
+    ) -> Result<usize> {
+        let Some(balances) = self.get_all_token_balances().await else {
+            anyhow::bail!("Cannot reconcile: Solana provider not configured");
+        };
+        portfolio.reconcile_positions(&balances, 6, dex).await
     }
 }

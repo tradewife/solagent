@@ -873,6 +873,30 @@ impl Agent {
     pub async fn run(&self) -> Result<()> {
         *self.running.write().await = true;
 
+        // Reconcile on-chain positions with the database on startup.
+        // This catches positions opened before the agent crashed or trades
+        // that were confirmed on-chain but whose confirmation timed out.
+        tracing::info!("Running on-chain position reconciliation on startup");
+        match self.subsystems.exec.reconcile_positions(
+            &self.subsystems.portfolio,
+            &self.subsystems.dex,
+        ).await {
+            Ok(count) => {
+                if count > 0 {
+                    tracing::warn!(
+                        reconciled = count,
+                        "Found {} on-chain positions missing from DB — records created",
+                        count
+                    );
+                } else {
+                    tracing::info!("Reconciliation: all on-chain positions already in DB");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to reconcile positions on startup (non-fatal)");
+            }
+        }
+
         // Spawn wallet watcher background task (if configured).
         let _watcher_handle = if let Some(ref watcher) = self.subsystems.watcher {
             let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -1069,6 +1093,15 @@ impl Agent {
                 _ = monitor_interval.tick() => {
                     if let Err(e) = self.monitor().await {
                         tracing::error!(error = %e, "Monitor failed");
+                    }
+
+                    // Periodically reconcile on-chain positions with DB
+                    // to catch any positions from trades that were confirmed late.
+                    if let Err(e) = self.subsystems.exec.reconcile_positions(
+                        &self.subsystems.portfolio,
+                        &self.subsystems.dex,
+                    ).await {
+                        tracing::debug!(error = %e, "Periodic reconciliation skipped (non-fatal)");
                     }
                 }
             }

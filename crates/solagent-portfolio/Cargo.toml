@@ -5,6 +5,8 @@ edition.workspace = true
 
 [dependencies]
 solagent-core = { path = "../solagent-core" }
+solagent-risk = { path = "../solagent-risk" }
+solagent-data = { path = "../solagent-data" }
 sqlx = { workspace = true, features = ["runtime-tokio", "sqlite"] }
 tokio = { workspace = true }
 tracing = { workspace = true }

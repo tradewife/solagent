@@ -8,6 +8,7 @@ solagent-core = { path = "../solagent-core" }
 solagent-chain-solana = { path = "../solagent-chain-solana" }
 solagent-chain-base = { path = "../solagent-chain-base" }
 solagent-data = { path = "../solagent-data" }
+solagent-portfolio = { path = "../solagent-portfolio" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }

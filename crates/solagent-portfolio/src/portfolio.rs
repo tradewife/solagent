@@ -136,6 +136,7 @@ impl PortfolioManager {
     }
 
     /// Open a new position.
+    #[allow(clippy::too_many_arguments)]
     pub async fn open_position(
         &self,
         token_address: &str,
@@ -375,6 +376,7 @@ impl PortfolioManager {
     }
 
     /// Record a trade execution.
+    #[allow(clippy::too_many_arguments)]
     pub async fn record_trade(
         &self,
         position_id: Option<&str>,
@@ -606,6 +608,109 @@ impl PortfolioManager {
             .fetch_one(&self.pool)
             .await?;
         Ok(count)
+    }
+
+    // ─── On-Chain Reconciliation ─────────────────────────────────────────
+
+    /// Reconcile positions by scanning the wallet's on-chain token accounts.
+    ///
+    /// For each token held on-chain (via SolanaProvider::get_all_token_balances),
+    /// check if a matching open position exists in the DB. If any token is held
+    /// on-chain but not recorded as an open position, create a position record.
+    ///
+    /// Returns the number of positions reconciled (newly created).
+    pub async fn reconcile_positions(
+        &self,
+        on_chain_balances: &[(String, u64)],
+        token_decimals: u8,
+        dex: &solagent_data::DexScreenerClient,
+    ) -> Result<usize> {
+        let open_positions = self.get_open_positions().await?;
+        let recorded_tokens: std::collections::HashSet<String> = open_positions
+            .iter()
+            .map(|p| p.token_address.clone())
+            .collect();
+
+        let mut reconciled = 0usize;
+
+        for (mint, raw_amount) in on_chain_balances {
+            // Skip SOL — only handle SPL tokens.
+            if mint == "So11111111111111111111111111111111111111112" {
+                continue;
+            }
+
+            // Skip if already recorded as an open position.
+            if recorded_tokens.contains(mint) {
+                continue;
+            }
+
+            let token_amount = *raw_amount as f64 / 10f64.powi(token_decimals as i32);
+
+            // Try to get current price from DexScreener.
+            let (current_price, market_cap) = match dex.get_token_info(mint).await {
+                Ok(Some(pair)) => {
+                    let price = pair.price_usd
+                        .and_then(|p| p.parse::<f64>().ok())
+                        .unwrap_or(0.0);
+                    (price, pair.market_cap)
+                }
+                _ => (0.0, None),
+            };
+
+            let size_usd = token_amount * current_price;
+
+            tracing::info!(
+                mint = %mint,
+                token_amount,
+                current_price,
+                size_usd,
+                "Reconciling on-chain position not in DB"
+            );
+
+            // Create position record with conservative defaults.
+            // Use stop_loss at -15% and no take_profit (monitor loop will manage).
+            let sl = if current_price > 0.0 {
+                Some(current_price * 0.85)
+            } else {
+                None
+            };
+
+            // Determine appropriate exit profile based on market cap.
+            let profile = if let Some(mc) = market_cap {
+                solagent_risk::RiskManager::select_exit_profile(
+                    Some(mc),
+                    None, // age unknown for reconciled positions
+                    50,   // default confluence score
+                )
+            } else {
+                solagent_risk::ExitProfile::swing()
+            };
+
+            let tp = profile.take_profit_pct.map(|pct| current_price * (1.0 + pct / 100.0));
+
+            let _ = self.open_position(
+                mint,
+                Chain::Solana,
+                current_price,
+                size_usd,
+                token_amount,
+                sl,
+                tp,
+            ).await?;
+
+            reconciled += 1;
+        }
+
+        if reconciled > 0 {
+            tracing::info!(
+                reconciled,
+                "Reconciliation complete: created position records for on-chain tokens"
+            );
+        } else {
+            tracing::debug!("Reconciliation: all on-chain positions already recorded");
+        }
+
+        Ok(reconciled)
     }
 }
 
