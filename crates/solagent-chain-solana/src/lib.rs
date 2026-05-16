@@ -150,8 +150,19 @@ impl SolanaProvider {
         Ok(0)
     }
 
-    /// List all SPL token accounts owned by this wallet, returning (mint_address, token_amount).
+    /// List all SPL token accounts owned by this wallet, returning (mint_address, raw_amount).
+    /// Falls back from Helius to public RPC on failure.
     pub async fn get_all_token_balances(&self) -> Result<Vec<(String, u64)>> {
+        match self.get_all_token_balances_inner().await {
+            Ok(balances) => Ok(balances),
+            Err(e) => {
+                tracing::warn!(error = %e, "Helius token balance fetch failed, trying public RPC");
+                self.get_all_token_balances_public().await
+            }
+        }
+    }
+
+    async fn get_all_token_balances_inner(&self) -> Result<Vec<(String, u64)>> {
         let address = self.pubkeys();
         let rpc = self.get_rpc().await;
         // Use ProgramId filter for the SPL Token program to get all token accounts.
@@ -200,6 +211,70 @@ impl SolanaProvider {
             }
         }
 
+        Ok(balances)
+    }
+
+    /// Public RPC fallback for token balance fetching.
+    /// Uses `spl-token accounts` CLI, which correctly discovers Associated Token Accounts
+    /// (ATAs). The `ProgramId` filter used by the Solana RPC `getTokenAccountsByOwner` only
+    /// returns accounts owned directly by the wallet's keypair — not ATAs owned by the
+    /// ATA program `ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL`.
+    async fn get_all_token_balances_public(&self) -> Result<Vec<(String, u64)>> {
+        let pubkey = self.keypair.pubkey().to_string();
+        tracing::info!(wallet = %pubkey, "Fetching token balances via spl-token CLI");
+
+        let output = tokio::process::Command::new("spl-token")
+            .args([
+                "accounts",
+                "--owner",
+                &pubkey,
+                "--url",
+                "https://api.mainnet-beta.solana.com",
+                "--output",
+                "json-compact",
+            ])
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("spl-token CLI failed: {stderr}");
+        }
+
+        #[derive(::serde::Deserialize)]
+        struct SplTokenAccount {
+            mint: String,
+            #[serde(rename = "tokenAmount")]
+            token_amount: SplTokenAmount,
+        }
+        #[derive(::serde::Deserialize)]
+        struct SplTokenAmount {
+            amount: String,
+            #[allow(dead_code)]
+            decimals: u8,
+        }
+        #[derive(::serde::Deserialize)]
+        struct SplTokenAccountsOutput {
+            accounts: Vec<SplTokenAccount>,
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let parsed: SplTokenAccountsOutput = serde_json::from_str(&stdout)?;
+
+        let mut balances = Vec::new();
+        for account in parsed.accounts {
+            if let Ok(raw_amount) = account.token_amount.amount.parse::<u64>() {
+                if raw_amount > 0 {
+                    balances.push((account.mint, raw_amount));
+                }
+            }
+        }
+
+        tracing::info!(
+            wallet = %pubkey,
+            count = balances.len(),
+            "spl-token CLI returned token balances"
+        );
         Ok(balances)
     }
 

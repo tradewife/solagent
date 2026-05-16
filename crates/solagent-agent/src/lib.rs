@@ -882,14 +882,21 @@ impl Agent {
             &self.subsystems.dex,
         ).await {
             Ok(count) => {
+                let open_positions = self.subsystems.portfolio.get_open_positions().await
+                    .map(|p| p.len()).unwrap_or(0);
                 if count > 0 {
                     tracing::warn!(
                         reconciled = count,
-                        "Found {} on-chain positions missing from DB — records created",
-                        count
+                        open_positions,
+                        "Found {} on-chain positions missing from DB — records created ({} total open positions now tracked)",
+                        count, open_positions + count,
                     );
                 } else {
-                    tracing::info!("Reconciliation: all on-chain positions already in DB");
+                    tracing::info!(
+                        open_positions,
+                        "Reconciliation: all {} on-chain positions already in DB",
+                        open_positions,
+                    );
                 }
             }
             Err(e) => {
