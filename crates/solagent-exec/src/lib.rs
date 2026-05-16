@@ -6,6 +6,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use base64::Engine;
+use solana_sdk::signature::Signer;
 use solagent_core::{Chain, Trade, TradeSide};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -377,12 +378,16 @@ impl ExecutionEngine {
         let swap_tx = jupiter.get_swap_transaction(&quote, &user_pubkey).await?;
 
         // Deserialize, sign, and send the transaction.
+        // Jupiter V6 returns versioned (V0) transactions with Address Lookup Tables.
         let tx_bytes = base64::engine::general_purpose::STANDARD
             .decode(&swap_tx.swap_transaction)?;
-        let mut tx: solana_sdk::transaction::Transaction =
+        let mut vtx: solana_sdk::transaction::VersionedTransaction =
             bincode::deserialize(&tx_bytes)?;
-        tx.sign(&[provider.keypair()], tx.message.recent_blockhash);
-        let signature = provider.sign_and_send(&tx).await?;
+        // Sign the versioned transaction: compute signature over the message.
+        let message_bytes = bincode::serialize(&vtx.message)?;
+        let signature = provider.keypair().sign_message(&message_bytes);
+        vtx.signatures[0] = signature;
+        let signature = provider.sign_and_send_versioned(&vtx).await?;
 
         let token_amount = quote.out_amount.parse::<f64>().unwrap_or(0.0);
         Ok(Trade {
@@ -423,10 +428,12 @@ impl ExecutionEngine {
 
         let tx_bytes = base64::engine::general_purpose::STANDARD
             .decode(&swap_tx.swap_transaction)?;
-        let mut tx: solana_sdk::transaction::Transaction =
+        let mut vtx: solana_sdk::transaction::VersionedTransaction =
             bincode::deserialize(&tx_bytes)?;
-        tx.sign(&[provider.keypair()], tx.message.recent_blockhash);
-        let signature = provider.sign_and_send(&tx).await?;
+        let message_bytes = bincode::serialize(&vtx.message)?;
+        let signature = provider.keypair().sign_message(&message_bytes);
+        vtx.signatures[0] = signature;
+        let signature = provider.sign_and_send_versioned(&vtx).await?;
 
         let size_usd = token_amount * current_price;
         Ok(Trade {

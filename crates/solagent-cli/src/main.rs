@@ -764,9 +764,9 @@ async fn main() -> Result<()> {
                 event_bus: event_bus.clone(),
                 confluence: std::sync::Mutex::new(confluence),
                 confluence_threshold,
-                progressive_threshold_failures: config.as_ref().map(|c| c.strategies.progressive_threshold_failures).unwrap_or(50),
+                progressive_threshold_failures: config.as_ref().map(|c| c.strategies.progressive_threshold_failures).unwrap_or(10),
                 progressive_threshold_step: config.as_ref().map(|c| c.strategies.progressive_threshold_step).unwrap_or(5.0),
-                progressive_threshold_floor: config.as_ref().map(|c| c.strategies.progressive_threshold_floor).unwrap_or(20.0),
+                progressive_threshold_floor: config.as_ref().map(|c| c.strategies.progressive_threshold_floor).unwrap_or(10.0),
                 watcher,
                 gmgn: solagent_data::GmgnClient::new(),
             };

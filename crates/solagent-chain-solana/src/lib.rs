@@ -179,6 +179,28 @@ impl SolanaProvider {
         Ok(signature)
     }
 
+    /// Sign and send a versioned transaction (V0 with Address Lookup Tables).
+    /// Jupiter V6 returns V0 transactions that require this method.
+    pub async fn sign_and_send_versioned(
+        &self,
+        vtx: &solana_sdk::transaction::VersionedTransaction,
+    ) -> Result<Signature> {
+        let rpc = self.get_rpc().await;
+        let config = solana_client::rpc_config::RpcSendTransactionConfig {
+            skip_preflight: true,
+            max_retries: Some(0),
+            ..Default::default()
+        };
+        let signature = rpc.send_transaction_with_config(vtx, config)?;
+        // Wait for confirmation.
+        let confirmed = rpc.confirm_transaction(&signature)?;
+        if confirmed {
+            Ok(signature)
+        } else {
+            anyhow::bail!("Transaction {} was not confirmed", signature);
+        }
+    }
+
     /// Simulate a transaction without sending it.
     pub async fn simulate_tx(&self, tx: &Transaction) -> Result<SimulateResult> {
         let rpc = self.get_rpc().await;

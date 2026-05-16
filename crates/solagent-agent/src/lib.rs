@@ -943,11 +943,17 @@ impl Agent {
                                 cd.retain(|_, t| *t + cooldown_duration > now);
                             }
 
-                            // Only evaluate the first N tokens per scan to respect API rate limits.
+                            // Only evaluate N tokens per scan to respect API rate limits.
+                            // Filter cooldown FIRST, then deduplicate by token address
+                            // (DexScreener returns multiple pairs for same base token),
+                            // then take the limit — ensures we evaluate unique fresh tokens.
                             let eval_limit = self.config.max_concurrent_evaluations.min(tokens.len());
                             let cooldown = self.eval_cooldown.read().await;
-                            let tokens_to_eval: Vec<_> = tokens.iter().take(eval_limit)
+                            let mut seen_addresses = std::collections::HashSet::new();
+                            let tokens_to_eval: Vec<_> = tokens.iter()
                                 .filter(|t| !cooldown.contains_key(&t.address))
+                                .filter(|t| seen_addresses.insert(t.address.clone()))
+                                .take(eval_limit)
                                 .collect();
                             let skipped = eval_limit.saturating_sub(tokens_to_eval.len());
                             if skipped > 0 {

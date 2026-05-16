@@ -27,11 +27,11 @@ trailing_stop_pct = 15.0
 active_strategies = ["whale_consensus", "accumulation", "launch_momentum", "volume_spike", "social"]
 confluence_threshold = 35.0
 min_signal_count = 2
-progressive_threshold_failures = 50
+progressive_threshold_failures = 20
 progressive_threshold_step = 5.0
-progressive_threshold_floor = 20.0
+progressive_threshold_floor = 10.0
 
 [data]
-jupiter_api_url = "https://quote-api.jup.ag/v6"
+jupiter_api_url = "https://api.jup.ag/swap/v1"
 dexscreener_base_url = "https://api.dexscreener.com"
 birdeye_base_url = "https://public-api.birdeye.so"

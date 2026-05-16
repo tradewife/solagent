@@ -16,14 +16,24 @@ pub struct SwapInfo {
     pub output_mint: String,
     pub in_amount: String,
     pub out_amount: String,
-    pub fee_amount: String,
-    pub fee_mint: String,
+    #[serde(default)]
+    pub fee_amount: Option<String>,
+    #[serde(default)]
+    pub fee_mint: Option<String>,
+    #[serde(flatten)]
+    pub other: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RoutePlanStep {
     pub swap_info: SwapInfo,
+    #[serde(rename = "percent")]
     pub percentage: u32,
+    #[serde(default)]
+    pub bps: Option<serde_json::Value>,
+    #[serde(flatten)]
+    pub other: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
