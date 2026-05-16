@@ -286,7 +286,9 @@ impl RiskManager {
         // Update circuit breaker based on drawdown.
         {
             let peak = *self.peak_value.read();
-            if peak > 0.0 {
+            // Only check drawdown if both peak and current value are positive.
+            // A zero portfolio value likely means RPC failure, not real drawdown.
+            if peak > 0.0 && portfolio_value > 0.0 {
                 let dd_pct = ((peak - portfolio_value) / peak) * 100.0;
                 let mut cb = self.circuit_breaker.write();
                 if dd_pct >= self.config.halt_threshold_pct {
@@ -328,7 +330,11 @@ impl RiskManager {
     }
 
     /// Update peak portfolio value.
+    /// Ignores zero values (which indicate RPC failure, not real portfolio).
     pub fn update_peak(&self, current_value: f64) {
+        if current_value <= 0.0 {
+            return; // Don't update peak with bogus zero values
+        }
         let mut peak = self.peak_value.write();
         if current_value > *peak {
             *peak = current_value;
@@ -353,7 +359,17 @@ impl RiskManager {
         let by_token_cap = portfolio_value * self.config.max_per_token_pct / 100.0;
         let absolute_cap = self.config.max_position_size_usd;
 
-        by_pct.min(by_token_cap).min(absolute_cap)
+        // Use a minimum floor to ensure we always attempt a trade when risk checks pass.
+        // If portfolio_value is 0 (RPC balance fetch failed), fall back to the absolute cap.
+        let size = if portfolio_value > 0.0 {
+            by_pct.min(by_token_cap).min(absolute_cap)
+        } else {
+            // Can't calculate percentage-based size — use absolute cap.
+            absolute_cap
+        };
+
+        // Enforce a minimum trade size of $1 to avoid dust swaps.
+        size.max(1.0)
     }
 
     // ─── Dynamic Exit Profiles ──────────────────────────────────────────

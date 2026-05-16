@@ -186,6 +186,7 @@ impl ExecutionEngine {
         size_usd: f64,
         wallet_balance_usd: f64,
         current_price: f64,
+        sol_price: f64,
     ) -> Result<Trade> {
         // Pre-flight checks.
         let checks = self
@@ -213,7 +214,7 @@ impl ExecutionEngine {
             );
 
             match self
-                .dispatch_buy(chain, token_address, size_usd, slippage_bps, current_price)
+                .dispatch_buy(chain, token_address, size_usd, slippage_bps, current_price, sol_price)
                 .await
             {
                 Ok(trade) => {
@@ -311,9 +312,10 @@ impl ExecutionEngine {
         size_usd: f64,
         slippage_bps: u32,
         current_price: f64,
+        sol_price: f64,
     ) -> Result<Trade> {
         match chain {
-            Chain::Solana => self.dispatch_solana_buy(token_address, size_usd, slippage_bps, current_price).await,
+            Chain::Solana => self.dispatch_solana_buy(token_address, size_usd, slippage_bps, current_price, sol_price).await,
             Chain::Base => {
                 anyhow::bail!("Base execution not yet implemented");
             }
@@ -344,6 +346,7 @@ impl ExecutionEngine {
         size_usd: f64,
         slippage_bps: u32,
         current_price: f64,
+        sol_price: f64,
     ) -> Result<Trade> {
         let jupiter = self.jupiter.as_ref()
             .ok_or_else(|| anyhow::anyhow!("Jupiter client not configured"))?;
@@ -352,8 +355,13 @@ impl ExecutionEngine {
 
         // SOL mint address.
         let sol_mint = "So11111111111111111111111111111111111111112";
-        // Convert USD amount to lamports (approximate using current SOL price).
-        let lamports = (size_usd / current_price * 1_000_000_000.0) as u64;
+        // Convert USD amount to lamports using SOL price (not token price).
+        // size_usd is how much SOL to spend; divide by SOL price to get SOL amount.
+        let lamports = if sol_price > 0.0 {
+            (size_usd / sol_price * 1_000_000_000.0) as u64
+        } else {
+            anyhow::bail!("SOL price is zero, cannot calculate swap amount");
+        };
 
         // Get quote from Jupiter.
         let quote = jupiter.get_quote(sol_mint, token_address, lamports, slippage_bps).await?;
@@ -458,7 +466,13 @@ impl ExecutionEngine {
     pub async fn get_sol_balance(&self) -> Option<u64> {
         let provider = self.solana_provider.as_ref()?;
         let pubkey = provider.pubkeys();
-        provider.get_balance(&pubkey).await.ok()
+        match provider.get_balance(&pubkey).await {
+            Ok(balance) => Some(balance),
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to get SOL balance from RPC");
+                None
+            }
+        }
     }
 
     /// Get the Solana wallet public key, if configured.

@@ -210,8 +210,14 @@ pub struct AgentSubsystems {
     pub event_bus: EventBus,
     /// Confluence scorer aggregating all signal detectors.
     pub confluence: std::sync::Mutex<solagent_signals::ConfluenceScorer>,
-    /// Confluence threshold (0-100). Default 65.
+    /// Confluence threshold (0-100). Default 35.
     pub confluence_threshold: f64,
+    /// Progressive threshold: consecutive failures before lowering.
+    pub progressive_threshold_failures: u32,
+    /// Progressive threshold: step to lower by each time.
+    pub progressive_threshold_step: f64,
+    /// Progressive threshold: minimum floor (never go below).
+    pub progressive_threshold_floor: f64,
     /// Wallet watcher for detecting smart money trades (Helius-backed).
     pub watcher: Option<solagent_data::WalletWatcher>,
     /// GMGN client for fetching holder count data.
@@ -241,7 +247,12 @@ impl Agent {
     pub fn new(config: AgentConfig, subsystems: AgentSubsystems) -> Self {
         let event_bus = subsystems.event_bus.clone();
         let _ = event_bus;
-        let progressive = ProgressiveThreshold::with_original(subsystems.confluence_threshold);
+        let progressive = ProgressiveThreshold::from_config(
+            subsystems.confluence_threshold,
+            subsystems.progressive_threshold_failures,
+            subsystems.progressive_threshold_step,
+            subsystems.progressive_threshold_floor,
+        );
         Self {
             state: Arc::new(tokio::sync::RwLock::new(AgentState::Scanning)),
             config,
@@ -285,6 +296,9 @@ impl Agent {
                 event_bus,
                 confluence: std::sync::Mutex::new(solagent_signals::ConfluenceScorer::new(threshold)),
                 confluence_threshold: threshold,
+                progressive_threshold_failures: 50,
+                progressive_threshold_step: 5.0,
+                progressive_threshold_floor: 20.0,
                 watcher: None,
                 gmgn: solagent_data::GmgnClient::new(),
             }),
@@ -293,7 +307,7 @@ impl Agent {
             position_exits: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             eval_cooldown: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             progressive_threshold: Arc::new(tokio::sync::RwLock::new(
-                ProgressiveThreshold::with_original(threshold),
+                ProgressiveThreshold::from_config(threshold, 50, 5.0, 20.0),
             )),
         }
     }
@@ -609,12 +623,14 @@ impl Agent {
             "Selected exit profile"
         );
 
+        let sol_price = self.get_sol_price().await;
         let trade = self.subsystems.exec.execute_buy(
             evaluation.chain,
             &evaluation.token_address,
             size,
             portfolio_value,
             current_price,
+            sol_price,
         ).await?;
 
         // Record in portfolio.
@@ -725,9 +741,15 @@ impl Agent {
     /// Get SOL balance from the wallet. Queries the Solana RPC for the real balance.
     async fn get_sol_balance(&self) -> f64 {
         match self.subsystems.exec.get_sol_balance().await {
-            Some(lamports) => lamports as f64 / 1_000_000_000.0,
+            Some(lamports) => {
+                let sol = lamports as f64 / 1_000_000_000.0;
+                tracing::debug!(sol_balance = sol, "SOL balance fetched");
+                sol
+            }
             None => {
-                tracing::warn!("Solana provider not configured — portfolio value excludes wallet SOL balance");
+                // If we can't get the balance but the provider is configured,
+                // try using the portfolio value from positions as a fallback.
+                tracing::warn!("Could not fetch SOL balance from RPC — using $0 balance");
                 0.0
             }
         }
