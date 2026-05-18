@@ -5706,6 +5706,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "rand 0.9.4",
  "serde",
  "serde_json",
  "solagent-core",

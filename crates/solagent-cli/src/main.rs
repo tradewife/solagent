@@ -783,6 +783,7 @@ async fn main() -> Result<()> {
                     max_open_pos,
                     daily_loss,
                 ),
+                auto_tuner: None,
             }
             };
 

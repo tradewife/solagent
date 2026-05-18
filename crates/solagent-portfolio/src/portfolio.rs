@@ -270,12 +270,6 @@ impl PortfolioManager {
 
     /// Get total realized + unrealized PnL.
     pub async fn get_pnl(&self) -> Result<PnlSummary> {
-        let trades: Vec<TradeRow> = sqlx::query_as::<_, TradeRow>(
-            "SELECT * FROM trades ORDER BY executed_at DESC",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
         let positions: Vec<PositionRow> = sqlx::query_as::<_, PositionRow>(
             "SELECT * FROM positions WHERE status = 'open'",
         )
@@ -283,7 +277,6 @@ impl PortfolioManager {
         .await?;
 
         let unrealized: f64 = positions.iter().map(|p| p.unrealized_pnl).sum();
-        let total_trades = trades.len() as u64;
 
         let mut wins = 0u64;
         let mut losses = 0u64;
@@ -298,6 +291,7 @@ impl PortfolioManager {
         .fetch_all(&self.pool)
         .await?;
         let realized: f64 = closed.iter().map(|p| p.unrealized_pnl).sum();
+        let total_trades = closed.len() as u64;
 
         for pos in &closed {
             let pnl = pos.unrealized_pnl;

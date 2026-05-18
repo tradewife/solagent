@@ -364,4 +364,43 @@ mod tests {
         assert_eq!(info.holder_count, 1000000);
         assert_eq!(info.stat.unwrap().holder_count, Some(1000000));
     }
+
+    // ════════════════════════════════════════════════════════════════════
+    // PART B: Graceful Degradation Tests
+    // ════════════════════════════════════════════════════════════════════
+
+    /// Verify GmgnClient::get_holder_count() returns None gracefully when
+    /// gmgn-cli is not available (non-existent binary path). The client
+    /// must never panic — it degrades by returning None and incrementing
+    /// the failure counter.
+    #[tokio::test]
+    async fn test_gmgn_graceful_failure() {
+        let client = GmgnClient::with_cli_path("/nonexistent/gmgn-cli".to_string());
+
+        // get_holder_count should return None (not panic) when CLI is unavailable.
+        let result = client.get_holder_count("So11111111111111111111111111111111111111112").await;
+        assert!(result.is_none(),
+            "get_holder_count should return None when gmgn-cli is not available");
+
+        // Failure counter should be incremented.
+        assert_eq!(client.failure_count(), 1, "Failure count should be 1 after one failed call");
+        assert_eq!(client.call_count(), 1, "Call count should be 1");
+
+        // Multiple calls should also not panic.
+        for i in 0..5 {
+            let r = client.get_holder_count(&format!("token_{i}")).await;
+            assert!(r.is_none(), "Call {i} should also return None, not panic");
+        }
+        assert_eq!(client.failure_count(), 6);
+        assert_eq!(client.call_count(), 6);
+
+        // get_holder_counts (batch) should also degrade gracefully.
+        let tokens = vec![
+            "batch_token_1".to_string(),
+            "batch_token_2".to_string(),
+        ];
+        let batch_results = client.get_holder_counts(&tokens).await;
+        assert!(batch_results.is_empty(),
+            "Batch get_holder_counts should return empty map when CLI is unavailable");
+    }
 }

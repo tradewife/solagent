@@ -850,4 +850,432 @@ mod tests {
         rm.set_daily_loss_limit(15.0);
         assert!((rm.config.max_daily_loss_usd - 15.0).abs() < f64::EPSILON);
     }
+
+    // ─── Exit Condition Tests ───────────────────────────────────────────
+
+    /// Helper: create a RiskManager with custom per-trade stop loss for testing.
+    fn test_manager_with_sl(sl_pct: f64) -> RiskManager {
+        let mut config = RiskConfig::default();
+        config.default_stop_loss_pct = sl_pct;
+        RiskManager::new(config)
+    }
+
+    /// Stop-loss triggers when current price drops to the SL level.
+    #[test]
+    fn test_stop_loss_triggers_below_sl() {
+        let rm = test_manager_with_sl(15.0); // 15% stop loss
+        // Entry=$1.00, SL=$0.85. Current=$0.84 → should trigger.
+        let result = rm.check_stop_conditions(
+            0.84,              // current_price
+            1.00,              // entry_price
+            Some(0.85),        // stop_loss
+            None,              // take_profit
+            Some(1.00),        // peak_price
+            10.0,              // trailing_stop_pct (not relevant here)
+        );
+        assert!(result.is_some(), "Stop loss should trigger when price drops below SL");
+        let reason = result.unwrap();
+        assert!(
+            reason.contains("Stop loss"),
+            "Reason should mention 'Stop loss', got: {reason}"
+        );
+    }
+
+    /// Stop-loss does NOT trigger when current price is still above SL.
+    #[test]
+    fn test_stop_loss_does_not_trigger_above_sl() {
+        let rm = test_manager_with_sl(15.0);
+        // Entry=$1.00, SL=$0.85. Current=$0.86 → should NOT trigger.
+        let result = rm.check_stop_conditions(
+            0.86,              // current_price
+            1.00,              // entry_price
+            Some(0.85),        // stop_loss
+            None,              // take_profit
+            Some(1.00),        // peak_price
+            10.0,              // trailing_stop_pct
+        );
+        assert!(result.is_none(), "Stop loss should NOT trigger when price is above SL");
+    }
+
+    /// Take-profit triggers exactly at the TP target.
+    #[test]
+    fn test_take_profit_triggers_at_target() {
+        let rm = test_manager();
+        // Entry=$1.00, TP=$2.00 (100% profit). Current=$2.00 → should trigger.
+        let result = rm.check_stop_conditions(
+            2.00,              // current_price
+            1.00,              // entry_price
+            Some(0.80),        // stop_loss (not relevant)
+            Some(2.00),        // take_profit
+            Some(1.00),        // peak_price
+            10.0,              // trailing_stop_pct (not relevant)
+        );
+        assert!(result.is_some(), "Take profit should trigger when price reaches TP target");
+        let reason = result.unwrap();
+        assert!(
+            reason.contains("Take profit"),
+            "Reason should mention 'Take profit', got: {reason}"
+        );
+    }
+
+    /// Take-profit does NOT trigger when price is just below TP.
+    #[test]
+    fn test_take_profit_not_triggered_below() {
+        let rm = test_manager();
+        // Entry=$1.00, TP=$2.00. Current=$1.99 → should NOT trigger.
+        let result = rm.check_stop_conditions(
+            1.99,              // current_price
+            1.00,              // entry_price
+            Some(0.80),        // stop_loss
+            Some(2.00),        // take_profit
+            Some(1.00),        // peak_price
+            10.0,              // trailing_stop_pct
+        );
+        assert!(result.is_none(), "Take profit should NOT trigger below the TP target");
+    }
+
+    /// Trailing stop tracks the peak price. When price retraces from peak
+    /// by the trailing percentage, it triggers.
+    #[test]
+    fn test_trailing_stop_tracks_peak() {
+        let rm = test_manager();
+        // Entry=$1.00, peak=$1.50, trailing=15%.
+        // Trail level = $1.50 * 0.85 = $1.275.
+        let trail_pct = 15.0;
+
+        // Price at $1.27 ≤ $1.275 → should trigger.
+        let result = rm.check_stop_conditions(
+            1.27,              // current_price
+            1.00,              // entry_price
+            Some(0.50),        // stop_loss (far below, not relevant)
+            None,              // take_profit
+            Some(1.50),        // peak_price > entry → trailing stop active
+            trail_pct,
+        );
+        assert!(result.is_some(), "Trailing stop should trigger at $1.27 (below $1.275 trail)");
+        let reason = result.unwrap();
+        assert!(
+            reason.contains("Trailing stop"),
+            "Reason should mention 'Trailing stop', got: {reason}"
+        );
+
+        // Price at $1.28 > $1.275 → should NOT trigger.
+        let result2 = rm.check_stop_conditions(
+            1.28,              // current_price
+            1.00,              // entry_price
+            Some(0.50),        // stop_loss
+            None,              // take_profit
+            Some(1.50),        // peak_price
+            trail_pct,
+        );
+        assert!(result2.is_none(), "Trailing stop should NOT trigger at $1.28 (above $1.275 trail)");
+    }
+
+    /// Trailing stop should NOT fire if the peak has never been above entry,
+    /// even if the price has dropped significantly.
+    #[test]
+    fn test_trailing_stop_not_active_when_below_entry() {
+        let rm = test_manager();
+        // Entry=$1.00, peak=$0.95 (never above entry).
+        // Current=$0.80. Trailing stop should NOT fire.
+        let result = rm.check_stop_conditions(
+            0.80,              // current_price
+            1.00,              // entry_price
+            Some(0.60),        // stop_loss (far below, to isolate trailing check)
+            None,              // take_profit
+            Some(0.95),        // peak_price < entry → trailing stop inactive
+            15.0,              // trailing_stop_pct
+        );
+        assert!(result.is_none(),
+            "Trailing stop should NOT trigger when peak is below entry price"
+        );
+    }
+
+    /// Exit profile selection by market cap, age, and confluence score.
+    #[test]
+    fn test_exit_profile_selection_by_market_cap() {
+        // Moonbag: MC=$50K, age=0.5h, confluence=85
+        let p1 = RiskManager::select_exit_profile(Some(50_000.0), Some(0.5), 85);
+        assert_eq!(p1.name, "moonbag", "MC=$50K, age=0.5h, confluence=85 → moonbag");
+
+        // Runner: MC=$500K, age=12h, confluence=75
+        let p2 = RiskManager::select_exit_profile(Some(500_000.0), Some(12.0), 75);
+        assert_eq!(p2.name, "runner", "MC=$500K, age=12h, confluence=75 → runner");
+
+        // Swing: MC=$5M, age=48h, confluence=50
+        let p3 = RiskManager::select_exit_profile(Some(5_000_000.0), Some(48.0), 50);
+        assert_eq!(p3.name, "swing", "MC=$5M, age=48h, confluence=50 → swing");
+
+        // Conservative: MC=$50M, age=720h (30 days)
+        let p4 = RiskManager::select_exit_profile(Some(50_000_000.0), Some(720.0), 50);
+        assert_eq!(p4.name, "conservative", "MC=$50M, age=720h → conservative");
+    }
+
+    /// Moonbag profile has take_profit_pct=None, so calculate_exit
+    /// returns None for the TP component.
+    #[test]
+    fn test_moonbag_no_take_profit() {
+        // Moonbag conditions: MC=$50K, age=0.5h, confluence=85
+        let (sl, tp, trail) = RiskManager::calculate_exit(
+            1.00,              // entry_price
+            Some(50_000.0),    // market_cap
+            Some(0.5),         // age_hours
+            85,                // confluence_score
+        );
+        // Moonbag: stop_loss_pct=20%, so SL = $1.00 * 0.80 = $0.80
+        assert!((sl - 0.80).abs() < 0.001, "Moonbag SL should be 20% below entry ($0.80), got ${sl}");
+        // Moonbag: take_profit_pct=None, so TP is None
+        assert!(tp.is_none(), "Moonbag should have no take profit (tp=None), got {tp:?}");
+        // Moonbag: trailing_stop_pct=25%
+        assert!((trail - 25.0).abs() < f64::EPSILON, "Moonbag trailing should be 25%, got {trail}");
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // PART A: Risk Constraint Enforcement Tests
+    // ════════════════════════════════════════════════════════════════════
+
+    // ─── Circuit Breaker Tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_circuit_breaker_halted_on_drawdown() {
+        let rm = test_manager();
+        // Set peak to 100, then evaluate with portfolio at 84 (16% drawdown).
+        // halt_threshold_pct is 10% by default, so 16% > 10% → circuit breaker = Halted.
+        rm.update_peak(100.0);
+        let report = rm.evaluate_trade(
+            "token_abc",
+            10.0,   // size_usd
+            1,      // current_open_positions
+            84.0,   // portfolio_value (16% drawdown from 100)
+            &[],
+        );
+        assert_eq!(report.circuit_breaker, CircuitBreaker::Halted,
+            "16% drawdown should trigger CircuitBreaker::Halted, got {:?}", report.circuit_breaker);
+        // When halted, can_trade() should return false.
+        assert!(!rm.can_trade(), "can_trade() should be false when circuit breaker is Halted");
+    }
+
+    #[test]
+    fn test_circuit_breaker_warning_on_drawdown() {
+        let rm = test_manager();
+        // Set peak to 100, evaluate with portfolio at 92 (8% drawdown).
+        // warning_threshold_pct=7% → 8% ≥ 7% → Warning.
+        // halt_threshold_pct=10% → 8% < 10% → NOT Halted.
+        rm.update_peak(100.0);
+        let report = rm.evaluate_trade(
+            "token_def",
+            10.0,
+            1,
+            92.0,   // 8% drawdown
+            &[],
+        );
+        assert_eq!(report.circuit_breaker, CircuitBreaker::Warning,
+            "8% drawdown should trigger CircuitBreaker::Warning, got {:?}", report.circuit_breaker);
+        // Warning state still allows trading (reduced sizing implied).
+        assert!(rm.can_trade(), "can_trade() should be true in Warning state");
+    }
+
+    #[test]
+    fn test_circuit_breaker_normal_on_small_drawdown() {
+        let rm = test_manager();
+        // 5% drawdown — below both warning (7%) and halt (10%).
+        rm.update_peak(100.0);
+        let report = rm.evaluate_trade(
+            "token_ghi",
+            10.0,
+            0,
+            95.0,   // 5% drawdown
+            &[],
+        );
+        assert_eq!(report.circuit_breaker, CircuitBreaker::Normal,
+            "5% drawdown should keep circuit breaker Normal, got {:?}", report.circuit_breaker);
+        assert!(rm.can_trade());
+    }
+
+    // ─── Daily Loss Limit Test ──────────────────────────────────────────
+
+    #[test]
+    fn test_daily_loss_limit_halt() {
+        // Create a RiskManager with a $15 daily loss limit.
+        let mut cfg = RiskConfig::default();
+        cfg.max_daily_loss_usd = 15.0;
+        let rm = RiskManager::new(cfg);
+
+        // Record $16 of realized losses via a sell trade.
+        let trade = Trade {
+            id: solagent_core::uuid::Uuid::new_v4(),
+            token_address: "loss_token".to_string(),
+            chain: solagent_core::Chain::Solana,
+            side: TradeSide::Sell,
+            size_usd: 16.0,
+            token_amount: 100.0,
+            price: 0.16,
+            tx_signature: None,
+            slippage_bps: None,
+            executed_at: Utc::now(),
+            latency_ms: None,
+        };
+        rm.record_trade(&trade);
+
+        // Daily loss check: $16 > $15 limit → should fail.
+        let check = rm.check_daily_loss();
+        assert!(!check.passed,
+            "Daily loss $16 should exceed the $15 limit (check passed unexpectedly)");
+
+        // evaluate_trade should also fail because daily loss check is included.
+        let report = rm.evaluate_trade(
+            "loss_token2",
+            10.0,
+            0,
+            100.0,
+            &[],
+        );
+        assert!(!report.passed,
+            "evaluate_trade should reject when daily loss limit exceeded");
+    }
+
+    // ─── Position Size Cap Tests ────────────────────────────────────────
+
+    #[test]
+    fn test_position_size_capped_at_max_30() {
+        // Set max_position_size_usd to $30 and verify a $40 position is rejected.
+        let mut cfg = RiskConfig::default();
+        cfg.max_position_size_usd = 30.0;
+        let rm = RiskManager::new(cfg);
+
+        let report = rm.evaluate_trade(
+            "big_position_token",
+            40.0,    // exceeds $30 cap
+            1,
+            500.0,
+            &[],
+        );
+        assert!(!report.passed, "Position size $40 should be rejected with $30 max");
+        let pos_check = report.checks.iter()
+            .find(|c| c.name == "position_size")
+            .expect("position_size check should be present");
+        assert!(!pos_check.passed, "position_size check should fail for $40 > $30");
+    }
+
+    #[test]
+    fn test_position_size_within_limit_passes() {
+        let mut cfg = RiskConfig::default();
+        cfg.max_position_size_usd = 30.0;
+        let rm = RiskManager::new(cfg);
+
+        let report = rm.evaluate_trade(
+            "normal_token",
+            25.0,    // within $30 cap
+            1,
+            500.0,
+            &[],
+        );
+        assert!(report.passed, "Position size $25 should pass with $30 max");
+    }
+
+    // ─── Wallet Reserve Test ────────────────────────────────────────────
+
+    #[test]
+    fn test_calculate_position_size_caps_small_portfolio() {
+        // On a small portfolio, calculate_position_size caps at 2% per trade.
+        // Portfolio=$21 → 2% = $0.42, floor $1.
+        let rm = test_manager();
+        let allowed_size = rm.calculate_position_size(21.0);
+        assert!(
+            allowed_size < 20.0,
+            "Portfolio $21 should not permit a $20 position; calculated allowed size: ${allowed_size}"
+        );
+        // 2% of $21 = $0.42, floored to $1 minimum.
+        assert_eq!(allowed_size, 1.0, "Expected $1 floor on small portfolio, got ${allowed_size}");
+    }
+
+    // ─── Max Open Positions Test ────────────────────────────────────────
+
+    #[test]
+    fn test_max_open_positions_exceeded() {
+        let mut cfg = RiskConfig::default();
+        cfg.max_open_positions = 3;
+        let rm = RiskManager::new(cfg);
+
+        // 3 open, max=3 → current_open_positions (3) >= max (3) → rejected.
+        let report = rm.evaluate_trade(
+            "fourth_token",
+            10.0,
+            3,      // current_open_positions = max
+            500.0,
+            &[],
+        );
+        assert!(!report.passed, "4th position should be rejected when max_open_positions is 3");
+        let max_check = report.checks.iter()
+            .find(|c| c.name == "max_positions")
+            .expect("max_positions check should be present");
+        assert!(!max_check.passed,
+            "max_positions check should fail when current(3) >= max(3)");
+    }
+
+    #[test]
+    fn test_max_open_positions_not_exceeded() {
+        let mut cfg = RiskConfig::default();
+        cfg.max_open_positions = 3;
+        let rm = RiskManager::new(cfg);
+
+        // 2 open, max=3 → 3rd position should pass.
+        let report = rm.evaluate_trade(
+            "third_token",
+            10.0,
+            2,
+            500.0,
+            &[],
+        );
+        assert!(report.passed, "3rd position should pass with max=3 and 2 currently open");
+    }
+
+    // ─── Multiple Simultaneous Failures Test ────────────────────────────
+
+    #[test]
+    fn test_multiple_failures_reported() {
+        let mut cfg = RiskConfig::default();
+        cfg.max_position_size_usd = 10.0;
+        cfg.max_open_positions = 1;
+        cfg.max_daily_loss_usd = 1.0;
+        let rm = RiskManager::new(cfg);
+
+        // Record a loss to trigger daily loss check.
+        let trade = Trade {
+            id: solagent_core::uuid::Uuid::new_v4(),
+            token_address: "prior_loss".to_string(),
+            chain: solagent_core::Chain::Solana,
+            side: TradeSide::Sell,
+            size_usd: 5.0,
+            token_amount: 100.0,
+            price: 0.05,
+            tx_signature: None,
+            slippage_bps: None,
+            executed_at: Utc::now(),
+            latency_ms: None,
+        };
+        rm.record_trade(&trade);
+
+        // This proposed trade violates: position_size ($20 > $10 max),
+        // max_positions ($3 open > $1 max), and daily_loss ($5 > $1 limit).
+        let report = rm.evaluate_trade(
+            "doomed_token",
+            20.0,   // too big
+            3,      // too many open
+            500.0,  // healthy portfolio, so drawdown is not an issue
+            &[],
+        );
+        assert!(!report.passed, "Trade violating 3 constraints should be rejected");
+
+        let failed_names: Vec<&str> = report.checks.iter()
+            .filter(|c| !c.passed)
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(failed_names.contains(&"position_size"),
+            "Expected position_size to fail; failures: {failed_names:?}");
+        assert!(failed_names.contains(&"max_positions"),
+            "Expected max_positions to fail; failures: {failed_names:?}");
+        assert!(failed_names.contains(&"daily_loss"),
+            "Expected daily_loss to fail; failures: {failed_names:?}");
+    }
 }

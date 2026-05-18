@@ -10,12 +10,15 @@
 // deferred; the current pattern is safe in practice because the agent is single-tasked.
 #![allow(clippy::await_holding_lock)]
 
+pub mod auto_tuner;
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use solagent_core::chrono::{DateTime, Utc};
 use solagent_core::serde_json;
 use solagent_core::uuid::Uuid;
 use solagent_core::{Chain, EventBus, Event, Signal, TokenInfo};
+use auto_tuner::AutoTuner;
 use std::sync::Arc;
 
 // ─── Agent State Machine ─────────────────────────────────────────────────────
@@ -231,6 +234,9 @@ pub struct AgentSubsystems {
     /// Runtime-configurable parameters (weights, threshold, risk limits)
     /// for the auto-tuner.
     pub runtime_config: solagent_signals::RuntimeConfig,
+    /// Auto-tuner that adjusts signal weights, threshold, and position sizing
+    /// at runtime based on trade outcomes.
+    pub auto_tuner: Option<AutoTuner>,
 }
 
 // ─── Agent ───────────────────────────────────────────────────────────────────
@@ -253,7 +259,17 @@ pub struct Agent {
 
 impl Agent {
     /// Create a new agent with wired subsystems.
-    pub fn new(config: AgentConfig, subsystems: AgentSubsystems) -> Self {
+    pub fn new(config: AgentConfig, mut subsystems: AgentSubsystems) -> Self {
+        // Create the auto-tuner before subsystems is moved into Arc.
+        // PortfolioManager clones from the same SqlitePool so they share DB state.
+        let auto_tuner_portfolio = std::sync::Arc::new(
+            solagent_portfolio::PortfolioManager::new(subsystems.portfolio.pool().clone())
+        );
+        subsystems.auto_tuner = Some(AutoTuner::new(
+            subsystems.runtime_config.clone(),
+            auto_tuner_portfolio,
+        ));
+
         let event_bus = subsystems.event_bus.clone();
         let _ = event_bus;
         let progressive = ProgressiveThreshold::from_config(
@@ -318,7 +334,13 @@ impl Agent {
                 progressive_threshold_floor: 20.0,
                 watcher: None,
                 gmgn: solagent_data::GmgnClient::new(),
-                runtime_config,
+                runtime_config: runtime_config.clone(),
+                auto_tuner: Some(AutoTuner::new(
+                    runtime_config.clone(),
+                    std::sync::Arc::new(solagent_portfolio::PortfolioManager::new(
+                        sqlx::SqlitePool::connect_lazy("sqlite::memory:").unwrap(),
+                    )),
+                )),
             }),
             decisions: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             running: Arc::new(tokio::sync::RwLock::new(false)),
@@ -1158,6 +1180,13 @@ impl Agent {
                             tracing::error!(error = %e, "Scan failed");
                         }
                     }
+
+                    // Run auto-tuner after each full scan cycle.
+                    if let Some(ref tuner) = self.subsystems.auto_tuner {
+                        if let Err(e) = tuner.maybe_tune().await {
+                            tracing::warn!(error = %e, "Auto-tuner tune failed (non-fatal)");
+                        }
+                    }
                 }
 
                 // Periodic position monitoring.
@@ -1363,5 +1392,109 @@ mod tests {
         }
         // 23 - 5 = 18, but floor is 20, so should clamp to 20.
         assert!((pt.current() - 20.0).abs() < f64::EPSILON, "Should clamp to floor 20, got {}", pt.current());
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // PART C: Agent-Level Degradation Tests
+    // ════════════════════════════════════════════════════════════════════
+
+    /// Helper: create a minimal TokenInfo for testing the evaluate() path.
+    fn test_token(address: &str, symbol: &str) -> TokenInfo {
+        TokenInfo {
+            address: address.to_string(),
+            chain: Chain::Solana,
+            symbol: symbol.to_string(),
+            name: format!("Test {symbol}"),
+            decimals: 6,
+            price_usd: Some(0.01),
+            market_cap_usd: Some(50_000.0),
+            volume_24h: Some(5000.0),
+            holder_count: Some(200),
+            created_at: Some(Utc::now() - chrono::Duration::hours(2)), // 2h old
+            pair_address: Some("test_pair_address".to_string()),
+            lp_locked: None,
+            mint_authority_revoked: None,
+            freeze_authority_revoked: None,
+        }
+    }
+
+    /// Verify the agent's evaluate() method doesn't crash when the
+    /// ConfluenceScorer has no strategies (score() returns 0).
+    /// This simulates a signal engine that can't produce scores but
+    /// the agent should still degrade gracefully.
+    #[tokio::test]
+    async fn test_agent_continues_on_signal_failure() {
+        // new_minimal() creates a ConfluenceScorer with NO strategies added.
+        // So score() will return a composite_score of 0 with empty signals.
+        // The agent should handle this without panicking.
+        let event_bus = EventBus::new(16);
+        let agent = Agent::new_minimal(AgentConfig::default(), event_bus);
+
+        // Token 1: evaluate should succeed (no panic) even with zero signals.
+        let token1 = test_token("Token1111111111111111111111111111111111111", "TKN1");
+        let result1 = agent.evaluate(&token1).await;
+        // The evaluate method should return Ok, not panic.
+        assert!(result1.is_ok(), "evaluate() should not panic for token with no signals");
+
+        // Token 2: a second token should also succeed — the agent continues
+        // past the first one without state corruption.
+        let token2 = test_token("Token2222222222222222222222222222222222222", "TKN2");
+        let result2 = agent.evaluate(&token2).await;
+        assert!(result2.is_ok(), "evaluate() should handle second token too");
+
+        // Both results should have 0 confluence (no strategies = no signals).
+        let eval1 = result1.unwrap();
+        let eval2 = result2.unwrap();
+        assert_eq!(eval1.confluence_score, 0,
+            "Token with no strategies should have confluence_score=0, got {}", eval1.confluence_score);
+        assert_eq!(eval2.confluence_score, 0);
+
+        // Both should have signals present (empty vec, not crash).
+        assert!(eval1.signals.is_empty(),
+            "No-strategy scorer should return empty signals, got {:?}", eval1.signals);
+        assert!(eval2.signals.is_empty());
+
+        // Token 1's evaluation shouldn't affect token 2's (no cross-contamination).
+        assert_eq!(eval2.token_address, token2.address);
+    }
+
+    /// Verify the agent handles evaluation of a token with all fields populated.
+    #[tokio::test]
+    async fn test_agent_evaluate_with_rich_token() {
+        let event_bus = EventBus::new(16);
+        let agent = Agent::new_minimal(AgentConfig::default(), event_bus);
+
+        // Token with realistic data: price, volume, mcap, holders, age.
+        let token = TokenInfo {
+            address: "RichToken11111111111111111111111111111111".to_string(),
+            chain: Chain::Solana,
+            symbol: "RICH".to_string(),
+            name: "Rich Token".to_string(),
+            decimals: 9,
+            price_usd: Some(0.05),
+            market_cap_usd: Some(500_000.0),
+            volume_24h: Some(250_000.0),
+            holder_count: Some(1500),
+            created_at: Some(Utc::now() - chrono::Duration::hours(12)),
+            pair_address: Some("rich_pair_address".to_string()),
+            lp_locked: Some(true),
+            mint_authority_revoked: Some(true),
+            freeze_authority_revoked: Some(true),
+        };
+
+        let result = agent.evaluate(&token).await;
+        assert!(result.is_ok(), "evaluate() should work with rich token data");
+        let eval = result.unwrap();
+
+        // Confluence is 0 (no strategies), but safety score should be computed
+        // from the heuristic (liquidity, mcap, price, age, pair data).
+        assert!(eval.safety_score > 0,
+            "Safety heuristic should produce a non-zero score for rich token; got {}",
+            eval.safety_score);
+        assert_eq!(eval.token_address, token.address);
+        assert_eq!(eval.chain, Chain::Solana);
+        // Token has market cap and age → should be reflected in result.
+        assert!(eval.market_cap.is_some());
+        assert!(eval.age_hours.is_some());
     }
 }
