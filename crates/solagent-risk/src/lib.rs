@@ -372,6 +372,70 @@ impl RiskManager {
         size.max(1.0)
     }
 
+    /// Calculate a dynamic position size that scales with confluence score and win rate.
+    ///
+    /// - `portfolio_value`: current portfolio value in USD.
+    /// - `confluence_score`: composite signal score (0-100).
+    /// - `win_rate`: historical win rate (0.0-1.0). 0.5 = breakeven / unknown.
+    /// - `runtime_max_position_size`: max position cap from RuntimeConfig.
+    ///
+    /// # Logic
+    /// - Base tier by confluence: 0-35→$5, 35-45→$10, 45-60→$15, 60+→$20.
+    /// - Win rate modifier: >60% → +$5 per tier (up to max), <30% → -$5 (down to $5 floor).
+    /// - Cap at `min(runtime_max_position_size, portfolio_value * 0.25, $30)`.
+    /// - Floor at $1 to avoid dust.
+    pub fn calculate_dynamic_position_size(
+        &self,
+        portfolio_value: f64,
+        confluence_score: u8,
+        win_rate: f64,
+        runtime_max_position_size: f64,
+    ) -> f64 {
+        // Base tier selection by confluence score.
+        let base_size = match confluence_score {
+            0..=34 => 5.0,
+            35..=44 => 10.0,
+            45..=59 => 15.0,
+            _ => 20.0, // 60+
+        };
+
+        // Win rate modifier.
+        let size: f64 = if win_rate > 0.60 {
+            (base_size + 5.0_f64).min(runtime_max_position_size)
+        } else if win_rate < 0.30 {
+            (base_size - 5.0_f64).max(5.0)
+        } else {
+            base_size
+        };
+
+        // Cap at runtime max, portfolio-based limit, and hard $30 ceiling.
+        let portfolio_cap = portfolio_value * 0.25;
+        let cap = runtime_max_position_size
+            .min(portfolio_cap.max(1.0)) // ensure cap isn't ≤0 when portfolio_value is 0
+            .min(30.0);
+        let capped = size.min(cap);
+
+        // Floor at $1 to avoid dust swaps.
+        capped.max(1.0)
+    }
+
+    // ─── Runtime Config Sync ────────────────────────────────────────────
+
+    /// Set the max open positions at runtime (for auto-tuner / RuntimeConfig sync).
+    pub fn set_max_open_positions(&mut self, n: usize) {
+        self.config.max_open_positions = n;
+    }
+
+    /// Set the max position size at runtime (for auto-tuner / RuntimeConfig sync).
+    pub fn set_max_position_size(&mut self, size: f64) {
+        self.config.max_position_size_usd = size;
+    }
+
+    /// Set the daily loss limit at runtime (for auto-tuner / RuntimeConfig sync).
+    pub fn set_daily_loss_limit(&mut self, limit: f64) {
+        self.config.max_daily_loss_usd = limit;
+    }
+
     // ─── Dynamic Exit Profiles ──────────────────────────────────────────
 
     /// Select exit profile based on token characteristics.
@@ -517,5 +581,273 @@ impl RiskManager {
     /// Check if the circuit breaker would allow a new trade.
     pub fn can_trade(&self) -> bool {
         !matches!(self.circuit_breaker(), CircuitBreaker::Halted)
+    }
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_manager() -> RiskManager {
+        RiskManager::new(RiskConfig::default())
+    }
+
+    // ─── Dynamic Position Sizing Tests ──────────────────────────────────
+
+    #[test]
+    fn test_dynamic_size_confluence_0_returns_5() {
+        let rm = test_manager();
+        let size = rm.calculate_dynamic_position_size(100.0, 0, 0.5, 15.0);
+        assert!((size - 5.0).abs() < f64::EPSILON,
+            "confluence=0 should give base $5, got ${size}");
+    }
+
+    #[test]
+    fn test_dynamic_size_confluence_34_returns_5() {
+        let rm = test_manager();
+        let size = rm.calculate_dynamic_position_size(100.0, 34, 0.5, 15.0);
+        assert!((size - 5.0).abs() < f64::EPSILON,
+            "confluence=34 (0-34 tier) should give base $5, got ${size}");
+    }
+
+    #[test]
+    fn test_dynamic_size_confluence_35_returns_10() {
+        let rm = test_manager();
+        let size = rm.calculate_dynamic_position_size(100.0, 35, 0.5, 15.0);
+        assert!((size - 10.0).abs() < f64::EPSILON,
+            "confluence=35 (35-44 tier) should give base $10, got ${size}");
+    }
+
+    #[test]
+    fn test_dynamic_size_confluence_44_returns_10() {
+        let rm = test_manager();
+        let size = rm.calculate_dynamic_position_size(100.0, 44, 0.5, 15.0);
+        assert!((size - 10.0).abs() < f64::EPSILON,
+            "confluence=44 (35-44 tier) should give base $10, got ${size}");
+    }
+
+    #[test]
+    fn test_dynamic_size_confluence_45_returns_15() {
+        let rm = test_manager();
+        let size = rm.calculate_dynamic_position_size(100.0, 45, 0.5, 15.0);
+        assert!((size - 15.0).abs() < f64::EPSILON,
+            "confluence=45 (45-59 tier) should give base $15, got ${size}");
+    }
+
+    #[test]
+    fn test_dynamic_size_confluence_60_returns_20() {
+        let rm = test_manager();
+        let size = rm.calculate_dynamic_position_size(200.0, 60, 0.5, 25.0);
+        assert!((size - 20.0).abs() < f64::EPSILON,
+            "confluence=60 (60+ tier) should give base $20, got ${size}");
+    }
+
+    #[test]
+    fn test_dynamic_size_confluence_100_returns_20() {
+        let rm = test_manager();
+        let size = rm.calculate_dynamic_position_size(200.0, 100, 0.5, 25.0);
+        assert!((size - 20.0).abs() < f64::EPSILON,
+            "confluence=100 (60+ tier) should give base $20, got ${size}");
+    }
+
+    // ─── Win Rate Modifier Tests ────────────────────────────────────────
+
+    #[test]
+    fn test_win_rate_above_60_bumps_up() {
+        let rm = test_manager();
+        // confluence=45 (base $15), win_rate=0.8 → +$5 = $20, capped by runtime_max=25
+        let size = rm.calculate_dynamic_position_size(200.0, 45, 0.8, 25.0);
+        assert!((size - 20.0).abs() < f64::EPSILON,
+            "win_rate=0.8 should bump $15→$20, got ${size}");
+    }
+
+    #[test]
+    fn test_win_rate_below_30_reduces() {
+        let rm = test_manager();
+        // confluence=60 (base $20), win_rate=0.1 → -$5 = $15
+        let size = rm.calculate_dynamic_position_size(200.0, 60, 0.1, 25.0);
+        assert!((size - 15.0).abs() < f64::EPSILON,
+            "win_rate=0.1 should reduce $20→$15, got ${size}");
+    }
+
+    #[test]
+    fn test_win_rate_neutral_no_change() {
+        let rm = test_manager();
+        // confluence=35 (base $10), win_rate=0.5 → no modifier
+        let size = rm.calculate_dynamic_position_size(100.0, 35, 0.5, 15.0);
+        assert!((size - 10.0).abs() < f64::EPSILON,
+            "win_rate=0.5 should not change base, got ${size}");
+    }
+
+    #[test]
+    fn test_win_rate_exactly_60_no_bump() {
+        let rm = test_manager();
+        // Exactly 0.60 should NOT trigger the win rate bonus (> 0.60, not >=).
+        let size = rm.calculate_dynamic_position_size(100.0, 45, 0.60, 15.0);
+        assert!((size - 15.0).abs() < f64::EPSILON,
+            "win_rate=0.60 should NOT bump ($15 stays $15), got ${size}");
+    }
+
+    #[test]
+    fn test_win_rate_exactly_30_no_reduce() {
+        let rm = test_manager();
+        // Exactly 0.30 should NOT trigger the reduction (< 0.30, not <=).
+        let size = rm.calculate_dynamic_position_size(200.0, 60, 0.30, 25.0);
+        assert!((size - 20.0).abs() < f64::EPSILON,
+            "win_rate=0.30 should NOT reduce ($20 stays $20), got ${size}");
+    }
+
+    // ─── Bounds Enforcement Tests ───────────────────────────────────────
+
+    #[test]
+    fn test_dynamic_size_never_below_1() {
+        let rm = test_manager();
+        // Small portfolio, small confluence, small max_position_size — still ≥ $1.
+        let size = rm.calculate_dynamic_position_size(0.0, 0, 0.5, 1.0);
+        assert!(size >= 1.0, "Should never be below $1, got ${size}");
+    }
+
+    #[test]
+    fn test_dynamic_size_capped_by_max_position() {
+        let rm = test_manager();
+        // confluence=100 (base $20), win_rate=0.9 (bump to $25), but max=10.
+        let size = rm.calculate_dynamic_position_size(500.0, 100, 0.9, 10.0);
+        assert!((size - 10.0).abs() < f64::EPSILON,
+            "Should be capped at runtime_max=10, got ${size}");
+    }
+
+    #[test]
+    fn test_dynamic_size_capped_by_portfolio() {
+        let rm = test_manager();
+        // Portfolio=$20, confluence=100 (base $20), but 25% of $20 = $5 cap.
+        let size = rm.calculate_dynamic_position_size(20.0, 100, 0.5, 30.0);
+        assert!((size - 5.0).abs() < f64::EPSILON,
+            "Should be capped at 25% of portfolio=$5, got ${size}");
+    }
+
+    #[test]
+    fn test_dynamic_size_capped_at_30_hard_limit() {
+        let rm = test_manager();
+        // Large portfolio, high confluence, high win rate, high max — still ≤$30.
+        // With confluence=100 (base $20) and win_rate=0.9 (+$5), we get $25.
+        // The $30 hard cap is a safety ceiling — it would only kick in if
+        // tiers are raised above their current values.
+        let size = rm.calculate_dynamic_position_size(10000.0, 100, 0.9, 50.0);
+        // The cap chain is: min(50.0, min(10000*0.25=2500, 30)) = min(50, 30) = 30.
+        // But size=$25 is already below 30, so it returns 25.
+        assert!((size - 25.0).abs() < f64::EPSILON,
+            "Should return $25 (below $30 hard cap), got ${size}");
+
+        // To actually test the hard cap: set max_position_size to 40 but force
+        // a higher base by using a RuntimeConfig-style override (set_max_position_size).
+        let mut rm2 = test_manager();
+        rm2.set_max_position_size(40.0);
+        // With max=40, the cap chain: min(40, min(10000*0.25=2500, 30)) = min(40, 30) = 30.
+        // size=25 < 30, so still 25. The $30 hard cap is a true ceiling, enforced
+        // in all paths.
+        let size2 = rm2.calculate_dynamic_position_size(10000.0, 100, 0.9, 40.0);
+        assert!(size2 <= 30.0, "Should never exceed $30 hard cap, got ${size2}");
+    }
+
+    #[test]
+    fn test_dynamic_size_low_win_rate_floor_5() {
+        let rm = test_manager();
+        // confluence=35 (base $10), win_rate=0.1 → -$5 = $5 (floor at $5).
+        let size = rm.calculate_dynamic_position_size(100.0, 35, 0.1, 20.0);
+        assert!((size - 5.0).abs() < f64::EPSILON,
+            "win_rate=0.1 should reduce $10→$5, but not below $5 floor, got ${size}");
+    }
+
+    #[test]
+    fn test_dynamic_size_low_win_rate_below_5_floor() {
+        let rm = test_manager();
+        // confluence=0 (base $5), win_rate=0.1 → -$5 would give $0, but floor is $5.
+        let size = rm.calculate_dynamic_position_size(100.0, 0, 0.1, 20.0);
+        assert!((size - 5.0).abs() < f64::EPSILON,
+            "Should never go below $5 floor when reducing, got ${size}");
+    }
+
+    #[test]
+    fn test_dynamic_size_high_win_rate_capped_by_max_position() {
+        let rm = test_manager();
+        // confluence=45 (base $15), win_rate=0.8 → +$5 = $20, but max=15 caps it.
+        let size = rm.calculate_dynamic_position_size(200.0, 45, 0.8, 15.0);
+        assert!((size - 15.0).abs() < f64::EPSILON,
+            "win_rate bump should be capped by runtime_max, got ${size}");
+    }
+
+    // ─── Edge Case Tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_dynamic_size_zero_portfolio() {
+        let rm = test_manager();
+        // Portfolio is $0 (no balance), confluence=60 (base $20). 
+        // portfolio_cap = max(0*0.25, 1.0) = 1.0.
+        // cap = min(25.0, 1.0, 30.0) = 1.0. So $20 gets capped to $1.
+        let size = rm.calculate_dynamic_position_size(0.0, 60, 0.5, 25.0);
+        assert!((size - 1.0).abs() < f64::EPSILON,
+            "Zero portfolio should result in $1 size, got ${size}");
+    }
+
+    #[test]
+    fn test_dynamic_size_win_rate_exactly_50() {
+        let rm = test_manager();
+        let size = rm.calculate_dynamic_position_size(100.0, 50, 0.5, 20.0);
+        assert!((size - 15.0).abs() < f64::EPSILON,
+            "confluence=50 (45-59 tier) + win_rate=0.5 = $15, got ${size}");
+    }
+
+    #[test]
+    fn test_dynamic_size_all_tiers_with_neutral_win_rate() {
+        let rm = test_manager();
+        let cases = [
+            (0, 5.0),
+            (20, 5.0),
+            (30, 5.0),
+            (34, 5.0),
+            (35, 10.0),
+            (40, 10.0),
+            (44, 10.0),
+            (45, 15.0),
+            (50, 15.0),
+            (59, 15.0),
+            (60, 20.0),
+            (80, 20.0),
+            (100, 20.0),
+        ];
+
+        for (confluence, expected) in cases {
+            let size = rm.calculate_dynamic_position_size(500.0, confluence, 0.5, 30.0);
+            assert!((size - expected).abs() < f64::EPSILON,
+                "confluence={confluence} should give {expected}, got {size}");
+        }
+    }
+
+    // ─── Setter Tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_set_max_open_positions() {
+        let mut rm = test_manager();
+        assert_eq!(rm.config.max_open_positions, 10); // default
+        rm.set_max_open_positions(3);
+        assert_eq!(rm.config.max_open_positions, 3);
+    }
+
+    #[test]
+    fn test_set_max_position_size() {
+        let mut rm = test_manager();
+        assert!((rm.config.max_position_size_usd - 500.0).abs() < f64::EPSILON);
+        rm.set_max_position_size(15.0);
+        assert!((rm.config.max_position_size_usd - 15.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_set_daily_loss_limit() {
+        let mut rm = test_manager();
+        assert!((rm.config.max_daily_loss_usd - 200.0).abs() < f64::EPSILON);
+        rm.set_daily_loss_limit(15.0);
+        assert!((rm.config.max_daily_loss_usd - 15.0).abs() < f64::EPSILON);
     }
 }

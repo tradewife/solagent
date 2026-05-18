@@ -592,8 +592,28 @@ impl Agent {
         let positions = self.subsystems.portfolio.get_open_positions().await?;
         let portfolio_value = self.get_portfolio_value().await?;
 
+        // Sync runtime config into RiskManager before evaluating.
+        {
+            let max_open = *self.subsystems.runtime_config.max_open_positions.read().await;
+            let max_size = *self.subsystems.runtime_config.max_position_size_usd.read().await;
+            let daily_limit = *self.subsystems.runtime_config.daily_loss_limit.read().await;
+
+            let mut risk = self.subsystems.risk.lock().unwrap();
+            risk.set_max_open_positions(max_open);
+            risk.set_max_position_size(max_size);
+            risk.set_daily_loss_limit(daily_limit);
+        }
+
+        // Fetch win rate from portfolio for dynamic position sizing.
+        let win_rate = self.subsystems.portfolio.get_win_rate().await.unwrap_or(0.5);
+
         let risk = self.subsystems.risk.lock().unwrap();
-        let size = risk.calculate_position_size(portfolio_value);
+        let size = risk.calculate_dynamic_position_size(
+            portfolio_value,
+            evaluation.confluence_score,
+            win_rate,
+            *self.subsystems.runtime_config.max_position_size_usd.read().await,
+        );
         let report = risk.evaluate_trade(
             &evaluation.token_address,
             size,
@@ -606,6 +626,9 @@ impl Agent {
             token = &evaluation.token_address,
             passed = report.passed,
             circuit_breaker = %report.circuit_breaker,
+            dynamic_size = size,
+            confluence = evaluation.confluence_score,
+            win_rate = win_rate,
             "Risk check completed"
         );
 
@@ -617,15 +640,23 @@ impl Agent {
         self.transition(AgentState::Executing).await;
 
         let portfolio_value = self.get_portfolio_value().await?;
+        let win_rate = self.subsystems.portfolio.get_win_rate().await.unwrap_or(0.5);
 
         let risk = self.subsystems.risk.lock().unwrap();
-        let size = risk.calculate_position_size(portfolio_value);
+        let size = risk.calculate_dynamic_position_size(
+            portfolio_value,
+            evaluation.confluence_score,
+            win_rate,
+            *self.subsystems.runtime_config.max_position_size_usd.read().await,
+        );
         drop(risk);
 
         tracing::info!(
             token = &evaluation.token_address,
             size_usd = size,
-            "Attempting to execute buy"
+            confluence = evaluation.confluence_score,
+            win_rate = win_rate,
+            "Attempting to execute buy (dynamic size)"
         );
 
         // Get current price from DexScreener.

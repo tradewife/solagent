@@ -513,6 +513,31 @@ impl PortfolioManager {
         })
     }
 
+    // ─── Win Rate ───────────────────────────────────────────────────────
+
+    /// Calculate historical win rate from closed positions.
+    ///
+    /// Queries closed positions and counts those with positive unrealized_pnl
+    /// (which represents realized PnL at close time) as wins.
+    ///
+    /// Returns a value between 0.0 and 1.0, or 0.5 if no closed positions exist
+    /// (neutral starting point — neither optimistic nor pessimistic).
+    pub async fn get_win_rate(&self) -> Result<f64> {
+        let (wins, total): (i64, i64) = sqlx::query_as(
+            "SELECT COALESCE(SUM(CASE WHEN unrealized_pnl > 0 THEN 1 ELSE 0 END), 0), COUNT(*) FROM positions WHERE status = 'closed'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        if total == 0 {
+            // No trade history — return neutral 0.5 to avoid penalizing or
+            // over-rewarding a fresh wallet with no track record.
+            return Ok(0.5);
+        }
+
+        Ok(wins as f64 / total as f64)
+    }
+
     // ─── Twitter Account Management ─────────────────────────────────────
 
     /// Upsert a Twitter account into the twitter_accounts table.
@@ -1067,5 +1092,88 @@ mod tests {
         assert_eq!(evals[0].confluence_score, 30);
         assert_eq!(evals[1].confluence_score, 20);
         assert_eq!(evals[2].confluence_score, 10);
+    }
+
+    // ─── Win Rate Tests ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_get_win_rate_no_positions_returns_neutral() {
+        let pool = test_pool().await;
+        let pm = PortfolioManager::new(pool);
+
+        let wr = pm.get_win_rate().await.unwrap();
+        assert!((wr - 0.5).abs() < f64::EPSILON, "No closed positions should return neutral 0.5, got {wr}");
+    }
+
+    #[tokio::test]
+    async fn test_get_win_rate_all_wins() {
+        let pool = test_pool().await;
+        let pm = PortfolioManager::new(pool);
+
+        // Open and immediately close 3 positions, all profitable.
+        for i in 0..3 {
+            let pos = pm.open_position(
+                &format!("token_{i}"),
+                Chain::Solana,
+                1.0,  // entry_price
+                100.0, // size_usd
+                100.0, // token_amount
+                None,
+                None,
+            ).await.unwrap();
+
+            // Close at 2x → profit = 100 * (2-1)/1 = +100 (positive unrealized_pnl).
+            let closed = pm.close_position(&pos.id, 2.0).await.unwrap();
+            assert!(closed.unrealized_pnl > 0.0);
+        }
+
+        let wr = pm.get_win_rate().await.unwrap();
+        assert!((wr - 1.0).abs() < f64::EPSILON, "All wins should give 1.0, got {wr}");
+    }
+
+    #[tokio::test]
+    async fn test_get_win_rate_mixed() {
+        let pool = test_pool().await;
+        let pm = PortfolioManager::new(pool);
+
+        // Two wins, one loss.
+        for (i, close_price) in [(0, 2.0), (1, 0.5), (2, 3.0)] {
+            let pos = pm.open_position(
+                &format!("token_{i}"),
+                Chain::Solana,
+                1.0,  // entry_price
+                100.0, // size_usd
+                100.0, // token_amount
+                None,
+                None,
+            ).await.unwrap();
+            pm.close_position(&pos.id, close_price).await.unwrap();
+        }
+
+        let wr = pm.get_win_rate().await.unwrap();
+        assert!((wr - 2.0 / 3.0).abs() < 0.01, "2/3 wins should give ~0.667, got {wr}");
+    }
+
+    #[tokio::test]
+    async fn test_get_win_rate_all_losses() {
+        let pool = test_pool().await;
+        let pm = PortfolioManager::new(pool);
+
+        // All positions closed at a loss.
+        for i in 0..2 {
+            let pos = pm.open_position(
+                &format!("token_{i}"),
+                Chain::Solana,
+                2.0,  // entry_price
+                100.0,
+                100.0,
+                None,
+                None,
+            ).await.unwrap();
+            pm.close_position(&pos.id, 1.0).await.unwrap();
+        }
+
+        let wr = pm.get_win_rate().await.unwrap();
+        assert!((wr - 0.0).abs() < f64::EPSILON, "All losses should give 0.0, got {wr}");
     }
 }
