@@ -1312,26 +1312,16 @@ impl ConfluenceScorer {
 
     /// Evaluate all strategies for a token and produce a composite score.
     pub async fn score(&self, token: &TokenInfo) -> Result<ConfluenceResult> {
-        let mut signals = Vec::new();
+        let signals = self.evaluate_signals(token).await?;
+        let weights = self.weights.clone();
+        let threshold = self.threshold;
+
         let mut weighted_sum = 0.0;
         let mut weight_total = 0.0;
-
-        for (i, strategy) in self.strategies.iter().enumerate() {
-            let weight = self.weights.get(i).copied().unwrap_or(1.0);
-            match strategy.evaluate(token).await {
-                Ok(signal) => {
-                    weighted_sum += signal.score as f64 * weight;
-                    weight_total += weight;
-                    signals.push(signal);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        strategy = strategy.name(),
-                        error = %e,
-                        "Strategy evaluation failed"
-                    );
-                }
-            }
+        for (i, signal) in signals.iter().enumerate() {
+            let weight = weights.get(i).copied().unwrap_or(1.0);
+            weighted_sum += signal.score as f64 * weight;
+            weight_total += weight;
         }
 
         let composite = if weight_total > 0.0 {
@@ -1343,8 +1333,119 @@ impl ConfluenceScorer {
         Ok(ConfluenceResult {
             composite_score: composite as u8,
             signals,
-            passed: composite >= self.threshold,
+            passed: composite >= threshold,
         })
+    }
+
+    /// Evaluate signals without computing composite (for external scoring).
+    async fn evaluate_signals(&self, token: &TokenInfo) -> Result<Vec<Signal>> {
+        let mut signals = Vec::new();
+        for strategy in &self.strategies {
+            match strategy.evaluate(token).await {
+                Ok(signal) => signals.push(signal),
+                Err(e) => {
+                    tracing::warn!(
+                        strategy = strategy.name(),
+                        error = %e,
+                        "Strategy evaluation failed"
+                    );
+                }
+            }
+        }
+        Ok(signals)
+    }
+
+    /// Update the confluence threshold at runtime (for auto-tuner).
+    pub fn set_threshold(&mut self, threshold: f64) {
+        self.threshold = threshold;
+    }
+
+    /// Get the current threshold.
+    pub fn get_threshold(&self) -> f64 {
+        self.threshold
+    }
+
+    /// Update a signal weight by index at runtime.
+    pub fn set_weight(&mut self, index: usize, weight: f64) {
+        if let Some(w) = self.weights.get_mut(index) {
+            *w = weight;
+        }
+    }
+
+    /// Get current weights snapshot.
+    pub fn get_weights(&self) -> Vec<f64> {
+        self.weights.clone()
+    }
+
+    /// Get the number of strategies.
+    pub fn strategy_count(&self) -> usize {
+        self.strategies.len()
+    }
+}
+
+/// Thread-safe runtime configuration for the auto-tuner.
+///
+/// Wraps the mutable parameters that the auto-tuner adjusts at runtime:
+/// signal weights, confluence threshold, risk parameters.
+#[derive(Debug, Clone)]
+pub struct RuntimeConfig {
+    pub weights: Arc<RwLock<SignalWeights>>,
+    pub confluence_threshold: Arc<RwLock<f64>>,
+    pub max_position_size_usd: Arc<RwLock<f64>>,
+    pub max_open_positions: Arc<RwLock<usize>>,
+    pub daily_loss_limit: Arc<RwLock<f64>>,
+}
+
+impl RuntimeConfig {
+    pub fn new(
+        weights: SignalWeights,
+        confluence_threshold: f64,
+        max_position_size_usd: f64,
+        max_open_positions: usize,
+        daily_loss_limit: f64,
+    ) -> Self {
+        Self {
+            weights: Arc::new(RwLock::new(weights)),
+            confluence_threshold: Arc::new(RwLock::new(confluence_threshold)),
+            max_position_size_usd: Arc::new(RwLock::new(max_position_size_usd)),
+            max_open_positions: Arc::new(RwLock::new(max_open_positions)),
+            daily_loss_limit: Arc::new(RwLock::new(daily_loss_limit)),
+        }
+    }
+
+    /// Safely set a signal weight with bounds validation.
+    pub async fn set_weight(&self, field: &str, value: f64) -> Result<(), String> {
+        if value < 0.0 || value > 1.0 {
+            return Err(format!("Weight must be in [0.0, 1.0], got {value}"));
+        }
+        let mut w = self.weights.write().await;
+        match field {
+            "whale_consensus" => w.whale_consensus = value,
+            "accumulation" => w.accumulation = value,
+            "launch_momentum" => w.launch_momentum = value,
+            "volume_spike" => w.volume_spike = value,
+            "social" => w.social = value,
+            _ => return Err(format!("Unknown weight field: {field}")),
+        }
+        Ok(())
+    }
+
+    /// Set confluence threshold with bounds validation.
+    pub async fn set_confluence_threshold(&self, value: f64) -> Result<(), String> {
+        if value < 5.0 || value > 80.0 {
+            return Err(format!("Threshold must be in [5.0, 80.0], got {value}"));
+        }
+        *self.confluence_threshold.write().await = value;
+        Ok(())
+    }
+
+    /// Set max position size with bounds validation.
+    pub async fn set_max_position_size(&self, value: f64) -> Result<(), String> {
+        if value < 1.0 || value > 30.0 {
+            return Err(format!("Position size must be in [$1, $30], got ${value}"));
+        }
+        *self.max_position_size_usd.write().await = value;
+        Ok(())
     }
 }
 

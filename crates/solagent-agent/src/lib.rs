@@ -228,6 +228,9 @@ pub struct AgentSubsystems {
     pub watcher: Option<solagent_data::WalletWatcher>,
     /// GMGN client for fetching holder count data.
     pub gmgn: solagent_data::GmgnClient,
+    /// Runtime-configurable parameters (weights, threshold, risk limits)
+    /// for the auto-tuner.
+    pub runtime_config: solagent_signals::RuntimeConfig,
 }
 
 // ─── Agent ───────────────────────────────────────────────────────────────────
@@ -276,6 +279,14 @@ impl Agent {
         // This is used when the agent is created without full subsystems.
         // The subsystems field won't be usable, but scan/monitor won't be called.
         let threshold = 65.0;
+        let default_weights = solagent_signals::SignalWeights::default();
+        let runtime_config = solagent_signals::RuntimeConfig::new(
+            default_weights,
+            threshold,
+            15.0,   // max_position_size_usd
+            3,      // max_open_positions
+            15.0,   // daily_loss_limit
+        );
         Self {
             state: Arc::new(tokio::sync::RwLock::new(AgentState::Scanning)),
             config,
@@ -307,6 +318,7 @@ impl Agent {
                 progressive_threshold_floor: 20.0,
                 watcher: None,
                 gmgn: solagent_data::GmgnClient::new(),
+                runtime_config,
             }),
             decisions: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             running: Arc::new(tokio::sync::RwLock::new(false)),
@@ -499,13 +511,34 @@ impl Agent {
         let safety_score = Self::compute_heuristic_safety(token);
         let safety_passed = safety_score >= self.subsystems.safety.threshold;
 
+        // Sync runtime config (weights + threshold) into ConfluenceScorer
+        // before scoring, so the auto-tuner can adjust parameters at runtime.
+        {
+            let runtime_weights = self.subsystems.runtime_config.weights.read().await.clone();
+            let runtime_threshold = *self.subsystems.runtime_config.confluence_threshold.read().await;
+
+            let mut confluence = self.subsystems.confluence.lock().unwrap();
+            // Set weights in order: whale_consensus(0), accumulation(1),
+            // launch_momentum(2), volume_spike(3), social(4).
+            confluence.set_weight(0, runtime_weights.whale_consensus);
+            confluence.set_weight(1, runtime_weights.accumulation);
+            confluence.set_weight(2, runtime_weights.launch_momentum);
+            confluence.set_weight(3, runtime_weights.volume_spike);
+            confluence.set_weight(4, runtime_weights.social);
+            confluence.set_threshold(runtime_threshold);
+        }
+
         // Run confluence scoring across all signal detectors.
         let confluence = self.subsystems.confluence.lock().unwrap();
         let confluence_result = confluence.score(token).await?;
         drop(confluence);
 
-        // Use progressive threshold (may be lowered after many failures).
-        let effective_threshold = self.progressive_threshold.read().await.current();
+        // Effective threshold = min(runtime threshold, progressive threshold).
+        // This ensures the progressive safety net kicks in even if the runtime
+        // threshold is set higher.
+        let runtime_threshold = *self.subsystems.runtime_config.confluence_threshold.read().await;
+        let progressive = self.progressive_threshold.read().await.current();
+        let effective_threshold = runtime_threshold.min(progressive);
         let confluence_passed = confluence_result.composite_score as f64 >= effective_threshold;
         let confluence_score = confluence_result.composite_score;
         let signals = confluence_result.signals;

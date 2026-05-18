@@ -755,7 +755,14 @@ async fn main() -> Result<()> {
                 (None, false)
             };
 
-            let subsystems = solagent_agent::AgentSubsystems {
+            let subsystems = {
+                // Extract risk values for RuntimeConfig before risk_config is
+                // moved into RiskManager::new in the struct literal below.
+                let max_pos_size = risk_config.max_position_size_usd;
+                let max_open_pos = risk_config.max_open_positions;
+                let daily_loss = risk_config.max_daily_loss_usd;
+
+                solagent_agent::AgentSubsystems {
                 dex,
                 safety,
                 risk: std::sync::Mutex::new(solagent_risk::RiskManager::new(risk_config)),
@@ -769,6 +776,14 @@ async fn main() -> Result<()> {
                 progressive_threshold_floor: config.as_ref().map(|c| c.strategies.progressive_threshold_floor).unwrap_or(10.0),
                 watcher,
                 gmgn: solagent_data::GmgnClient::new(),
+                runtime_config: solagent_signals::RuntimeConfig::new(
+                    solagent_signals::SignalWeights::default(),
+                    confluence_threshold,
+                    max_pos_size,
+                    max_open_pos,
+                    daily_loss,
+                ),
+            }
             };
 
             // Load watched wallets from registry into the watcher.
