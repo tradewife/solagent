@@ -146,6 +146,59 @@ impl AutoTuner {
         // ─── 3. Adjust position sizing ───────────────────────────────────
         self.tune_position_size(win_rate).await;
 
+        // ─── 4. Record performance snapshot ──────────────────────────────
+        if let Err(e) = self.record_snapshot(win_rate).await {
+            tracing::warn!(error = %e, "Auto-tuner: failed to record performance snapshot (non-fatal)");
+        }
+
+        Ok(())
+    }
+
+    /// Record a performance snapshot after tuning completes.
+    async fn record_snapshot(&self, win_rate: f64) -> Result<()> {
+        let pnl = self.portfolio.get_pnl().await?;
+        let open_positions = self.portfolio.get_open_positions().await?;
+
+        let avg_trade_return = if pnl.total_trades > 0 {
+            Some(pnl.total_pnl / pnl.total_trades as f64)
+        } else {
+            None
+        };
+
+        let weights = self.runtime_config.weights.read().await;
+        let signal_weights = serde_json::json!({
+            "whale_consensus": weights.whale_consensus,
+            "accumulation": weights.accumulation,
+            "launch_momentum": weights.launch_momentum,
+            "volume_spike": weights.volume_spike,
+            "social": weights.social,
+        })
+        .to_string();
+
+        let threshold = *self.runtime_config.confluence_threshold.read().await;
+        let position_size = *self.runtime_config.max_position_size_usd.read().await;
+
+        let snapshot = solagent_portfolio::PerformanceSnapshot {
+            timestamp: Utc::now().to_rfc3339(),
+            win_rate,
+            total_trades: pnl.total_trades as usize,
+            total_pnl: pnl.total_pnl,
+            avg_trade_return,
+            signal_weights,
+            confluence_threshold: threshold,
+            position_size,
+            open_positions: open_positions.len(),
+        };
+
+        self.portfolio.insert_performance_snapshot(&snapshot).await?;
+
+        tracing::info!(
+            win_rate = format!("{:.1}%", win_rate * 100.0),
+            total_trades = snapshot.total_trades,
+            total_pnl = format!("${:.2}", snapshot.total_pnl),
+            "Auto-tuner: performance snapshot recorded"
+        );
+
         Ok(())
     }
 

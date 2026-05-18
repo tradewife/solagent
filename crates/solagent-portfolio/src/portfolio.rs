@@ -118,6 +118,23 @@ pub struct DailySnapshot {
     pub created_at: DateTime<Utc>,
 }
 
+// ─── Performance Snapshot ────────────────────────────────────────────────────
+
+/// A snapshot of key performance metrics recorded by the auto-tuner
+/// after each successful tuning cycle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerformanceSnapshot {
+    pub timestamp: String,
+    pub win_rate: f64,
+    pub total_trades: usize,
+    pub total_pnl: f64,
+    pub avg_trade_return: Option<f64>,
+    pub signal_weights: String,
+    pub confluence_threshold: f64,
+    pub position_size: f64,
+    pub open_positions: usize,
+}
+
 // ─── Portfolio Manager ───────────────────────────────────────────────────────
 
 /// Manages portfolio state with a SQLite backend.
@@ -532,6 +549,56 @@ impl PortfolioManager {
         Ok(wins as f64 / total as f64)
     }
 
+    // ─── Performance Metrics Snapshots ────────────────────────────────────
+
+    /// Insert a performance snapshot into the performance_metrics table.
+    pub async fn insert_performance_snapshot(
+        &self,
+        metrics: &PerformanceSnapshot,
+    ) -> Result<i64> {
+        let result = sqlx::query(
+            r#"INSERT INTO performance_metrics
+               (timestamp, win_rate, total_trades, total_pnl, avg_trade_return,
+                signal_weights, confluence_threshold, position_size, open_positions)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
+        )
+        .bind(&metrics.timestamp)
+        .bind(metrics.win_rate)
+        .bind(metrics.total_trades as i64)
+        .bind(metrics.total_pnl)
+        .bind(metrics.avg_trade_return)
+        .bind(&metrics.signal_weights)
+        .bind(metrics.confluence_threshold)
+        .bind(metrics.position_size)
+        .bind(metrics.open_positions as i64)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Get the most recent performance snapshot, if any exist.
+    pub async fn get_latest_metrics(&self) -> Result<Option<PerformanceSnapshot>> {
+        let row = sqlx::query_as::<_, PerformanceMetricsRow>(
+            "SELECT * FROM performance_metrics ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|r| r.into_snapshot()))
+    }
+
+    /// Get all evaluation records (useful for signal-report aggregation).
+    pub async fn get_all_evaluations(&self) -> Result<Vec<EvaluationRecord>> {
+        let rows = sqlx::query_as::<_, EvaluationRow>(
+            "SELECT * FROM evaluations ORDER BY created_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(|r| r.into_record()).collect())
+    }
+
     // ─── Twitter Account Management ─────────────────────────────────────
 
     /// Upsert a Twitter account into the twitter_accounts table.
@@ -938,6 +1005,36 @@ impl TwitterAccountRow {
             updated_at: DateTime::parse_from_rfc3339(&self.updated_at)
                 .map(|dt| dt.to_utc())
                 .unwrap_or_default(),
+        }
+    }
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct PerformanceMetricsRow {
+    id: i64,
+    timestamp: String,
+    win_rate: f64,
+    total_trades: i64,
+    total_pnl: f64,
+    avg_trade_return: Option<f64>,
+    signal_weights: Option<String>,
+    confluence_threshold: Option<f64>,
+    position_size: Option<f64>,
+    open_positions: i64,
+}
+
+impl PerformanceMetricsRow {
+    fn into_snapshot(self) -> PerformanceSnapshot {
+        PerformanceSnapshot {
+            timestamp: self.timestamp,
+            win_rate: self.win_rate,
+            total_trades: self.total_trades as usize,
+            total_pnl: self.total_pnl,
+            avg_trade_return: self.avg_trade_return,
+            signal_weights: self.signal_weights.unwrap_or_else(|| "{}".to_string()),
+            confluence_threshold: self.confluence_threshold.unwrap_or(0.0),
+            position_size: self.position_size.unwrap_or(0.0),
+            open_positions: self.open_positions as usize,
         }
     }
 }

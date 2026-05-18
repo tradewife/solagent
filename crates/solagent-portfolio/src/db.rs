@@ -118,6 +118,22 @@ CREATE TABLE IF NOT EXISTS twitter_accounts (
 
 CREATE INDEX IF NOT EXISTS idx_twitter_accounts_handle ON twitter_accounts(handle);
 CREATE INDEX IF NOT EXISTS idx_twitter_accounts_last_polled ON twitter_accounts(last_polled_at);
+
+-- Performance metrics snapshots recorded by the auto-tuner after each tune cycle.
+CREATE TABLE IF NOT EXISTS performance_metrics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    win_rate REAL NOT NULL,
+    total_trades INTEGER NOT NULL,
+    total_pnl REAL NOT NULL,
+    avg_trade_return REAL,
+    signal_weights TEXT,
+    confluence_threshold REAL,
+    position_size REAL,
+    open_positions INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_performance_metrics_timestamp ON performance_metrics(timestamp);
 "#;
 
 /// Open a SQLite pool and run all migrations.
