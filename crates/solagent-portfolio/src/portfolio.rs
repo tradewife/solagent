@@ -727,6 +727,100 @@ impl PortfolioManager {
         Ok(())
     }
 
+    // ─── Phantom Position Cleanup ───────────────────────────────────────
+
+    /// Remove phantom positions caused by wrong token decimals or data corruption.
+    ///
+    /// A phantom position has a plausible token_amount (thousands of tokens)
+    /// but an implausibly large size_usd (e.g. $12,312 for what should be $1.33).
+    /// These inflate the portfolio peak value and cause the circuit breaker to
+    /// HALT due to >90% drawdown when the position is eventually closed.
+    ///
+    /// Strategy:
+    /// - Find all positions where size_usd > $100 (clearly wrong for a sub-$1 wallet).
+    /// - Also find all positions where the DRPY token (or similar known-phantom address)
+    ///   has both a huge and a small version of the same position.
+    /// - Delete those phantom positions AND their associated trades.
+    ///
+    /// Returns the number of phantom position records cleaned up.
+    pub async fn cleanup_phantom_positions(&self) -> Result<usize> {
+        // Phase 1: Find phantom positions by implausibly large size_usd.
+        // We use $100 as the threshold — the agent is configured for ~$15 max
+        // position size, so anything over $100 is clearly wrong.
+        let phantom_rows: Vec<PhantomPosition> = sqlx::query_as(
+            "SELECT id, token_address, size_usd, token_amount FROM positions WHERE size_usd > 100.0 AND status = 'closed'",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        // Phase 2: Also find DRPY token specifically (known phantom).
+        let drpy_rows: Vec<PhantomPosition> = sqlx::query_as(
+            "SELECT id, token_address, size_usd, token_amount FROM positions WHERE token_address = 'EPRZgmvU4aTQ4UaC4bywgNvxJ5YmhuKqM1bx3gw4DRPY' AND size_usd > 100.0",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        // Collect all phantom position IDs.
+        let phantom_ids: std::collections::HashSet<String> = phantom_rows
+            .iter()
+            .chain(drpy_rows.iter())
+            .map(|p| p.id.clone())
+            .collect();
+
+        if phantom_ids.is_empty() {
+            tracing::debug!("cleanup_phantom_positions: no phantom records found");
+            return Ok(0);
+        }
+
+        // Also find the stale open DRPY position (379187fc-...).
+        let stale_open: Vec<PhantomPosition> = sqlx::query_as(
+            "SELECT id, token_address, size_usd, token_amount FROM positions WHERE token_address = 'EPRZgmvU4aTQ4UaC4bywgNvxJ5YmhuKqM1bx3gw4DRPY' AND status = 'open'",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let all_ids: Vec<String> = phantom_ids
+            .iter()
+            .chain(stale_open.iter().map(|p| &p.id))
+            .cloned()
+            .collect();
+
+        let total = all_ids.len();
+
+        // Delete associated trades first (FK constraint).
+        // Use a dynamic query since SQLite doesn't support arrays in IN clauses natively.
+        for id in &all_ids {
+            sqlx::query("DELETE FROM trades WHERE position_id = ?1")
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
+        }
+
+        // Delete the phantom positions.
+        for id in &all_ids {
+            let result = sqlx::query("DELETE FROM positions WHERE id = ?1")
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
+
+            if result.rows_affected() > 0 {
+                tracing::warn!(
+                    position_id = %id,
+                    "Cleaned up phantom position (size_usd > $100 or stale DRPY)"
+                );
+            }
+        }
+
+        if total > 0 {
+            tracing::warn!(
+                cleaned = total,
+                "Phantom position cleanup complete: removed {total} records with inflated size_usd"
+            );
+        }
+
+        Ok(total)
+    }
+
     // ─── On-Chain Reconciliation ─────────────────────────────────────────
 
     /// Reconcile positions by scanning the wallet's on-chain token accounts.
@@ -850,6 +944,15 @@ impl PortfolioManager {
 }
 
 // ─── Internal Row Types ──────────────────────────────────────────────────────
+
+/// Minimal row for phantom position detection.
+#[derive(Debug, sqlx::FromRow)]
+struct PhantomPosition {
+    id: String,
+    token_address: String,
+    size_usd: f64,
+    token_amount: f64,
+}
 
 #[derive(Debug, sqlx::FromRow)]
 struct PositionRow {
@@ -1266,5 +1369,83 @@ mod tests {
 
         let wr = pm.get_win_rate().await.unwrap();
         assert!((wr - 0.0).abs() < f64::EPSILON, "All losses should give 0.0, got {wr}");
+    }
+
+    // ─── Phantom Position Cleanup Tests ─────────────────────────────────
+
+    #[tokio::test]
+    async fn test_cleanup_phantom_positions_removes_big_size_usd() {
+        let pool = test_pool().await;
+        let pm = PortfolioManager::new(pool.clone());
+
+        // Insert a position with inflated size_usd (phantom).
+        let pos_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO positions (id, token_address, chain, entry_price, current_price, size_usd, token_amount, unrealized_pnl, status, opened_at, updated_at) VALUES (?1, ?2, 'solana', 1.33, 0.0001203, ?3, 9257.0, -12311.0, 'closed', '2026-05-19T00:00:00Z', '2026-05-19T00:00:00Z')",
+        )
+        .bind(&pos_id)
+        .bind("EPRZgmvU4aTQ4UaC4bywgNvxJ5YmhuKqM1bx3gw4DRPY")
+        .bind(12312.0_f64) // inflated size_usd
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Insert associated trade.
+        sqlx::query(
+            "INSERT INTO trades (id, position_id, token_address, chain, side, size_usd, token_amount, price, executed_at) VALUES (?1, ?2, ?3, 'solana', 'sell', 1.11, 9257.0, 0.0001203, '2026-05-19T00:00:00Z')",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&pos_id)
+        .bind("EPRZgmvU4aTQ4UaC4bywgNvxJ5YmhuKqM1bx3gw4DRPY")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let cleaned = pm.cleanup_phantom_positions().await.unwrap();
+        assert!(cleaned >= 1, "Should have cleaned at least 1 phantom position");
+
+        // Verify position was deleted.
+        let pos_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM positions WHERE id = ?1")
+            .bind(&pos_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(pos_count.0, 0, "Phantom position should be deleted");
+
+        // Verify trade was deleted.
+        let trade_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM trades WHERE position_id = ?1")
+            .bind(&pos_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(trade_count.0, 0, "Phantom trade should be deleted");
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_phantom_positions_keeps_normal() {
+        let pool = test_pool().await;
+        let pm = PortfolioManager::new(pool.clone());
+
+        // Open and close a normal position with $1 size_usd.
+        let pos = pm.open_position(
+            "normal_token",
+            Chain::Solana,
+            1.0,
+            1.0,
+            1000000.0,
+            None,
+            None,
+        ).await.unwrap();
+        pm.close_position(&pos.id, 0.9).await.unwrap();
+
+        let cleaned = pm.cleanup_phantom_positions().await.unwrap();
+        assert_eq!(cleaned, 0, "Normal positions should not be cleaned up");
+
+        // Verify the normal position still exists.
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM positions WHERE token_address = 'normal_token'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count.0, 1, "Normal position should still exist");
     }
 }

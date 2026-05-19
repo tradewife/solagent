@@ -990,6 +990,45 @@ impl Agent {
             }
         }
 
+        // Clean up phantom positions (from wrong token decimals inflating size_usd).
+        // This prevents the circuit breaker from staying HALTED across restarts
+        // due to phantom $12k PnL from a position that was actually $1.
+        tracing::info!("Cleaning up phantom positions on startup");
+        match self.subsystems.portfolio.cleanup_phantom_positions().await {
+            Ok(count) if count > 0 => {
+                tracing::warn!(
+                    cleaned = count,
+                    "Found and removed {} phantom position records on startup",
+                    count,
+                );
+            }
+            Ok(_) => {
+                tracing::info!("No phantom positions found — DB is clean");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to clean up phantom positions (non-fatal)");
+            }
+        }
+
+        // Reset the circuit breaker's peak value to the real portfolio value.
+        // This ensures any phantom PnL from past data errors does not cause a
+        // persistent HALTED state across agent restarts.
+        match self.get_portfolio_value().await {
+            Ok(real_value) => {
+                self.subsystems.risk.lock().unwrap().reset_peak(real_value);
+                tracing::info!(
+                    real_portfolio_value = real_value,
+                    "Circuit breaker peak reset to real portfolio value on startup"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to compute portfolio value for peak reset (non-fatal)"
+                );
+            }
+        }
+
         // Spawn wallet watcher background task (if configured).
         let _watcher_handle = if let Some(ref watcher) = self.subsystems.watcher {
             let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);

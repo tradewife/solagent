@@ -289,7 +289,26 @@ impl RiskManager {
             // Only check drawdown if both peak and current value are positive.
             // A zero portfolio value likely means RPC failure, not real drawdown.
             if peak > 0.0 && portfolio_value > 0.0 {
-                let dd_pct = ((peak - portfolio_value) / peak) * 100.0;
+                let raw_dd_pct = ((peak - portfolio_value) / peak) * 100.0;
+
+                // Sanity clamp: if drawdown exceeds 90%, it's almost certainly
+                // a data error (phantom PnL from wrong token decimals, stale
+                // prices, or corrupted DB records). Reset peak to current
+                // portfolio value instead of halting the agent.
+                let dd_pct = if raw_dd_pct > 90.0 {
+                    tracing::warn!(
+                        raw_drawdown_pct = %format!("{raw_dd_pct:.1}"),
+                        peak = peak,
+                        portfolio_value = portfolio_value,
+                        "Improbable drawdown > 90% detected — resetting peak to current portfolio value (data error / phantom PnL)"
+                    );
+                    let mut peak_w = self.peak_value.write();
+                    *peak_w = portfolio_value;
+                    0.0 // No drawdown after reset
+                } else {
+                    raw_dd_pct
+                };
+
                 let mut cb = self.circuit_breaker.write();
                 if dd_pct >= self.config.halt_threshold_pct {
                     *cb = CircuitBreaker::Halted;
@@ -339,6 +358,34 @@ impl RiskManager {
         if current_value > *peak {
             *peak = current_value;
         }
+    }
+
+    /// Reset the peak portfolio value to an explicit value.
+    ///
+    /// Use this on startup to compute the real portfolio value (SOL + open
+    /// positions at current prices) and reset the peak to that value. This
+    /// prevents phantom PnL from data errors (wrong decimals, stale prices)
+    /// from causing the circuit breaker to remain in HALTED state across
+    /// agent restarts.
+    pub fn reset_peak(&self, value: f64) {
+        if value <= 0.0 {
+            tracing::warn!(
+                reset_peak_value = value,
+                "Refusing to reset peak to <= 0; keeping existing value"
+            );
+            return;
+        }
+        let old = {
+            let mut peak = self.peak_value.write();
+            let old = *peak;
+            *peak = value;
+            old
+        };
+        tracing::info!(
+            old_peak = old,
+            new_peak = value,
+            "Peak portfolio value reset (startup reconciliation)"
+        );
     }
 
     /// Reset daily PnL (call at midnight UTC).
@@ -1053,6 +1100,50 @@ mod tests {
             "16% drawdown should trigger CircuitBreaker::Halted, got {:?}", report.circuit_breaker);
         // When halted, can_trade() should return false.
         assert!(!rm.can_trade(), "can_trade() should be false when circuit breaker is Halted");
+    }
+
+    #[test]
+    fn test_circuit_breaker_sanity_clamp_on_phantom_drawdown() {
+        let rm = test_manager();
+        // Set peak to 12312 (from phantom DRPY position), then evaluate
+        // with real portfolio at 50 (99.6% drawdown). The sanity clamp
+        // should detect >90% drawdown, reset peak to 50, and return Normal.
+        rm.update_peak(12312.0);
+        let report = rm.evaluate_trade(
+            "token_sane",
+            10.0,
+            0,
+            50.0,   // real portfolio value (99.6% drawdown from phantom peak)
+            &[],
+        );
+        assert_eq!(
+            report.circuit_breaker,
+            CircuitBreaker::Normal,
+            "Phantom 99.6% drawdown should be sanity-clamped to Normal, got {:?}",
+            report.circuit_breaker
+        );
+        assert!(rm.can_trade(), "can_trade() should be true after phantom drawdown clamp");
+    }
+
+    #[test]
+    fn test_circuit_breaker_sanity_clamp_leaves_real_drawdown() {
+        let rm = test_manager();
+        // 50% drawdown is not a phantom — it's a real (if severe) loss.
+        // The sanity clamp should NOT fire (only triggers > 90%).
+        rm.update_peak(100.0);
+        let report = rm.evaluate_trade(
+            "token_real_loss",
+            10.0,
+            0,
+            50.0,   // 50% real drawdown
+            &[],
+        );
+        assert_eq!(
+            report.circuit_breaker,
+            CircuitBreaker::Halted,
+            "50% real drawdown should still trigger Halted, got {:?}",
+            report.circuit_breaker
+        );
     }
 
     #[test]
