@@ -35,3 +35,5 @@ progressive_threshold_floor = 10.0
 jupiter_api_url = "https://api.jup.ag/swap/v1"
 dexscreener_base_url = "https://api.dexscreener.com"
 birdeye_base_url = "https://public-api.birdeye.so"
+zerion_base_url = "https://api.zerion.io/v1"
+# zerion_api_key — set in local.toml (free at dashboard.zerion.io, 60K calls/mo)

@@ -42,6 +42,10 @@ pub struct AutoTuner {
     runtime_config: RuntimeConfig,
     /// Portfolio manager for querying trade history and win rate.
     portfolio: Arc<PortfolioManager>,
+    /// Optional Zerion client for cross-validating PnL.
+    zerion: Option<solagent_data::ZerionClient>,
+    /// Wallet address for Zerion PnL queries.
+    wallet_address: Option<String>,
     /// Minimum number of completed trades before tuning activates.
     min_trades_before_tuning: usize,
     /// Maximum absolute change in any single weight during a tune cycle.
@@ -58,6 +62,8 @@ impl AutoTuner {
         Self {
             runtime_config,
             portfolio,
+            zerion: None,
+            wallet_address: None,
             min_trades_before_tuning: DEFAULT_MIN_TRADES,
             max_weight_change: DEFAULT_MAX_WEIGHT_CHANGE,
             last_tune_time: Arc::new(RwLock::new(Utc::now())),
@@ -76,11 +82,19 @@ impl AutoTuner {
         Self {
             runtime_config,
             portfolio,
+            zerion: None,
+            wallet_address: None,
             min_trades_before_tuning: min_trades,
             max_weight_change,
             last_tune_time: Arc::new(RwLock::new(Utc::now())),
             tune_interval_hours,
         }
+    }
+
+    /// Set the Zerion client for PnL cross-validation during tuning.
+    pub fn set_zerion(&mut self, client: solagent_data::ZerionClient, wallet_address: String) {
+        self.zerion = Some(client);
+        self.wallet_address = Some(wallet_address);
     }
 
     /// Check whether enough time has passed and enough trades exist.
@@ -136,6 +150,24 @@ impl AutoTuner {
             win_rate = format!("{:.1}%", win_rate * 100.0),
             "Auto-tuner: tuning parameters based on win rate"
         );
+
+        // Optional Zerion PnL cross-check.
+        if let (Some(zerion), Some(wallet)) = (&self.zerion, &self.wallet_address) {
+            match zerion.get_pnl(wallet, Some("solana")).await {
+                Ok(zerion_pnl) => {
+                    tracing::info!(
+                        zerion_total_gain = format!("${:.2}", zerion_pnl.total_gain),
+                        zerion_realized = format!("${:.2}", zerion_pnl.realized_gain),
+                        zerion_unrealized = format!("${:.2}", zerion_pnl.unrealized_gain),
+                        zerion_roi = format!("{:.2}%", zerion_pnl.relative_total_gain_pct),
+                        "Auto-tuner: Zerion PnL cross-check"
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "Auto-tuner: Zerion PnL unavailable (non-fatal)");
+                }
+            }
+        }
 
         // ─── 1. Adjust confluence threshold ──────────────────────────────
         self.tune_threshold(win_rate).await;
@@ -202,6 +234,7 @@ impl AutoTuner {
         Ok(())
     }
 
+    #[allow(clippy::doc_lazy_continuation)]
     /// Adjust the confluence threshold based on win rate.
     ///
     /// - win_rate > 60% → raise threshold by 5 (tighten — we're doing well, be pickier)
@@ -220,18 +253,15 @@ impl AutoTuner {
 
         if direction != 0.0 {
             let new = (old_threshold + direction).clamp(THRESHOLD_MIN, THRESHOLD_MAX);
-            let diff = new - old_threshold;
 
-            if diff.abs() > f64::EPSILON {
-                *self.runtime_config.confluence_threshold.write().await = new;
-                let direction_label = if direction > 0.0 { "↑" } else { "↓" };
-                tracing::info!(
-                    before = old_threshold,
-                    after = new,
-                    win_rate = format!("{:.1}%", win_rate * 100.0),
-                    "Auto-tuner: confluence threshold {direction_label} ({old_threshold:.0} → {new:.0})"
-                );
-            }
+            *self.runtime_config.confluence_threshold.write().await = new;
+            let direction_label = if direction > 0.0 { "↑" } else { "↓" };
+            tracing::info!(
+                before = old_threshold,
+                after = new,
+                win_rate = format!("{:.1}%", win_rate * 100.0),
+                "Auto-tuner: confluence threshold {direction_label} ({old_threshold:.0} → {new:.0})"
+            );
         } else {
             tracing::debug!(
                 threshold = old_threshold,
@@ -303,6 +333,7 @@ impl AutoTuner {
         );
     }
 
+    #[allow(clippy::doc_lazy_continuation)]
     /// Adjust max position size based on win rate.
     ///
     /// - win_rate > 60% → increase by $2 (up to $30) — confidence is high
@@ -321,18 +352,14 @@ impl AutoTuner {
 
         if delta != 0.0 {
             let new = (old_size + delta).clamp(POSITION_SIZE_MIN, POSITION_SIZE_MAX);
-            let diff = new - old_size;
-
-            if diff.abs() > f64::EPSILON {
-                *self.runtime_config.max_position_size_usd.write().await = new;
-                let direction_label = if delta > 0.0 { "↑" } else { "↓" };
-                tracing::info!(
-                    before = format!("${:.0}", old_size),
-                    after = format!("${:.0}", new),
-                    win_rate = format!("{:.1}%", win_rate * 100.0),
-                    "Auto-tuner: max position size {direction_label} (${old_size:.0} → ${new:.0})"
-                );
-            }
+            *self.runtime_config.max_position_size_usd.write().await = new;
+            let direction_label = if delta > 0.0 { "↑" } else { "↓" };
+            tracing::info!(
+                before = format!("${:.0}", old_size),
+                after = format!("${:.0}", new),
+                win_rate = format!("{:.1}%", win_rate * 100.0),
+                "Auto-tuner: max position size {direction_label} (${old_size:.0} → ${new:.0})"
+            );
         } else {
             tracing::debug!(
                 size = format!("${:.0}", old_size),

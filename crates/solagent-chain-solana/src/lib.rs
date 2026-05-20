@@ -193,12 +193,11 @@ impl SolanaProvider {
             }
 
             // Fallback: extract mint from account data (bytes 0-32) and amount (bytes 64-72).
-            if let Some(b64) = account_json.get("data").and_then(|d| {
+            let _ = account_json.get("data").and_then(|d| {
                 d.as_array().and_then(|a| a.first()).and_then(|v| v.as_str())
-            }) {
-                if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(b64)
-                    && decoded.len() >= 72
-                {
+            }).and_then(|b64| {
+                let decoded = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+                if decoded.len() >= 72 {
                     let mint_bytes: [u8; 32] = decoded[0..32].try_into().unwrap_or([0u8; 32]);
                     let mint = bs58::encode(mint_bytes).into_string();
                     let amount = u64::from_le_bytes(
@@ -208,7 +207,8 @@ impl SolanaProvider {
                         balances.push((mint, amount, 6));  // default 6 decimals for fallback path
                     }
                 }
-            }
+                Some(())
+            });
         }
 
         Ok(balances)
@@ -249,6 +249,7 @@ impl SolanaProvider {
         }
         #[derive(::serde::Deserialize)]
         struct SplTokenAmount {
+            #[allow(dead_code)]
             amount: String,
             #[allow(dead_code)]
             decimals: u8,

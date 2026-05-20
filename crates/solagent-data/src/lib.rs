@@ -10,6 +10,7 @@ pub mod helius;
 pub mod http;
 pub mod jupiter;
 pub mod watcher;
+pub mod zerion;
 
 // Re-export the main types at the crate root for backward compatibility.
 pub use birdeye::{
@@ -29,3 +30,7 @@ pub use helius::{
 pub use http::RateLimitedClient;
 pub use jupiter::{JupiterClient, JupiterQuote, SwapTransaction};
 pub use watcher::{WalletWatcher, WatchedWallet, WatcherConfig};
+pub use zerion::{
+    WalletPnl as ZerionWalletPnl, WalletPortfolio, WalletPosition, ZerionClient,
+    ZERION_BASE_URL,
+};

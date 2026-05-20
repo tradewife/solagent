@@ -75,6 +75,8 @@ pub struct AgentConfig {
     pub scan_interval_secs: u64,
     pub monitor_interval_secs: u64,
     pub max_concurrent_evaluations: usize,
+    /// Optional wallet address for Zerion PnL queries.
+    pub wallet_address: Option<String>,
 }
 
 impl Default for AgentConfig {
@@ -83,6 +85,7 @@ impl Default for AgentConfig {
             scan_interval_secs: 30,
             monitor_interval_secs: 60,
             max_concurrent_evaluations: 5,
+            wallet_address: None,
         }
     }
 }
@@ -237,6 +240,8 @@ pub struct AgentSubsystems {
     /// Auto-tuner that adjusts signal weights, threshold, and position sizing
     /// at runtime based on trade outcomes.
     pub auto_tuner: Option<AutoTuner>,
+    /// Optional Zerion client for wallet PnL + position enrichment.
+    pub zerion: Option<solagent_data::ZerionClient>,
 }
 
 // ─── Agent ───────────────────────────────────────────────────────────────────
@@ -265,10 +270,22 @@ impl Agent {
         let auto_tuner_portfolio = std::sync::Arc::new(
             solagent_portfolio::PortfolioManager::new(subsystems.portfolio.pool().clone())
         );
-        subsystems.auto_tuner = Some(AutoTuner::new(
+        let mut auto_tuner = AutoTuner::new(
             subsystems.runtime_config.clone(),
             auto_tuner_portfolio,
-        ));
+        );
+
+        // Wire Zerion client into auto-tuner for PnL cross-validation.
+        let zerion_key = std::env::var("ZERION_API_KEY").ok();
+        let zerion_for_tuner = solagent_data::ZerionClient::new(zerion_key.clone());
+        let zerion_for_agent = solagent_data::ZerionClient::new(zerion_key);
+        if zerion_for_tuner.is_enabled() && let Some(ref wallet) = config.wallet_address {
+            tracing::info!(%wallet, "Zerion PnL cross-check enabled for auto-tuner");
+            auto_tuner.set_zerion(zerion_for_tuner, wallet.clone());
+        }
+
+        subsystems.auto_tuner = Some(auto_tuner);
+        subsystems.zerion = if zerion_for_agent.is_enabled() { Some(zerion_for_agent) } else { None };
 
         let event_bus = subsystems.event_bus.clone();
         let _ = event_bus;
@@ -341,6 +358,7 @@ impl Agent {
                         sqlx::SqlitePool::connect_lazy("sqlite::memory:").unwrap(),
                     )),
                 )),
+                zerion: None,
             }),
             decisions: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             running: Arc::new(tokio::sync::RwLock::new(false)),
@@ -846,6 +864,74 @@ impl Agent {
         }
     }
 
+    /// Zerion enrichment: refresh wallet scores from PnL and emit WalletHold
+    /// events for positions held by watched wallets.
+    ///
+    /// Uses ~20 API calls per run (10 wallets × 2 endpoints).
+    /// With 60s monitor interval and 240-tick throttle, runs every ~4 hours.
+    async fn zerion_enrichment(&self, zerion: &solagent_data::ZerionClient) {
+        use solagent_core::Event;
+
+        // Refresh wallet scores from Zerion PnL (top 10 wallets).
+        let registry = solagent_portfolio::WalletRegistry::new(
+            self.subsystems.portfolio.pool().clone()
+        );
+        match registry.refresh_scores_from_zerion(zerion, 10).await {
+            Ok(n) => {
+                if n > 0 {
+                    tracing::info!(refreshed = n, "Zerion wallet score refresh done");
+                    // Reload wallet scores into the signal engine's cache.
+                    let _ = self.subsystems.confluence.lock().unwrap()
+                        .refresh_wallet_scores(&registry).await;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Zerion score refresh failed (non-fatal)");
+                return;
+            }
+        }
+
+        // Fetch positions for top 10 wallets and emit WalletHold events.
+        let wallets = registry.list_wallets(None, Some(solagent_core::Chain::Solana), 10).await;
+        match wallets {
+            Ok(wallets) => {
+                for w in &wallets {
+                    match zerion.get_positions(&w.address).await {
+                        Ok(positions) => {
+                            for pos in &positions {
+                                // Extract token CA from implementation (e.g., "solana:So1111...").
+                                let ca = pos.implementation.as_ref()
+                                    .and_then(|imp| imp.split(':').next_back().map(|s| s.to_string()));
+                                if let Some(token_ca) = ca.filter(|_| pos.value_usd > 1.0) {
+                                    self.subsystems.event_bus.publish(Event::WalletHold {
+                                        wallet: w.address.clone(),
+                                        token_address: token_ca,
+                                        chain: solagent_core::Chain::Solana,
+                                        value_usd: pos.value_usd,
+                                        quantity: pos.quantity,
+                                        timestamp: chrono::Utc::now(),
+                                    });
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                address = %&w.address[..w.address.len().min(12)],
+                                error = %e,
+                                "Zerion positions fetch failed"
+                            );
+                        }
+                    }
+                    // Small delay between wallets to stay within rate limits.
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to list wallets for Zerion enrichment");
+            }
+        }
+    }
+
     /// Monitor open positions (check stop-loss, take-profit, trailing stops).
     async fn monitor(&self) -> Result<()> {
         self.transition(AgentState::Monitoring).await;
@@ -1221,10 +1307,10 @@ impl Agent {
                     }
 
                     // Run auto-tuner after each full scan cycle.
-                    if let Some(ref tuner) = self.subsystems.auto_tuner {
-                        if let Err(e) = tuner.maybe_tune().await {
-                            tracing::warn!(error = %e, "Auto-tuner tune failed (non-fatal)");
-                        }
+                    if let Some(ref tuner) = self.subsystems.auto_tuner
+                        && let Err(e) = tuner.maybe_tune().await
+                    {
+                        tracing::warn!(error = %e, "Auto-tuner tune failed (non-fatal)");
                     }
                 }
 
@@ -1241,6 +1327,13 @@ impl Agent {
                         &self.subsystems.dex,
                     ).await {
                         tracing::debug!(error = %e, "Periodic reconciliation skipped (non-fatal)");
+                    }
+
+                    // Periodic Zerion enrichment: refresh wallet scores and emit
+                    // WalletHold events for positions held by watched wallets.
+                    // Runs every ~4 hours (every 240th monitor tick at 60s interval).
+                    if let Some(ref zerion) = self.subsystems.zerion {
+                        self.zerion_enrichment(zerion).await;
                     }
                 }
             }

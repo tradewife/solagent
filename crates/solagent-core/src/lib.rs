@@ -90,6 +90,8 @@ pub struct DataConfig {
     pub jupiter_api_url: String,
     pub dexscreener_base_url: String,
     pub birdeye_base_url: String,
+    pub zerion_api_key: Option<String>,
+    pub zerion_base_url: Option<String>,
 }
 
 impl Config {
@@ -269,6 +271,15 @@ pub enum Event {
         token_address: String,
         chain: Chain,
         amount_usd: f64,
+        timestamp: DateTime<Utc>,
+    },
+    /// A watched wallet holds a token position (from Zerion position snapshot).
+    WalletHold {
+        wallet: String,
+        token_address: String,
+        chain: Chain,
+        value_usd: f64,
+        quantity: f64,
         timestamp: DateTime<Utc>,
     },
     SignalFired {

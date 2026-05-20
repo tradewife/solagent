@@ -24,3 +24,4 @@ anyhow = { workspace = true }
 chrono = { workspace = true }
 ctrlc = "3"
 solana-sdk = { workspace = true }
+bs58 = { workspace = true }

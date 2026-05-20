@@ -98,6 +98,11 @@ impl WalletRegistry {
         Self { pool }
     }
 
+    /// Get a reference to the underlying SQLite pool.
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
     // ── CRUD ──────────────────────────────────────────────────────────────
 
     /// Insert or update a wallet. Recomputes the composite score before saving.
@@ -282,6 +287,118 @@ impl WalletRegistry {
             .execute(&self.pool)
             .await?;
         Ok(score)
+    }
+
+    // ── Zerion Enrichment ─────────────────────────────────────────────────
+
+    /// Refresh wallet scores from Zerion PnL data.
+    ///
+    /// For each wallet in the top N by score, fetches PnL from Zerion,
+    /// updates win_rate and total_pnl, then recomputes the composite score.
+    /// Returns the number of wallets refreshed.
+    pub async fn refresh_scores_from_zerion(
+        &self,
+        zerion: &solagent_data::ZerionClient,
+        top_n: usize,
+    ) -> Result<usize> {
+        if !zerion.is_enabled() {
+            return Ok(0);
+        }
+
+        let wallets = self.list_wallets(None, Some(Chain::Solana), top_n as u32).await?;
+        let mut refreshed = 0usize;
+
+        for w in &wallets {
+            match zerion.get_pnl(&w.address, Some("solana")).await {
+                Ok(pnl) => {
+                    // Derive win_rate from ROI: positive ROI → higher win rate.
+                    // Zerion gives us relative_total_gain_percentage which is a
+                    // proxy for overall profitability. Map it to a 0-1 win_rate.
+                    let roi_pct = pnl.relative_total_gain_pct;
+                    let new_win_rate = if roi_pct > 50.0 {
+                        0.9
+                    } else if roi_pct > 20.0 {
+                        0.75
+                    } else if roi_pct > 0.0 {
+                        0.6
+                    } else if roi_pct > -20.0 {
+                        0.4
+                    } else if roi_pct > -50.0 {
+                        0.25
+                    } else {
+                        0.1
+                    };
+
+                    // Use total_gain as the PnL, or realized_gain for a more
+                    // conservative view. We use total_gain (includes unrealized).
+                    let new_pnl = pnl.total_gain;
+
+                    sqlx::query(
+                        "UPDATE wallets SET win_rate = ?1, total_pnl = ?2, updated_at = ?3 \
+                         WHERE address = ?4 AND chain = 'solana'"
+                    )
+                    .bind(new_win_rate)
+                    .bind(new_pnl)
+                    .bind(Utc::now().to_rfc3339())
+                    .bind(&w.address)
+                    .execute(&self.pool)
+                    .await?;
+
+                    // Recompute and persist the composite score.
+                    let _ = self.recompute_score(&w.address, Chain::Solana).await;
+                    refreshed += 1;
+
+                    tracing::debug!(
+                        address = %&w.address[..w.address.len().min(12)],
+                        roi = format!("{:.1}%", roi_pct),
+                        pnl = format!("${:.0}", new_pnl),
+                        win_rate = format!("{:.0}%", new_win_rate * 100.0),
+                        "Refreshed wallet score from Zerion"
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        address = %&w.address[..w.address.len().min(12)],
+                        error = %e,
+                        "Zerion PnL fetch failed, skipping"
+                    );
+                }
+            }
+        }
+
+        if refreshed > 0 {
+            tracing::info!(
+                refreshed,
+                total = wallets.len(),
+                "Zerion wallet score refresh complete"
+            );
+        }
+
+        Ok(refreshed)
+    }
+
+    /// Fetch current token positions for a wallet from Zerion.
+    /// Returns a list of (token_symbol, token_ca, value_usd, quantity) tuples.
+    pub async fn get_zerion_positions(
+        &self,
+        zerion: &solagent_data::ZerionClient,
+        address: &str,
+    ) -> Result<Vec<(String, Option<String>, f64, f64)>> {
+        if !zerion.is_enabled() {
+            return Ok(Vec::new());
+        }
+
+        let positions = zerion.get_positions(address).await?;
+        Ok(positions
+            .into_iter()
+            .filter(|p| p.value_usd > 1.0) // Filter dust
+            .map(|p| {
+                let ca = p.implementation
+                    .as_ref()
+                    .and_then(|imp| imp.split(':').next_back().map(|s| s.to_string()));
+                (p.token_symbol, ca, p.value_usd, p.quantity)
+            })
+            .collect())
     }
 
     // ── Dev Blacklist ─────────────────────────────────────────────────────

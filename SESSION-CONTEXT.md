@@ -4,7 +4,7 @@
 
 Autonomous Solana trading agent in Rust. Scans DexScreener for opportunities, evaluates through 5-signal confluence engine with 8-point Birdeye safety checks, executes via Jupiter V6, manages risk with institutional-grade controls. Smart money wallets sourced from GMGN. Runs 24/7 with offline resilience.
 
-**All 9 phases complete. Zero `todo!()` in codebase. Release build passes clean. 55 smart money wallets seeded. Dry-run verified.**
+**All 9 phases + mission complete. Zero `todo!()` in codebase. Release build passes clean with 0 warnings. 144 tests pass. 55 smart money wallets seeded. Zerion API integrated.**
 
 ## Build Status
 
@@ -49,6 +49,7 @@ cargo build --release                              # zero warnings, zero errors
 | `BIRDEYE_API_KEY` | Yes | birdeye.so | Safety scoring, token prices, holder analysis |
 | `HELIUS_API_KEY` | Yes | dev.helius.xyz | Wallet transaction parsing, RPC |
 | `GMGN_API_KEY` | Yes | gmgn.ai/ai | Smart money/KOL wallet discovery and profiling |
+| `ZERION_API_KEY` | Optional | dashboard.zerion.io | Wallet portfolio, positions, PnL, prices (free: 60K calls/mo) |
 | DexScreener | No key | — | New pair scanning |
 | Jupiter | No key | — | Swap execution |
 
@@ -63,6 +64,7 @@ crates/
 │   ├── birdeye.rs           # Birdeye client
 │   ├── helius.rs            # Helius client (typed SwapEvent, TokenTransfer, etc.)
 │   ├── jupiter.rs           # Jupiter V6 client (quote + swap transaction)
+│   ├── zerion.rs            # Zerion API client (portfolio, positions, PnL, prices)
 │   └── watcher.rs           # WalletWatcher (Helius polling, 1.5s stagger, EventBus events)
 ├── solagent-chain-solana/   # Solana RPC pool, keypair mgmt, pump.fun parsing
 ├── solagent-chain-base/     # Base/alloy provider (stubs — lower priority)
@@ -71,7 +73,7 @@ crates/
 ├── solagent-risk/           # Position sizing, dynamic exit profiles, drawdown, circuit breaker
 ├── solagent-exec/           # Jupiter V6 execution with retry + pre-flight checks
 ├── solagent-portfolio/      # SQLite wallet registry + portfolio manager
-├── solagent-agent/          # Autonomous agent loop + state machine
+├── solagent-agent/          # Autonomous agent loop + state machine + auto-tuner
 └── solagent-cli/            # CLI binary with all commands
 ```
 
@@ -229,6 +231,7 @@ Threshold: 70/100 to proceed.
 | Jupiter | Unlimited | Swap execution | Use freely |
 | Helius | 1M credits/mo | Wallet monitoring | 20 wallets × 1.5s stagger × 60s cycle |
 | GMGN | 20 req/sec | Wallet discovery/profiling | Used during seeding only |
+| Zerion | 60K calls/mo (2K/day) | Portfolio, PnL, positions | 8 RPS, ~20 calls/day for sync + tune |
 
 ## External Tools
 
@@ -238,12 +241,28 @@ Threshold: 70/100 to proceed.
 ## Git
 
 - Repo at `/home/kt/solagent/`, on `main` branch
-- 3 commits + uncommitted changes (watcher stagger fix, seed script, GMGN integration)
+- Latest: `fix: circuit breaker stuck HALTED from phantom DRPY PnL` + Zerion integration
 
 ## Remaining Gaps (nice-to-have, not blocking)
 
 - `solagent-chain-base`: all stubs (Base/Uniswap not a priority)
-- `solagent-data/birdeye`: `get_wallet_pnl` endpoint not implemented
 - CLI `trade buy/sell`: prints info only (agent handles execution)
 - Telegram alerts not implemented
 - Railway/Docker deployment not set up (local-only)
+
+## Mission Completion (May 2025)
+
+All 15 mission features completed and verified:
+- **Milestone 1 (First Blood)**: All 8 features done — dead signals fixed, first live trades executed
+- **Milestone 2 (Self-Tuning)**: All 7 features done — runtime-mutable config, auto-tuner (11 tests), dynamic sizing (30+ tests), graceful degradation, monitor loop validation
+- **37/37 validation assertions passed** with unit test + log analysis evidence
+- **144 tests pass, 0 failures, 0 clippy warnings**
+
+## Zerion API Integration
+
+- **Client**: `crates/solagent-data/src/zerion.rs` — HTTP Basic Auth, 8 RPS rate limiting
+- **Endpoints**: portfolio overview, token positions, FIFO PnL (realized/unrealized/ROI)
+- **Auto-tuner**: logs Zerion PnL cross-check during each tuning cycle (optional)
+- **CLI**: `solagent portfolio sync --address <WALLET>` — fetch portfolio + positions + PnL
+- **Config**: `ZERION_API_KEY` env var or `[data] zerion_api_key` in config/local.toml
+- **Free tier**: 60K calls/mo, 10 RPS — budget ~20 calls/day for daily sync + tune cycles

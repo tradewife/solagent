@@ -147,6 +147,16 @@ enum PortfolioAction {
         #[arg(short, long, default_value = "30")]
         days: u64,
     },
+    /// Show performance metrics and trade statistics
+    Performance,
+    /// Show per-signal contribution analysis
+    SignalReport,
+    /// Sync positions from Zerion API
+    Sync {
+        /// Wallet address (defaults to configured wallet)
+        #[arg(short, long)]
+        address: Option<String>,
+    },
     /// Close a position
     Close {
         /// Position ID
@@ -510,6 +520,207 @@ async fn main() -> Result<()> {
                     println!("Closing position: {id}");
                     println!("Use `solagent agent --start` for automated position management.");
                 }
+                PortfolioAction::Performance => {
+                    let pnl = pm.get_pnl().await?;
+                    let latest = pm.get_latest_metrics().await?;
+
+                    println!("Performance Report:");
+                    println!("{}", "-".repeat(50));
+                    println!("  Total PnL:        ${:.2}", pnl.total_pnl);
+                    println!("  Realized PnL:     ${:.2}", pnl.realized_pnl);
+                    println!("  Unrealized PnL:   ${:.2}", pnl.unrealized_pnl);
+                    println!("  Total Trades:     {}", pnl.total_trades);
+                    println!("  Winning Trades:   {}", pnl.winning_trades);
+                    println!("  Losing Trades:    {}", pnl.losing_trades);
+                    println!("  Win Rate:         {:.1}%", pnl.win_rate * 100.0);
+                    println!("  Avg Trade Size:   ${:.2}", pnl.avg_trade_size_usd);
+                    println!("  Largest Win:      ${:.2}", pnl.largest_win_usd);
+                    println!("  Largest Loss:     ${:.2}", pnl.largest_loss_usd);
+
+                    if pnl.total_trades > 0 {
+                        let avg_return = pnl.total_pnl / pnl.total_trades as f64;
+                        println!("  Avg Trade Return: ${:.2}", avg_return);
+                    }
+
+                    if let Some(m) = latest {
+                        println!("\n  Latest Auto-Tuner Snapshot:");
+                        println!("    Win Rate:        {:.1}%", m.win_rate * 100.0);
+                        println!("    Total Trades:    {}", m.total_trades);
+                        println!("    Confluence Thresh: {:.1}", m.confluence_threshold);
+                        println!("    Position Size:   ${:.2}", m.position_size);
+                        println!("    Open Positions:  {}", m.open_positions);
+                        if !m.signal_weights.is_empty() {
+                            println!("    Signal Weights:  {}", m.signal_weights);
+                        }
+                    } else {
+                        println!("\n  (No auto-tuner snapshots recorded yet)");
+                    }
+                }
+                PortfolioAction::SignalReport => {
+                    let evals = pm.get_all_evaluations().await?;
+                    if evals.is_empty() {
+                        println!("No evaluation data available. Run the agent to accumulate evaluations.");
+                    } else {
+                        println!("Signal Contribution Report");
+                        println!("{}", "=".repeat(60));
+
+                        // Aggregate signal scores from evaluation records.
+                        let mut signal_totals: std::collections::HashMap<String, (f64, i64)> =
+                            std::collections::HashMap::new();
+                        let signal_names = ["whale_consensus", "accumulation", "launch_momentum", "volume_spike", "social"];
+
+                        let mut passed_count = 0i64;
+                        let mut failed_count = 0i64;
+
+                        for ev in &evals {
+                            if ev.passed { passed_count += 1; } else { failed_count += 1; }
+                            // Parse signal_scores JSON.
+                            if let Ok(scores) = serde_json::from_str::<serde_json::Value>(&ev.signal_scores) {
+                                for name in &signal_names {
+                                    if let Some(v) = scores.get(name).and_then(|v| v.as_f64()) {
+                                        let entry = signal_totals.entry(name.to_string()).or_insert((0.0, 0));
+                                        entry.0 += v;
+                                        entry.1 += 1;
+                                    }
+                                }
+                            }
+                        }
+
+                        println!("\n  Evaluations: {} total ({} passed, {} failed)",
+                            evals.len(), passed_count, failed_count);
+
+                        println!("\n  {:<20} {:>12} {:>12} {:>10}",
+                            "Signal", "Avg Score", "Total Score", "Samples");
+                        println!("  {}", "-".repeat(56));
+                        for name in &signal_names {
+                            if let Some((total, count)) = signal_totals.get(*name) {
+                                let avg = total / *count as f64;
+                                println!("  {:<20} {:>11.1} {:>12.0} {:>10}", name, avg, total, count);
+                            } else {
+                                println!("  {:<20} {:>12} {:>12} {:>10}", name, "-", "-", "0");
+                            }
+                        }
+
+                        // Show per-signal contribution to passed evaluations.
+                        let passed_evals: Vec<_> = evals.iter().filter(|e| e.passed).collect();
+                        if !passed_evals.is_empty() {
+                            println!("\n  Signal Averages for PASSED Evaluations:");
+                            println!("  {}", "-".repeat(56));
+                            for name in &signal_names {
+                                let mut total = 0.0f64;
+                                let mut count = 0i64;
+                                for ev in &passed_evals {
+                                    if let Ok(scores) = serde_json::from_str::<serde_json::Value>(&ev.signal_scores)
+                                        && let Some(v) = scores.get(name).and_then(|v| v.as_f64())
+                                    {
+                                        total += v;
+                                        count += 1;
+                                    }
+                                }
+                                if count > 0 {
+                                    println!("  {:<20} {:>11.1}", name, total / count as f64);
+                                }
+                            }
+                        }
+
+                        // Show latest auto-tuner weights.
+                        if let Some(m) = pm.get_latest_metrics().await? {
+                            println!("\n  Current Tuned Weights: {}", m.signal_weights);
+                        }
+                    }
+                }
+                PortfolioAction::Sync { address } => {
+                    let zerion_key = std::env::var("ZERION_API_KEY")
+                        .ok()
+                        .or_else(|| config.as_ref()?.data.zerion_api_key.clone());
+                    let zerion = solagent_data::ZerionClient::new(zerion_key);
+                    if !zerion.is_enabled() {
+                        println!("Zerion API not configured. Set ZERION_API_KEY env var or add zerion_api_key to [data] in config.");
+                        println!("Get a free key at: https://dashboard.zerion.io/");
+                        return Ok(());
+                    }
+
+                    let wallet = match address {
+                        Some(a) => a,
+                        None => {
+                            let key = std::env::var("SOLANA_PRIVATE_KEY")
+                                .or_else(|_| std::env::var("PRIVATE_KEY"))
+                                .unwrap_or_default();
+                            if key.is_empty() {
+                                println!("No wallet address provided and no SOLANA_PRIVATE_KEY configured.");
+                                println!("Usage: solagent portfolio sync --address <WALLET>");
+                                return Ok(());
+                            }
+                            // Derive address from private key.
+                            match bs58::decode(&key).into_vec() {
+                                Ok(bytes) => {
+                                    use solana_sdk::signer::Signer;
+                                    match solana_sdk::signer::keypair::Keypair::try_from(bytes.as_slice()) {
+                                        Ok(kp) => kp.pubkey().to_string(),
+                                        Err(_) => {
+                                            println!("Invalid SOLANA_PRIVATE_KEY format.");
+                                            return Ok(());
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    println!("Invalid SOLANA_PRIVATE_KEY (not valid base58).");
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    };
+
+                    println!("Syncing from Zerion for wallet: {}...", &wallet[..wallet.len().min(16)]);
+
+                    match zerion.get_portfolio(&wallet).await {
+                        Ok(portfolio) => {
+                            println!("\nPortfolio:");
+                            println!("  Total Value: ${:.2}", portfolio.total_value_usd);
+                            if let Some(change) = portfolio.change_1d_absolute {
+                                let sign = if change >= 0.0 { "+" } else { "" };
+                                println!("  24h Change:  {sign}${:.2}", change);
+                            }
+                            if let Some(pct) = portfolio.change_1d_percent {
+                                println!("  24h Change:  {:+.2}%", pct);
+                            }
+                        }
+                        Err(e) => println!("Portfolio fetch failed: {e}"),
+                    }
+
+                    match zerion.get_positions(&wallet).await {
+                        Ok(positions) => {
+                            if positions.is_empty() {
+                                println!("\nNo token positions found.");
+                            } else {
+                                println!("\nToken Positions ({}):\n", positions.len());
+                                println!("  {:<12} {:>12} {:>10} {:>10}", "Token", "Value", "Qty", "Price");
+                                println!("  {}", "-".repeat(46));
+                                for p in &positions {
+                                    let price_str = p.price_usd.map(|pr| format!("${pr:.4}")).unwrap_or("-".into());
+                                    println!("  {:<12} ${:>10.2} {:>10.4} {:>10}",
+                                        p.token_symbol, p.value_usd, p.quantity, price_str);
+                                }
+                            }
+                        }
+                        Err(e) => println!("Positions fetch failed: {e}"),
+                    }
+
+                    match zerion.get_pnl(&wallet, Some("solana")).await {
+                        Ok(pnl) => {
+                            println!("\nPnL (Solana, FIFO):");
+                            let sign = if pnl.total_gain >= 0.0 { "+" } else { "" };
+                            println!("  Total Gain:    {sign}${:.2}", pnl.total_gain);
+                            println!("  Realized:      ${:.2}", pnl.realized_gain);
+                            println!("  Unrealized:    ${:.2}", pnl.unrealized_gain);
+                            println!("  Total Invested: ${:.2}", pnl.total_invested);
+                            println!("  Net Invested:  ${:.2}", pnl.net_invested);
+                            println!("  Fees Paid:     ${:.2}", pnl.total_fee);
+                            println!("  ROI:           {:+.2}%", pnl.relative_total_gain_pct);
+                        }
+                        Err(e) => println!("PnL fetch failed: {e}"),
+                    }
+                }
             }
         }
 
@@ -784,6 +995,7 @@ async fn main() -> Result<()> {
                     daily_loss,
                 ),
                 auto_tuner: None,
+                zerion: None,
             }
             };
 
@@ -812,7 +1024,15 @@ async fn main() -> Result<()> {
                 }
             }
 
-            let agent_config = solagent_agent::AgentConfig::default();
+            let mut agent_config = solagent_agent::AgentConfig::default();
+            // Derive wallet address from configured private key for Zerion PnL queries.
+            if let Ok(key) = std::env::var("SOLANA_PRIVATE_KEY").or_else(|_| std::env::var("PRIVATE_KEY"))
+                && let Ok(bytes) = bs58::decode(&key).into_vec()
+                && let Ok(kp) = solana_sdk::signer::keypair::Keypair::try_from(bytes.as_slice())
+            {
+                use solana_sdk::signer::Signer;
+                agent_config.wallet_address = Some(kp.pubkey().to_string());
+            }
             let agent = solagent_agent::Agent::new(agent_config, subsystems);
 
             println!("\nAgent initialized. Press Ctrl+C to stop.\n");

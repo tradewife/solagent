@@ -29,6 +29,9 @@ solagent --config config/local.toml safety <TOKEN_CA> [--deployer <ADDR>]
 solagent --config config/local.toml portfolio summary
 solagent --config config/local.toml portfolio positions
 solagent --config config/local.toml portfolio pnl --days 7
+solagent --config config/local.toml portfolio performance
+solagent --config config/local.toml portfolio signal-report
+solagent --config config/local.toml portfolio sync --address <WALLET>
 
 # Wallet registry (smart money tracking)
 solagent --config config/local.toml wallet add <ADDR> --label smart_money
@@ -38,6 +41,7 @@ solagent --config config/local.toml wallet blacklist-add <DEV_ADDR> --reason "kn
 # Database
 solagent --config config/local.toml db migrate
 solagent --config config/local.toml db stats
+solagent --config config/local.toml db eval-stats
 
 # Start autonomous agent
 ./scripts/run-agent.sh              # live mode
@@ -96,6 +100,7 @@ The circuit breaker resets automatically on agent restart (daily PnL counter res
 - `BIRDEYE_API_KEY` — Required. Free at birdeye.so. Used for safety scoring, token prices, holder analysis.
 - `HELIUS_API_KEY` — Optional. Free at dev.helius.xyz. Used for wallet transaction parsing and faster RPC.
 - `GMGN_API_KEY` — Required for wallet seeding. Free at gmgn.ai/ai. Used for smart money/KOL wallet discovery and profiling. Stored in `~/.config/gmgn/.env`.
+- `ZERION_API_KEY` — Optional. Free at dashboard.zerion.io (60K calls/mo). Used for wallet portfolio, positions, and FIFO PnL data.
 - DexScreener and Jupiter need no keys.
 
 ## Configuration

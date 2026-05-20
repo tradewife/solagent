@@ -215,12 +215,22 @@ struct WalletBuyRecord {
     amount_usd: f64,
 }
 
+#[derive(Debug, Clone)]
+struct WalletHoldRecord {
+    wallet: String,
+    value_usd: f64,
+    timestamp: DateTime<Utc>,
+}
+
 /// Whale consensus signal: fires when multiple known smart wallets buy the same token
 /// within a configurable time window.
 pub struct WhaleConsensusSignal {
     name: String,
     /// Token address -> recent buys.
     buys: Arc<DashMap<String, VecDeque<WalletBuyRecord>>>,
+    /// Token address -> wallets holding (from Zerion position snapshots).
+    /// Maps token → (wallet, value_usd, timestamp).
+    holds: Arc<DashMap<String, Vec<WalletHoldRecord>>>,
     /// Minimum number of distinct wallets to trigger.
     min_wallets: usize,
     /// Window duration in minutes.
@@ -239,6 +249,7 @@ impl Clone for WhaleConsensusSignal {
         Self {
             name: self.name.clone(),
             buys: Arc::clone(&self.buys),
+            holds: Arc::clone(&self.holds),
             min_wallets: self.min_wallets,
             window_minutes: self.window_minutes,
             min_buy_usd: self.min_buy_usd,
@@ -259,6 +270,7 @@ impl WhaleConsensusSignal {
         Self {
             name: "whale_consensus".to_string(),
             buys: Arc::new(DashMap::new()),
+            holds: Arc::new(DashMap::new()),
             min_wallets,
             window_minutes,
             min_buy_usd,
@@ -275,6 +287,22 @@ impl WhaleConsensusSignal {
             timestamp: Utc::now(),
             amount_usd,
         });
+    }
+
+    /// Record that a wallet holds a token position (from Zerion snapshot).
+    pub fn record_hold(&self, token_address: String, wallet: String, value_usd: f64) {
+        let mut holds = self.holds.entry(token_address).or_default();
+        // Replace existing entry for same wallet, or append.
+        if let Some(existing) = holds.iter_mut().find(|h| h.wallet == wallet) {
+            existing.value_usd = value_usd;
+            existing.timestamp = Utc::now();
+        } else {
+            holds.push(WalletHoldRecord {
+                wallet,
+                value_usd,
+                timestamp: Utc::now(),
+            });
+        }
     }
 
     /// Subscribe to the event bus and auto-record WalletBuy events.
@@ -301,6 +329,24 @@ impl WhaleConsensusSignal {
                                 "Recording smart wallet buy for whale consensus"
                             );
                             signal.record_buy(token_address, wallet, amount_usd);
+                        }
+                    }
+                    Ok(Event::WalletHold {
+                        wallet,
+                        token_address,
+                        value_usd,
+                        ..
+                    }) => {
+                        let scores = signal.wallet_scores.read().await;
+                        if scores.is_known(&wallet) {
+                            drop(scores);
+                            tracing::debug!(
+                                wallet = &wallet[..wallet.len().min(12)],
+                                token = &token_address[..token_address.len().min(12)],
+                                value_usd,
+                                "Recording smart wallet hold position"
+                            );
+                            signal.record_hold(token_address, wallet, value_usd);
                         }
                     }
                     Ok(_) => {}
@@ -335,13 +381,14 @@ impl Strategy for WhaleConsensusSignal {
         self.prune_stale(&token.address);
 
         let scores = self.wallet_scores.read().await;
-        let score = if let Some(buys) = self.buys.get(&token.address) {
+
+        // Count recent buys.
+        let buy_score = if let Some(buys) = self.buys.get(&token.address) {
             let distinct_wallets: HashSet<&str> =
                 buys.iter().map(|b| b.wallet.as_str()).collect();
             let count = distinct_wallets.len();
 
             if count >= self.min_wallets {
-                // Sum wallet scores for wallets we know about.
                 let wallet_score_sum: f64 = distinct_wallets
                     .iter()
                     .map(|w| scores.get_score(w).unwrap_or(50.0))
@@ -353,24 +400,59 @@ impl Strategy for WhaleConsensusSignal {
                     0.5
                 };
 
-                // Recency multiplier: more recent buys = higher score.
                 let newest = buys.back().map(|b| b.timestamp).unwrap_or_default();
                 let oldest = buys.front().map(|b| b.timestamp).unwrap_or_default();
                 let span_mins = (newest - oldest).num_minutes().max(1) as f64;
                 let recency_mult = 1.0 / (1.0 + span_mins / self.window_minutes as f64);
 
-                // Amount multiplier: larger buys = higher score.
                 let total_amount: f64 = buys.iter().map(|b| b.amount_usd).sum();
                 let amount_mult = (total_amount / 1000.0).min(2.0);
 
                 let base = (count as f64 / self.min_wallets as f64).min(3.0) * 33.0;
-                let raw = base * quality_ratio * recency_mult * amount_mult;
-                raw.clamp(0.0, 100.0) as u8
+                (base * quality_ratio * recency_mult * amount_mult).clamp(0.0, 100.0)
             } else {
-                ((count as f64 / self.min_wallets as f64) * 50.0).clamp(0.0, 100.0) as u8
+                ((count as f64 / self.min_wallets as f64) * 50.0).clamp(0.0, 100.0)
             }
         } else {
-            0
+            0.0
+        };
+
+        // Count wallet holdings (from Zerion position snapshots).
+        // Multiple smart wallets holding the same token = conviction signal.
+        let hold_score = if let Some(holds) = self.holds.get(&token.address) {
+            let count = holds.len();
+            if count >= 2 {
+                let total_value: f64 = holds.iter().map(|h| h.value_usd).sum();
+                // Base score scales with number of holders (2=10, 3=15, 4+=20)
+                let base = (10.0 + (count as f64 - 2.0) * 5.0).min(20.0);
+                // Boost for large aggregate position (>$1K = 1.5x, >$5K = 2x)
+                let size_mult = if total_value > 5000.0 {
+                    2.0
+                } else if total_value > 1000.0 {
+                    1.5
+                } else {
+                    1.0
+                };
+                (base * size_mult).clamp(0.0, 25.0)
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+
+        // Combine: buy score is primary, hold score is supplementary.
+        let combined = (buy_score + hold_score).clamp(0.0, 100.0);
+        let score = combined as u8;
+
+        let reasoning = if buy_score > 0.0 && hold_score > 0.0 {
+            format!("Whale consensus: {score}/100 (buys={:.0} + holds={:.0})", buy_score, hold_score)
+        } else if buy_score > 0.0 {
+            format!("Whale consensus: {score}/100")
+        } else if hold_score > 0.0 {
+            format!("Whale holdings: {score}/100 (position conviction)")
+        } else {
+            format!("Whale consensus: {score}/100")
         };
 
         Ok(Signal::new(
@@ -379,7 +461,7 @@ impl Strategy for WhaleConsensusSignal {
             &self.name,
             score,
             0.7,
-            format!("Whale consensus: {score}/100"),
+            reasoning,
         ))
     }
 }
@@ -1297,6 +1379,25 @@ impl ConfluenceScorer {
         }
     }
 
+    /// Reload wallet scores from the database into the whale consensus signal's cache.
+    /// Call this after Zerion enrichment updates wallet scores in SQLite.
+    pub async fn refresh_wallet_scores(&mut self, registry: &solagent_portfolio::WalletRegistry) {
+        for strategy in &mut self.strategies {
+            if let StrategyKind::WhaleConsensus(ws) = strategy {
+                let pool = registry.pool().clone();
+                let mut scores = ws.wallet_scores.write().await;
+                let cache = RegistryScoreCache::new(pool);
+                if let Err(e) = cache.refresh().await {
+                    tracing::warn!(error = %e, "Failed to refresh wallet score cache");
+                    return;
+                }
+                *scores = Box::new(cache);
+                tracing::debug!("Reloaded wallet scores into whale consensus signal");
+                return;
+            }
+        }
+    }
+
     /// Poll curated Twitter account timelines for token mentions.
     /// Unlike keyword search, this only attributes mentions to tokens whose
     /// CAs are explicitly present in the tweet text.
@@ -1415,7 +1516,7 @@ impl RuntimeConfig {
 
     /// Safely set a signal weight with bounds validation.
     pub async fn set_weight(&self, field: &str, value: f64) -> Result<(), String> {
-        if value < 0.0 || value > 1.0 {
+        if !(0.0..=1.0).contains(&value) {
             return Err(format!("Weight must be in [0.0, 1.0], got {value}"));
         }
         let mut w = self.weights.write().await;
@@ -1432,7 +1533,7 @@ impl RuntimeConfig {
 
     /// Set confluence threshold with bounds validation.
     pub async fn set_confluence_threshold(&self, value: f64) -> Result<(), String> {
-        if value < 5.0 || value > 80.0 {
+        if !(5.0..=80.0).contains(&value) {
             return Err(format!("Threshold must be in [5.0, 80.0], got {value}"));
         }
         *self.confluence_threshold.write().await = value;
@@ -1441,7 +1542,7 @@ impl RuntimeConfig {
 
     /// Set max position size with bounds validation.
     pub async fn set_max_position_size(&self, value: f64) -> Result<(), String> {
-        if value < 1.0 || value > 30.0 {
+        if !(1.0..=30.0).contains(&value) {
             return Err(format!("Position size must be in [$1, $30], got ${value}"));
         }
         *self.max_position_size_usd.write().await = value;
@@ -2328,11 +2429,11 @@ mod tests {
     #[tokio::test]
     async fn test_tweets_without_cas_not_attributed() {
         let signal = SocialSignal::new(Chain::Solana);
-        let token_ca = "ABC123DEF456GHI789JKL012MNO345PQR";
+        let _token_ca = "*********************************";
 
         // Simulate a keyword search result (not a CA-specific search).
         // Use a non-CA keyword so query_ca is None.
-        let result = signal.search_keyword("solana memecoin").await;
+        let _result = signal.search_keyword("solana memecoin").await;
 
         // The keyword search may or may not succeed (depends on twitter-cli),
         // but we can test the extract_solana_cas logic directly.

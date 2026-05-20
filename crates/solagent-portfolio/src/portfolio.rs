@@ -868,24 +868,21 @@ impl PortfolioManager {
             // Update existing positions that may have stale token_amount/size_usd
             // (e.g. from before the per-token decimals fix).
             if recorded_tokens.contains(mint) {
-                match self.get_position_by_token(mint).await {
-                    Ok(Some(existing)) => {
-                        let amount_changed = (existing.token_amount - token_amount).abs() > token_amount * 0.01;
-                        if amount_changed {
-                            tracing::info!(
-                                mint = %mint,
-                                old_amount = existing.token_amount,
-                                new_amount = token_amount,
-                                old_size_usd = existing.size_usd,
-                                new_size_usd = size_usd,
-                                "Updating existing position with corrected on-chain balance"
-                            );
-                            self.update_position_amounts(&existing.id, token_amount, size_usd).await?;
-                            reconciled += 1;
-                        }
-                        continue;
+                if let Ok(Some(existing)) = self.get_position_by_token(mint).await {
+                    let amount_changed = (existing.token_amount - token_amount).abs() > token_amount * 0.01;
+                    if amount_changed {
+                        tracing::info!(
+                            mint = %mint,
+                            old_amount = existing.token_amount,
+                            new_amount = token_amount,
+                            old_size_usd = existing.size_usd,
+                            new_size_usd = size_usd,
+                            "Updating existing position with corrected on-chain balance"
+                        );
+                        self.update_position_amounts(&existing.id, token_amount, size_usd).await?;
+                        reconciled += 1;
                     }
-                    _ => {}
+                    continue;
                 }
                 continue;
             }
@@ -949,8 +946,11 @@ impl PortfolioManager {
 #[derive(Debug, sqlx::FromRow)]
 struct PhantomPosition {
     id: String,
+    #[allow(dead_code)]
     token_address: String,
+    #[allow(dead_code)]
     size_usd: f64,
+    #[allow(dead_code)]
     token_amount: f64,
 }
 
@@ -1114,6 +1114,7 @@ impl TwitterAccountRow {
 
 #[derive(Debug, sqlx::FromRow)]
 struct PerformanceMetricsRow {
+    #[allow(dead_code)]
     id: i64,
     timestamp: String,
     win_rate: f64,

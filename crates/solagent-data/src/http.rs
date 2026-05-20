@@ -47,6 +47,33 @@ impl RateLimitedClient {
         Ok(data)
     }
 
+    /// Perform a GET request with a custom auth header, deserialize the JSON response into `T`.
+    pub async fn get_json_with_auth<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        auth_header: &str,
+    ) -> Result<T> {
+        let client = self.request().await;
+        let resp = client
+            .get(url)
+            .header("Authorization", auth_header)
+            .send()
+            .await?;
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            anyhow::bail!("GET {url} returned 429: rate limited");
+        }
+        if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+            anyhow::bail!("GET {url} returned 503: service unavailable, retry later");
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("GET {url} returned {status}: {body}");
+        }
+        let data: T = resp.json().await?;
+        Ok(data)
+    }
+
     /// Perform a POST request with a JSON body, deserialize the JSON response into `T`.
     pub async fn post_json<T: serde::de::DeserializeOwned>(
         &self,
