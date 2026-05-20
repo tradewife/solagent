@@ -29,7 +29,7 @@ confluence_threshold = 35.0
 min_signal_count = 2
 progressive_threshold_failures = 20
 progressive_threshold_step = 5.0
-progressive_threshold_floor = 10.0
+progressive_threshold_floor = 25.0
 
 [data]
 jupiter_api_url = "https://api.jup.ag/swap/v1"

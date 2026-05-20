@@ -892,7 +892,7 @@ async fn main() -> Result<()> {
             let whale_signal = std::sync::Arc::new(solagent_signals::WhaleConsensusSignal::new(
                 solagent_core::Chain::Solana,
                 2,    // min_wallets
-                30,   // window_minutes
+                60,   // window_minutes (1hr window for more whale consensus hits)
                 50.0, // min_buy_usd
                 Box::new(score_cache),
             ));

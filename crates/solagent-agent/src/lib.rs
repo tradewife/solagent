@@ -631,6 +631,7 @@ impl Agent {
 
         let positions = self.subsystems.portfolio.get_open_positions().await?;
         let portfolio_value = self.get_portfolio_value().await?;
+        let available_cash = self.get_available_cash().await;
 
         // Sync runtime config into RiskManager before evaluating.
         {
@@ -649,7 +650,7 @@ impl Agent {
 
         let risk = self.subsystems.risk.lock().unwrap();
         let size = risk.calculate_dynamic_position_size(
-            portfolio_value,
+            available_cash, // cap against available SOL, not total portfolio
             evaluation.confluence_score,
             win_rate,
             *self.subsystems.runtime_config.max_position_size_usd.read().await,
@@ -679,12 +680,12 @@ impl Agent {
     async fn execute(&self, evaluation: &EvaluationResult) -> Result<()> {
         self.transition(AgentState::Executing).await;
 
-        let portfolio_value = self.get_portfolio_value().await?;
+        let available_cash = self.get_available_cash().await;
         let win_rate = self.subsystems.portfolio.get_win_rate().await.unwrap_or(0.5);
 
         let risk = self.subsystems.risk.lock().unwrap();
         let size = risk.calculate_dynamic_position_size(
-            portfolio_value,
+            available_cash, // cap against available SOL, not total portfolio
             evaluation.confluence_score,
             win_rate,
             *self.subsystems.runtime_config.max_position_size_usd.read().await,
@@ -737,7 +738,7 @@ impl Agent {
             evaluation.chain,
             &evaluation.token_address,
             size,
-            portfolio_value,
+            available_cash, // use actual spendable cash, not total portfolio
             current_price,
             sol_price,
         ).await?;
@@ -845,6 +846,23 @@ impl Agent {
         );
 
         Ok(total)
+    }
+
+    /// Get available cash (SOL balance in USD) — the actual spendable amount for new trades.
+    /// Unlike portfolio_value which includes open positions, this only counts SOL that can be swapped.
+    async fn get_available_cash(&self) -> f64 {
+        let sol_price = self.get_sol_price().await;
+        let sol_balance = self.get_sol_balance().await;
+        let cash = sol_balance * sol_price;
+        tracing::debug!(
+            sol_balance,
+            sol_price,
+            available_cash_usd = cash,
+            "Available cash calculated"
+        );
+        // Reserve 0.01 SOL for transaction fees (~$1.50 at $150/SOL).
+        let fee_reserve = if sol_price > 0.0 { 0.01 * sol_price } else { 1.0 };
+        (cash - fee_reserve).max(0.0)
     }
 
     /// Get SOL balance from the wallet. Queries the Solana RPC for the real balance.
