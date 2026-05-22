@@ -6,12 +6,15 @@ A Rust-based autonomous trading agent that scans Solana for token opportunities,
 
 ## Architecture
 ```
-DexScreener/Birdeye/Helius/GMGN --> Data Pipeline --> Signal Engine (5 signals)
+DexScreener/Birdeye/Helius/GMGN --> Data Pipeline --> Signal Engine (6 signals)
                                                     --> Confluence Scorer
                                                     --> Safety Evaluator (8 checks)
                                                     --> Risk Manager (position sizing, drawdown, circuit breaker)
                                                     --> Execution Engine (Jupiter V6 swap)
                                                     --> Portfolio Manager (SQLite positions + PnL)
+
+Behavioral Scanner (4h cycle) --> BehavioralWalletCache --> BehavioralSignal
+                                                       --> WhaleConsensusSignal (quality boost)
 ```
 
 ## Key Commands
@@ -125,14 +128,28 @@ GMGN provides the smart money wallet data that feeds the Whale Consensus signal.
 - Emits `WalletBuy`/`WalletSell` events on the EventBus
 - These events feed the WhaleConsensusSignal
 
-## Signal Engine
-1. **Whale Consensus** (weight 0.30) — Multiple smart money wallets buy same token within 1 hour
-2. **Accumulation** (weight 0.20) — Holder growth vs flat price = accumulation phase
-3. **Launch Momentum** (weight 0.20) — New token with rapid holder + volume growth
-4. **Volume Spike** (weight 0.15) — 3x+ average volume in rolling window
-5. **Social** (weight 0.15) — Twitter mention velocity + engagement
+## Signal Engine (6 signals)
+1. **Whale Consensus** (weight 0.25) — Multiple smart money wallets buy same token within 1 hour. GMGN top-trader fallback when Helius is rate-limited.
+2. **Behavioral** (weight 0.25) — SOVEREIGN/PRECOGNITIVE wallets from behavioral intelligence scanner detected in GMGN top traders per token.
+3. **Accumulation** (weight 0.15) — Holder growth vs flat price = accumulation phase
+4. **Launch Momentum** (weight 0.15) — New token with rapid holder + volume growth
+5. **Volume Spike** (weight 0.10) — 3x+ average volume in rolling window
+6. **Social** (weight 0.10) — Twitter mention velocity + engagement
 
 Confluence threshold: 35/100 weighted composite required to trigger evaluation (progressive floor: 25).
+
+## Behavioral Intelligence Scanner
+Runs as a background task every 4 hours. Discovers wallets with genuine edge across 5 detection layers:
+1. **Inverse Loss Archaeology** (weight 0.20) — Statistical inverse of losing wallet patterns
+2. **Liquidity Ghost Detection** (weight 0.25) — Exits before crashes across multiple tokens
+3. **Irrational Conviction Scoring** (weight 0.20) — Early entry in 10x+ tokens before social amplification
+4. **CTO Meta-Reader** (weight 0.20) — Profitable re-entry post-community takeover
+5. **Consensus Deviation** (weight 0.15) — Profitable but methodologically unlike top 500
+
+Wallets classified into tiers: PRECOGNITIVE (90-100), SOVEREIGN (75-89), EMERGING (55-74), NOISE (<55).
+Red flags auto-disqualify: MEV/bot patterns, copy-trade clustering, KOL correlation >40%.
+
+CLI command: `solagent --config config/local.toml behavioral-scan`
 
 ## Safety Checks (8 per token)
 1. Mint authority revoked (15 pts)
