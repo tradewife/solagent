@@ -100,6 +100,33 @@ pub struct WalletPnl {
     pub trade_count: u64,
 }
 
+// ─── Token Discovery Types ──────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenOverview {
+    pub address: String,
+    pub symbol: Option<String>,
+    pub name: Option<String>,
+    pub price: Option<f64>,
+    pub price_change_24h: Option<f64>,
+    pub price_change_1h: Option<f64>,
+    pub liquidity: Option<f64>,
+    pub market_cap: Option<f64>,
+    pub volume_24h: Option<f64>,
+    pub holder_count: Option<u64>,
+    #[serde(flatten)]
+    pub other: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenListData {
+    pub items: Vec<TokenOverview>,
+    #[serde(flatten)]
+    pub other: serde_json::Value,
+}
+
 pub const BIRDEYE_DEFAULT_BASE_URL: &str = "https://public-api.birdeye.so";
 
 // ─── Client ──────────────────────────────────────────────────────────────────
@@ -215,6 +242,51 @@ impl BirdeyeClient {
             .await;
         let data: HolderListData = self.send_birdeye(req).await?;
         Ok(data.items)
+    }
+
+    /// Get top traders for a token (extended with configurable limit and offset).
+    pub async fn get_top_traders_ext(&self, address: &str, limit: u32, offset: u32) -> Result<Vec<TraderInfo>> {
+        let req = self
+            .birdeye_get(
+                &format!(
+                    "/defi/v3/token/top-traders?address={}&sort_by=pnl&sort_type=desc&offset={offset}&limit={limit}",
+                    address
+                ),
+                "solana",
+            )
+            .await;
+        let data: TraderListData = self.send_birdeye(req).await?;
+        Ok(data.items)
+    }
+
+    /// Get tokens sorted by a given criterion (for discovering crashed/10x tokens).
+    /// `sort_by` can be "volume24h", "priceChange24h", "marketCap", etc.
+    pub async fn get_token_list(&self, sort_by: &str, sort_type: &str, limit: u32, offset: u32) -> Result<Vec<TokenOverview>> {
+        let req = self
+            .birdeye_get(
+                &format!(
+                    "/defi/v3/token/list?sort_by={sort_by}&sort_type={sort_type}&offset={offset}&limit={limit}",
+                ),
+                "solana",
+            )
+            .await;
+        let data: TokenListData = self.send_birdeye(req).await?;
+        Ok(data.items)
+    }
+
+    /// Get tokens with largest 24h price drops (Layer 1/2 discovery).
+    pub async fn get_biggest_losers(&self, limit: u32) -> Result<Vec<TokenOverview>> {
+        self.get_token_list("priceChange24h", "asc", limit, 0).await
+    }
+
+    /// Get tokens with largest 24h price gains (Layer 3 discovery).
+    pub async fn get_biggest_gainers(&self, limit: u32) -> Result<Vec<TokenOverview>> {
+        self.get_token_list("priceChange24h", "desc", limit, 0).await
+    }
+
+    /// Get tokens with highest 24h volume (Layer 4/5 discovery).
+    pub async fn get_highest_volume(&self, limit: u32) -> Result<Vec<TokenOverview>> {
+        self.get_token_list("volume24h", "desc", limit, 0).await
     }
 
     pub async fn get_wallet_pnl(&self, wallet: &str) -> Result<WalletPnl> {

@@ -88,6 +88,25 @@ enum Commands {
         deployer: Option<String>,
     },
 
+    /// Behavioral intelligence scan — discover wallets with genuine edge
+    BehavioralScan {
+        /// Number of crashed tokens to analyze (Layer 1/2)
+        #[arg(long, default_value = "10")]
+        crash_tokens: usize,
+        /// Number of mooning tokens to analyze (Layer 3)
+        #[arg(long, default_value = "10")]
+        moon_tokens: usize,
+        /// Minimum PnL threshold for a wallet to be scored (USD)
+        #[arg(long, default_value = "50")]
+        min_pnl: f64,
+        /// Minimum number of tokens a wallet must appear in
+        #[arg(long, default_value = "2")]
+        min_appearances: usize,
+        /// Output as JSON instead of formatted text
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Portfolio management
     Portfolio {
         #[command(subcommand)]
@@ -438,6 +457,137 @@ async fn main() -> Result<()> {
                 None,
             ).await;
             println!("{}", report.summary());
+        }
+
+        // ─── Behavioral Scan ────────────────────────────────────────────
+        Commands::BehavioralScan { crash_tokens, moon_tokens, min_pnl, min_appearances, json } => {
+            tracing::info!(
+                crash_tokens, moon_tokens, min_pnl, min_appearances,
+                "Starting behavioral intelligence scan"
+            );
+
+            let birdeye_key = config.as_ref()
+                .and_then(|c| c.data.birdeye_api_key.clone())
+                .or_else(|| std::env::var("BIRDEYE_API_KEY").ok())
+                .or_else(|| {
+                    // Try loading from .env file in current directory
+                    let env_path = std::path::Path::new(".env");
+                    if env_path.exists() {
+                        if let Ok(contents) = std::fs::read_to_string(env_path) {
+                            for line in contents.lines() {
+                                if let Some(val) = line.strip_prefix("BIRDEYE_API_KEY=") {
+                                    return Some(val.trim().to_string());
+                                }
+                            }
+                        }
+                    }
+                    None
+                });
+
+            if birdeye_key.is_none() {
+                println!("Error: BIRDEYE_API_KEY not configured.");
+                println!("Set it in config/local.toml [data] birdeye_api_key or as BIRDEYE_API_KEY env var.");
+                return Ok(());
+            }
+
+            let birdeye = solagent_data::BirdeyeClient::with_api_key(birdeye_key);
+
+            let config = solagent_behavioral::scanner::ScanConfig {
+                crash_token_count: crash_tokens,
+                moon_token_count: moon_tokens,
+                min_pnl_usd: min_pnl,
+                min_token_appearances: min_appearances,
+                ..Default::default()
+            };
+
+            let scanner = solagent_behavioral::BehavioralScanner::with_config(birdeye, config);
+
+            println!("Running behavioral scan...");
+            println!("  Crash tokens: {} | Moon tokens: {} | Min PnL: ${} | Min appearances: {}",
+                crash_tokens, moon_tokens, min_pnl, min_appearances);
+            println!();
+
+            match scanner.scan().await {
+                Ok(report) => {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&report)?);
+                    } else {
+                        // Summary
+                        println!("Scan complete: {} tokens scanned, {} wallets discovered, {} scored",
+                            report.tokens_scanned, report.wallets_discovered, report.wallets_scored);
+                        println!("  Crash tokens: {} | Moon tokens: {}",
+                            report.crash_tokens.len(), report.moon_tokens.len());
+
+                        let precognitive = report.by_tier(solagent_behavioral::Tier::Precognitive);
+                        let sovereign = report.by_tier(solagent_behavioral::Tier::Sovereign);
+                        let emerging = report.by_tier(solagent_behavioral::Tier::Emerging);
+                        let noise = report.by_tier(solagent_behavioral::Tier::Noise);
+                        println!("\nTiers: PRECOGNITIVE={} SOVEREIGN={} EMERGING={} NOISE={}",
+                            precognitive.len(), sovereign.len(), emerging.len(), noise.len());
+
+                        // Sovereign section
+                        if !sovereign.is_empty() {
+                            println!("\n=== SOVEREIGN (track every position) ===");
+                            for w in sovereign {
+                                println!("\nWALLET: {}", w.address);
+                                println!("TIER: {}", w.tier);
+                                println!("SCORE: {:.0}", w.composite_score);
+                                println!("PRIMARY EDGE: {}", w.primary_edge);
+                                println!("RED_FLAGS: {}", if w.red_flags.is_empty() { "none".to_string() } else { w.red_flags.join(", ") });
+                                println!("CONFIDENCE: {}", w.confidence);
+                                println!("NOTES: {}", w.notes);
+                                println!("LAYER_SCORES: L1={:.0} L2={:.0} L3={:.0} L4={:.0} L5={:.0}",
+                                    w.layer_scores.inverse_loss, w.layer_scores.ghost_detect,
+                                    w.layer_scores.conviction, w.layer_scores.cto_reader,
+                                    w.layer_scores.deviation);
+                                println!("---");
+                            }
+                        }
+
+                        // Emerging section
+                        if !emerging.is_empty() {
+                            println!("\n=== EMERGING (watch 7 more days) ===");
+                            for w in emerging {
+                                println!("  {} | Score: {:.0} | Edge: {} | {}",
+                                    &w.address[..w.address.len().min(24)],
+                                    w.composite_score, w.primary_edge, w.notes);
+                            }
+                        }
+
+                        // Top 20 ranking table
+                        println!("\n=== FULL RANKINGS (top 20) ===");
+                        println!("{:<40} {:<14} {:>5} {:>8} {:>5} {:<18}",
+                            "Address", "Tier", "Score", "PnL", "Toks", "Edge");
+                        println!("{}", "-".repeat(95));
+                        for w in report.wallets.iter().take(20) {
+                            let rf = if w.red_flags.is_empty() { "" } else { " *" };
+                            println!("{:<40} {:<14} {:>5.0} {:>8.0} {:>5} {:<18}{}",
+                                &w.address[..w.address.len().min(39)],
+                                w.tier,
+                                w.composite_score,
+                                w.token_pnl,
+                                w.token_count,
+                                w.primary_edge,
+                                rf);
+                        }
+
+                        // Save JSON report
+                        let report_path = format!("logs/behavioral_{}.json",
+                            chrono::Utc::now().format("%Y%m%d_%H%M%S"));
+                        if let Ok(json_str) = serde_json::to_string_pretty(&report) {
+                            if std::fs::create_dir_all("logs").is_ok() {
+                                if std::fs::write(&report_path, json_str).is_ok() {
+                                    println!("\nFull report saved to: {}", report_path);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("Behavioral scan failed: {e}");
+                    println!("Ensure BIRDEYE_API_KEY is set and you have API access.");
+                }
+            }
         }
 
         // ─── Trade ───────────────────────────────────────────────────────
@@ -951,6 +1101,23 @@ async fn main() -> Result<()> {
                 weights.social,
             );
 
+            // Behavioral signal: uses behavioral wallet cache populated by
+            // periodic background scan. Checks GMGN top traders per token
+            // against discovered SOVEREIGN/PRECOGNITIVE wallets.
+            let behavioral_cache = std::sync::Arc::new(solagent_signals::BehavioralWalletCache::new());
+            let behavioral_signal = solagent_signals::BehavioralSignal::new(
+                behavioral_cache.clone(),
+                solagent_core::Chain::Solana,
+            );
+            confluence.add_strategy(
+                solagent_signals::StrategyKind::Behavioral(behavioral_signal),
+                weights.behavioral,
+            );
+            tracing::info!(
+                weights = ?weights,
+                "Signal weights configured (6 strategies including behavioral)"
+            );
+
             // Create wallet watcher if Helius key is available.
             let helius_key = config.as_ref()
                 .map(|c| c.chains.solana.helius_api_key.trim().to_string())
@@ -996,6 +1163,7 @@ async fn main() -> Result<()> {
                 ),
                 auto_tuner: None,
                 zerion: None,
+                behavioral_cache: Some(behavioral_cache),
             }
             };
 

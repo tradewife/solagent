@@ -135,7 +135,7 @@ Repos in `audit/`. Key grades:
 - **WalletWatcher**: polls Helius for watched wallets, emits WalletBuy/WalletSell events
 
 ### Phase 3: Signal Engine (all 5)
-1. **WhaleConsensusSignal** (w=0.30): sliding window, wallet-quality-weighted, event-driven
+1. **WhaleConsensusSignal** (w=0.30): sliding window (1hr), wallet-quality-weighted, event-driven
 2. **AccumulationSignal** (w=0.20): holder growth vs flat price
 3. **LaunchMomentumSignal** (w=0.20): new launch volume/holder spike
 4. **VolumeSpikeSignal** (w=0.15): 3x+ average over rolling window
@@ -182,13 +182,13 @@ Confluence threshold: 65/100 weighted composite required to trigger evaluation.
 
 | Signal | Weight | Trigger | Data Source |
 |--------|--------|---------|-------------|
-| Whale Consensus | 0.30 | 2+ smart money buy same token in 30 min | Helius watcher + GMGN wallet registry |
+| Whale Consensus | 0.30 | 2+ smart money buy same token in 1 hour | Helius watcher + GMGN wallet registry |
 | Accumulation | 0.20 | Holder growth + price flat | Birdeye holder API |
 | Launch Momentum | 0.20 | New token with rapid holder + volume growth | DexScreener new pairs |
 | Volume Spike | 0.15 | 3x+ average volume in rolling window | DexScreener pair data |
 | Social | 0.15 | Twitter mention velocity | twitter-cli |
 
-Confluence = weighted sum. Threshold: 65/100.
+Confluence = weighted sum. Threshold: 35/100 (progressive floor: 25).
 
 ## Safety Checks Detail
 
@@ -209,18 +209,19 @@ Threshold: 70/100 to proceed.
 
 | Parameter | Value |
 |-----------|-------|
-| Max position size | $15 per trade |
+| Max position size | $15 per trade (dynamic: $5-$20 by confluence + win rate) |
 | Max per token | 25% of portfolio |
 | Max open positions | 3 |
 | Daily loss limit | $15 (halts trading) |
 | Drawdown breaker | 15% from peak (halts agent) |
 | Stop loss | -15% per position |
-| Take profit | +40% per position |
-| Trailing stop | -8% from peak |
-| Safety threshold | 70/100 |
-| Confluence threshold | 65/100 |
+| Take profit | +300% per position |
+| Trailing stop | -15% from peak |
+| Safety threshold | 60/100 |
+| Confluence threshold | 35/100 (progressive floor: 25) |
 | Cooldown | 5 min after any loss |
 | Exit profiles | Dynamic: moonbag/runner/swing/conservative by mcap/age/confluence |
+| Position sizing | Capped by available SOL cash (not total portfolio) to avoid $1 dust trades |
 
 ## API Budget
 
@@ -241,7 +242,14 @@ Threshold: 70/100 to proceed.
 ## Git
 
 - Repo at `/home/kt/solagent/`, on `main` branch
-- Latest: `fix: circuit breaker stuck HALTED from phantom DRPY PnL` + Zerion integration
+- Latest: `fix: whale consensus 1hr window, confluence floor 25, dynamic sizer uses available cash`
+
+## Known Issues & Recent Fixes
+
+- **Whale consensus was dead** (0.0 avg across 6021 evals) — window too short (30min) for sparse smart money activity. Fixed: expanded to 1hr.
+- **Confluence threshold cratered to floor** — progressive lowering hit minimum (was 10, now 25). At 10, only social signal (~56 avg) was needed to pass, causing 11% win rate.
+- **Dynamic sizer returned $1 for all trades** — was capping against total portfolio ($35, mostly illiquid meme tokens) instead of available SOL cash. Fixed: new `get_available_cash()` method caps against spendable SOL minus 0.01 SOL fee reserve.
+- **Current win rate**: 11.1% (3W/24L, $-2.48 total PnL) — expects improvement with higher confluence floor and fixed sizing.
 
 ## Remaining Gaps (nice-to-have, not blocking)
 
@@ -263,6 +271,7 @@ All 15 mission features completed and verified:
 - **Client**: `crates/solagent-data/src/zerion.rs` — HTTP Basic Auth, 8 RPS rate limiting
 - **Endpoints**: portfolio overview, token positions, FIFO PnL (realized/unrealized/ROI)
 - **Auto-tuner**: logs Zerion PnL cross-check during each tuning cycle (optional)
+- **Agent enrichment**: every ~4h, refreshes top 10 wallet scores from Zerion PnL and emits `WalletHold` events for positions held by watched wallets
 - **CLI**: `solagent portfolio sync --address <WALLET>` — fetch portfolio + positions + PnL
 - **Config**: `ZERION_API_KEY` env var or `[data] zerion_api_key` in config/local.toml
 - **Free tier**: 60K calls/mo, 10 RPS — budget ~20 calls/day for daily sync + tune cycles

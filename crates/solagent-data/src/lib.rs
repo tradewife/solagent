@@ -14,8 +14,8 @@ pub mod zerion;
 
 // Re-export the main types at the crate root for backward compatibility.
 pub use birdeye::{
-    BirdeyeClient, BirdeyeResponse, HolderInfo, TokenPrice, TokenSecurity, TokenSecurityData,
-    TraderInfo, WalletPnl, BIRDEYE_DEFAULT_BASE_URL,
+    BirdeyeClient, BirdeyeResponse, HolderInfo, TokenOverview, TokenPrice, TokenSecurity,
+    TokenSecurityData, TraderInfo, WalletPnl, BIRDEYE_DEFAULT_BASE_URL,
 };
 pub use dexscreener::{
     BoostedToken, DexPair, DexPairResponse, DexScreenerClient, DexSearchResponse,

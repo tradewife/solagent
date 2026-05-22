@@ -5709,6 +5709,7 @@ dependencies = [
  "rand 0.9.4",
  "serde",
  "serde_json",
+ "solagent-behavioral",
  "solagent-core",
  "solagent-data",
  "solagent-exec",
@@ -5720,6 +5721,21 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "solagent-behavioral"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde",
+ "serde_json",
+ "solagent-core",
+ "solagent-data",
+ "solagent-portfolio",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -5767,6 +5783,7 @@ dependencies = [
  "serde",
  "serde_json",
  "solagent-agent",
+ "solagent-behavioral",
  "solagent-chain-solana",
  "solagent-core",
  "solagent-data",

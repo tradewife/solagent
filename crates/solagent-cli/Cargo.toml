@@ -12,6 +12,7 @@ solagent-signals = { path = "../solagent-signals" }
 solagent-safety = { path = "../solagent-safety" }
 solagent-risk = { path = "../solagent-risk" }
 solagent-exec = { path = "../solagent-exec" }
+solagent-behavioral = { path = "../solagent-behavioral" }
 solagent-chain-solana = { path = "../solagent-chain-solana" }
 clap = { workspace = true }
 tokio = { workspace = true }

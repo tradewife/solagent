@@ -1,0 +1,1293 @@
+[
+  {
+    "addr": "4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk",
+    "tier": "SOVEREIGN",
+    "score": 75.5,
+    "primary_edge": "L1_InverseLoss",
+    "winrate": 0.746938775510204,
+    "tokens": 958,
+    "avg_entry_mcap": "N/A",
+    "best_call": "8 tokens >5x, 29 tokens 2-5x",
+    "consensus_deviation": "35%",
+    "red_flags": [
+      "none"
+    ],
+    "confidence": "MEDIUM",
+    "realized_pnl": 168631.5216886208,
+    "avg_hold_hrs": 118.16129921719826,
+    "layers": {
+      "L1_InverseLoss": 90,
+      "L2_GhostDetect": 45,
+      "L3_Conviction": 90,
+      "L4_CTOReader": 85,
+      "L5_Deviation": 75
+    },
+    "tags": [
+      "top_renamed",
+      "kol",
+      "photon",
+      "launchpad_smart",
+      "padre"
+    ],
+    "name": "",
+    "twitter": "jijo_exe",
+    "follow_count": 52888
+  },
+  {
+    "addr": "RaVenxw8kykBbW7KGBaBsb7fDkkBYK4uJVDSFun6ZxR",
+    "tier": "NOISE",
+    "score": 73.0,
+    "primary_edge": "L1_InverseLoss",
+    "winrate": 0.7975077881619937,
+    "tokens": 2006,
+    "avg_entry_mcap": "N/A",
+    "best_call": "68 tokens >5x, 37 tokens 2-5x",
+    "consensus_deviation": "183%",
+    "red_flags": [
+      "MEV/Sandwich bot",
+      "Extreme trades/token (50.2) - bot pattern"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 26966.399385392106,
+    "avg_hold_hrs": 1666.5134694989106,
+    "layers": {
+      "L1_InverseLoss": 95,
+      "L2_GhostDetect": 45,
+      "L3_Conviction": 90,
+      "L4_CTOReader": 60,
+      "L5_Deviation": 85
+    },
+    "tags": [
+      "sandwich_bot"
+    ],
+    "name": "",
+    "twitter": "",
+    "follow_count": 1032
+  },
+  {
+    "addr": "CqB9P9K2dKjKmJx1k9qAJr8ucPKXgv45qP1G74JUwxwF",
+    "tier": "NOISE",
+    "score": 52.25,
+    "primary_edge": "L1_InverseLoss",
+    "winrate": 0.6666666666666666,
+    "tokens": 267,
+    "avg_entry_mcap": "N/A",
+    "best_call": "0 tokens >5x, 2 tokens 2-5x",
+    "consensus_deviation": "62%",
+    "red_flags": [
+      "none"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 12079.196540447654,
+    "avg_hold_hrs": 277.23657407407404,
+    "layers": {
+      "L1_InverseLoss": 85,
+      "L2_GhostDetect": 40,
+      "L3_Conviction": 30,
+      "L4_CTOReader": 55,
+      "L5_Deviation": 55
+    },
+    "tags": [
+      "smart_degen"
+    ],
+    "name": "",
+    "twitter": "",
+    "follow_count": 54
+  },
+  {
+    "addr": "4vw54BmAogeRV3vPKWyFet5yf8DTLcREzdSzx4rw9Ud9",
+    "tier": "NOISE",
+    "score": 50.25,
+    "primary_edge": "L1_InverseLoss",
+    "winrate": 0.5686070686070686,
+    "tokens": 2006,
+    "avg_entry_mcap": "N/A",
+    "best_call": "2 tokens >5x, 21 tokens 2-5x",
+    "consensus_deviation": "183%",
+    "red_flags": [
+      "3+ bot platforms: ['photon', 'padre', 'axiom']"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 123450.05966369598,
+    "avg_hold_hrs": 10.518632361111113,
+    "layers": {
+      "L1_InverseLoss": 70,
+      "L2_GhostDetect": 35,
+      "L3_Conviction": 60,
+      "L4_CTOReader": 70,
+      "L5_Deviation": 10
+    },
+    "tags": [
+      "top_renamed",
+      "photon",
+      "kol",
+      "padre",
+      "axiom"
+    ],
+    "name": "",
+    "twitter": "notdecu",
+    "follow_count": 25662
+  },
+  {
+    "addr": "DtVW93ZP44qLvxgNbyDUcHhJFEYUxLD8qEEb5bXJKeWx",
+    "tier": "NOISE",
+    "score": 48.25,
+    "primary_edge": "L1_InverseLoss",
+    "winrate": 0.6681222707423581,
+    "tokens": 291,
+    "avg_entry_mcap": "N/A",
+    "best_call": "0 tokens >5x, 0 tokens 2-5x",
+    "consensus_deviation": "59%",
+    "red_flags": [
+      "none"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 4043.134311407088,
+    "avg_hold_hrs": 162.17726675148432,
+    "layers": {
+      "L1_InverseLoss": 75,
+      "L2_GhostDetect": 40,
+      "L3_Conviction": 20,
+      "L4_CTOReader": 55,
+      "L5_Deviation": 55
+    },
+    "tags": [
+      "smart_degen"
+    ],
+    "name": "",
+    "twitter": "",
+    "follow_count": 62
+  },
+  {
+    "addr": "Gghj6515zeefxS2Dv7vwSSGyWqtASJFojuLwVMFsc6FN",
+    "tier": "NOISE",
+    "score": 47.25,
+    "primary_edge": "L3_Conviction",
+    "winrate": 0.5985037406483791,
+    "tokens": 418,
+    "avg_entry_mcap": "N/A",
+    "best_call": "7 tokens >5x, 14 tokens 2-5x",
+    "consensus_deviation": "41%",
+    "red_flags": [
+      "none"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 31026.087498226698,
+    "avg_hold_hrs": 22.05090091916734,
+    "layers": {
+      "L1_InverseLoss": 55,
+      "L2_GhostDetect": 45,
+      "L3_Conviction": 70,
+      "L4_CTOReader": 40,
+      "L5_Deviation": 20
+    },
+    "tags": [
+      "bullx",
+      "smart_degen",
+      "axiom"
+    ],
+    "name": "",
+    "twitter": "",
+    "follow_count": 523
+  },
+  {
+    "addr": "THXcGyTMLSKWmvpDpdgL8G224xfMXksCfA29LBoJfUJ",
+    "tier": "NOISE",
+    "score": 45.25,
+    "primary_edge": "L3_Conviction",
+    "winrate": 0.5885286783042394,
+    "tokens": 414,
+    "avg_entry_mcap": "N/A",
+    "best_call": "6 tokens >5x, 11 tokens 2-5x",
+    "consensus_deviation": "42%",
+    "red_flags": [
+      "none"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 27437.994062709848,
+    "avg_hold_hrs": 6.060292792792793,
+    "layers": {
+      "L1_InverseLoss": 55,
+      "L2_GhostDetect": 45,
+      "L3_Conviction": 70,
+      "L4_CTOReader": 30,
+      "L5_Deviation": 20
+    },
+    "tags": [
+      "bullx",
+      "smart_degen",
+      "axiom"
+    ],
+    "name": "",
+    "twitter": "",
+    "follow_count": 409
+  },
+  {
+    "addr": "DYAn4XpAkN5mhiXkRB7dGq4Jadnx6XYgu8L5b3WGhbrt",
+    "tier": "NOISE",
+    "score": 44.25,
+    "primary_edge": "L3_Conviction",
+    "winrate": 0.47928994082840237,
+    "tokens": 366,
+    "avg_entry_mcap": "N/A",
+    "best_call": "6 tokens >5x, 11 tokens 2-5x",
+    "consensus_deviation": "48%",
+    "red_flags": [
+      "none"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 18544.635806763265,
+    "avg_hold_hrs": 38.542122407923245,
+    "layers": {
+      "L1_InverseLoss": 35,
+      "L2_GhostDetect": 25,
+      "L3_Conviction": 75,
+      "L4_CTOReader": 65,
+      "L5_Deviation": 20
+    },
+    "tags": [
+      "top_renamed",
+      "trojan",
+      "kol",
+      "app_smart_money",
+      "axiom",
+      "padre"
+    ],
+    "name": "",
+    "twitter": "KayTheDoc",
+    "follow_count": 24767
+  },
+  {
+    "addr": "EW1BMaF3AUnu9anjUmu8p3EY5F33ZhMESi7V2DJHNgNw",
+    "tier": "NOISE",
+    "score": 40.0,
+    "primary_edge": "L3_Conviction",
+    "winrate": 0.6144278606965174,
+    "tokens": 414,
+    "avg_entry_mcap": "N/A",
+    "best_call": "8 tokens >5x, 12 tokens 2-5x",
+    "consensus_deviation": "42%",
+    "red_flags": [
+      "Bot cluster member (100% token overlap, 0s timing correlation)"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 31118.74843128827,
+    "avg_hold_hrs": 7.225412912912913,
+    "layers": {
+      "L1_InverseLoss": 65,
+      "L2_GhostDetect": 0,
+      "L3_Conviction": 80,
+      "L4_CTOReader": 40,
+      "L5_Deviation": 20
+    },
+    "tags": [
+      "smart_degen",
+      "axiom"
+    ],
+    "name": "",
+    "twitter": "",
+    "follow_count": 399
+  },
+  {
+    "addr": "Hd5wMoiypHWRQmkus5SHu6ECH27fXVqkhg3d5rGhvLAL",
+    "tier": "NOISE",
+    "score": 40.0,
+    "primary_edge": "L1_InverseLoss",
+    "winrate": 0.7318840579710145,
+    "tokens": 139,
+    "avg_entry_mcap": "N/A",
+    "best_call": "0 tokens >5x, 0 tokens 2-5x",
+    "consensus_deviation": "80%",
+    "red_flags": [
+      "Young wallet (3 days) with clean WR"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 1991.26124331459,
+    "avg_hold_hrs": 0.5094984012789768,
+    "layers": {
+      "L1_InverseLoss": 85,
+      "L2_GhostDetect": 50,
+      "L3_Conviction": 0,
+      "L4_CTOReader": 30,
+      "L5_Deviation": 30
+    },
+    "tags": [
+      "fresh_wallet",
+      "smart_degen"
+    ],
+    "name": "",
+    "twitter": "",
+    "follow_count": 6
+  },
+  {
+    "addr": "GijFWw4oNyh9ko3FaZforNsi3jk6wDovARpkKahPD4o5",
+    "tier": "NOISE",
+    "score": 39.5,
+    "primary_edge": "L3_Conviction",
+    "winrate": 0.4307116104868914,
+    "tokens": 1199,
+    "avg_entry_mcap": "N/A",
+    "best_call": "5 tokens >5x, 16 tokens 2-5x",
+    "consensus_deviation": "69%",
+    "red_flags": [
+      "3+ bot platforms: ['photon', 'padre', 'axiom']"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 94020.15547487157,
+    "avg_hold_hrs": 114.33406351867374,
+    "layers": {
+      "L1_InverseLoss": 40,
+      "L2_GhostDetect": 15,
+      "L3_Conviction": 70,
+      "L4_CTOReader": 50,
+      "L5_Deviation": 25
+    },
+    "tags": [
+      "top_renamed",
+      "photon",
+      "padre",
+      "smart_degen",
+      "axiom"
+    ],
+    "name": "",
+    "twitter": "",
+    "follow_count": 8242
+  },
+  {
+    "addr": "5kTMRBxmE9TmBjwehaZt1eF3wqx8Qv2GNyjKfdajqtBN",
+    "tier": "NOISE",
+    "score": 38.5,
+    "primary_edge": "L1_InverseLoss",
+    "winrate": 0.6535433070866141,
+    "tokens": 388,
+    "avg_entry_mcap": "N/A",
+    "best_call": "0 tokens >5x, 0 tokens 2-5x",
+    "consensus_deviation": "45%",
+    "red_flags": [
+      "none"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 5646.988418425473,
+    "avg_hold_hrs": 2.045911662315057,
+    "layers": {
+      "L1_InverseLoss": 80,
+      "L2_GhostDetect": 40,
+      "L3_Conviction": 0,
+      "L4_CTOReader": 40,
+      "L5_Deviation": 30
+    },
+    "tags": [
+      "smart_degen",
+      "axiom"
+    ],
+    "name": "",
+    "twitter": "",
+    "follow_count": 111
+  },
+  {
+    "addr": "7q15WZ4iSUDvqfs5Kdh9bfptkQhs6qKUyCUq6GY6PGxg",
+    "tier": "NOISE",
+    "score": 37.5,
+    "primary_edge": "L1_InverseLoss",
+    "winrate": 0.6910112359550562,
+    "tokens": 549,
+    "avg_entry_mcap": "N/A",
+    "best_call": "0 tokens >5x, 0 tokens 2-5x",
+    "consensus_deviation": "22%",
+    "red_flags": [
+      "none"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 15540.99181302979,
+    "avg_hold_hrs": 15.89096423417852,
+    "layers": {
+      "L1_InverseLoss": 75,
+      "L2_GhostDetect": 20,
+      "L3_Conviction": 10,
+      "L4_CTOReader": 55,
+      "L5_Deviation": 30
+    },
+    "tags": [
+      "axiom",
+      "smart_degen"
+    ],
+    "name": "",
+    "twitter": "",
+    "follow_count": 370
+  },
+  {
+    "addr": "zzzCaz9jTFBka6vypB26BeyKK9BTqyFYyFzqZtM6sUa",
+    "tier": "NOISE",
+    "score": 37.5,
+    "primary_edge": "L1_InverseLoss",
+    "winrate": 0.6756756756756757,
+    "tokens": 1268,
+    "avg_entry_mcap": "N/A",
+    "best_call": "0 tokens >5x, 0 tokens 2-5x",
+    "consensus_deviation": "79%",
+    "red_flags": [
+      "none"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 7189.04782315299,
+    "avg_hold_hrs": 0.22278468323977546,
+    "layers": {
+      "L1_InverseLoss": 80,
+      "L2_GhostDetect": 20,
+      "L3_Conviction": 0,
+      "L4_CTOReader": 45,
+      "L5_Deviation": 50
+    },
+    "tags": [
+      "smart_degen"
+    ],
+    "name": "",
+    "twitter": "",
+    "follow_count": 37
+  },
+  {
+    "addr": "XjsgzZkt4k1Z5S1wq4y6oNH7iqCZ68mabV8E2cu2fgt",
+    "tier": "NOISE",
+    "score": 36.25,
+    "primary_edge": "L3_Conviction",
+    "winrate": 0.4139240506329114,
+    "tokens": 811,
+    "avg_entry_mcap": "N/A",
+    "best_call": "5 tokens >5x, 20 tokens 2-5x",
+    "consensus_deviation": "15%",
+    "red_flags": [
+      "none"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 20600.60642846815,
+    "avg_hold_hrs": 26.18053294971914,
+    "layers": {
+      "L1_InverseLoss": 25,
+      "L2_GhostDetect": 25,
+      "L3_Conviction": 75,
+      "L4_CTOReader": 35,
+      "L5_Deviation": 20
+    },
+    "tags": [
+      "padre",
+      "smart_degen",
+      "axiom"
+    ],
+    "name": "",
+    "twitter": "",
+    "follow_count": 127
+  },
+  {
+    "addr": "FFEjC9MHhpQViBPrD2iU6LmV2hEigyhLJaL7MZUZzyD4",
+    "tier": "NOISE",
+    "score": 36.0,
+    "primary_edge": "L1_InverseLoss",
+    "winrate": 0.6004962779156328,
+    "tokens": 415,
+    "avg_entry_mcap": "N/A",
+    "best_call": "7 tokens >5x, 10 tokens 2-5x",
+    "consensus_deviation": "41%",
+    "red_flags": [
+      "Bot cluster member (100% token overlap, 0s timing correlation)"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 31704.59411576725,
+    "avg_hold_hrs": 5.943357843137255,
+    "layers": {
+      "L1_InverseLoss": 65,
+      "L2_GhostDetect": 0,
+      "L3_Conviction": 60,
+      "L4_CTOReader": 40,
+      "L5_Deviation": 20
+    },
+    "tags": [
+      "smart_degen",
+      "axiom"
+    ],
+    "name": "",
+    "twitter": "",
+    "follow_count": 535
+  },
+  {
+    "addr": "2fNPNJKE3ny6b5Vo1wdfa7J7KqYNjeyBM3PbGGSJ398r",
+    "tier": "NOISE",
+    "score": 34.5,
+    "primary_edge": "L1_InverseLoss",
+    "winrate": 0.714795008912656,
+    "tokens": 586,
+    "avg_entry_mcap": "N/A",
+    "best_call": "0 tokens >5x, 0 tokens 2-5x",
+    "consensus_deviation": "17%",
+    "red_flags": [
+      "none"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 11054.386846853966,
+    "avg_hold_hrs": 13.33532679738562,
+    "layers": {
+      "L1_InverseLoss": 85,
+      "L2_GhostDetect": 0,
+      "L3_Conviction": 10,
+      "L4_CTOReader": 55,
+      "L5_Deviation": 30
+    },
+    "tags": [
+      "padre",
+      "smart_degen"
+    ],
+    "name": "",
+    "twitter": "",
+    "follow_count": 202
+  },
+  {
+    "addr": "GBeuq1LCo7A1VvZ5cwAQWKqXZXwemrLW97qAMF9YKpz7",
+    "tier": "NOISE",
+    "score": 34.0,
+    "primary_edge": "L1_InverseLoss",
+    "winrate": 0.6366307541625857,
+    "tokens": 1027,
+    "avg_entry_mcap": "N/A",
+    "best_call": "0 tokens >5x, 1 tokens 2-5x",
+    "consensus_deviation": "45%",
+    "red_flags": [
+      "none"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 22766.8552331054,
+    "avg_hold_hrs": 0.2060580065359477,
+    "layers": {
+      "L1_InverseLoss": 85,
+      "L2_GhostDetect": 20,
+      "L3_Conviction": 0,
+      "L4_CTOReader": 45,
+      "L5_Deviation": 20
+    },
+    "tags": [
+      "axiom"
+    ],
+    "name": "",
+    "twitter": "",
+    "follow_count": 263
+  },
+  {
+    "addr": "2T5NgDDidkvhJQg8AHDi74uCFwgp25pYFMRZXBaCUNBH",
+    "tier": "NOISE",
+    "score": 29.75,
+    "primary_edge": "L1_InverseLoss",
+    "winrate": 0.4864864864864865,
+    "tokens": 199,
+    "avg_entry_mcap": "N/A",
+    "best_call": "0 tokens >5x, 2 tokens 2-5x",
+    "consensus_deviation": "72%",
+    "red_flags": [
+      "none"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 1357.5607934377776,
+    "avg_hold_hrs": 24.42196315486471,
+    "layers": {
+      "L1_InverseLoss": 45,
+      "L2_GhostDetect": 35,
+      "L3_Conviction": 15,
+      "L4_CTOReader": 45,
+      "L5_Deviation": 0
+    },
+    "tags": [
+      "top_renamed",
+      "photon",
+      "kol",
+      "padre"
+    ],
+    "name": "",
+    "twitter": "untaxxable",
+    "follow_count": 7889
+  },
+  {
+    "addr": "21vaYvUUE4ND1bVt1tcGiXUXHe41w53unQd5DmCDeLZ1",
+    "tier": "NOISE",
+    "score": 29.5,
+    "primary_edge": "L3_Conviction",
+    "winrate": 0.3227176220806794,
+    "tokens": 490,
+    "avg_entry_mcap": "N/A",
+    "best_call": "2 tokens >5x, 11 tokens 2-5x",
+    "consensus_deviation": "31%",
+    "red_flags": [
+      "none"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 38482.00449921486,
+    "avg_hold_hrs": 42.96133895775941,
+    "layers": {
+      "L1_InverseLoss": 20,
+      "L2_GhostDetect": 15,
+      "L3_Conviction": 65,
+      "L4_CTOReader": 25,
+      "L5_Deviation": 25
+    },
+    "tags": [
+      "smart_degen",
+      "photon"
+    ],
+    "name": "",
+    "twitter": "",
+    "follow_count": 302
+  },
+  {
+    "addr": "6uqWKLHZjPJmZr45dQJQfeqpJeMSFLuYeSrHDjWC9w1H",
+    "tier": "NOISE",
+    "score": 29.0,
+    "primary_edge": "L1_InverseLoss",
+    "winrate": 0.5124223602484472,
+    "tokens": 971,
+    "avg_entry_mcap": "N/A",
+    "best_call": "0 tokens >5x, 0 tokens 2-5x",
+    "consensus_deviation": "37%",
+    "red_flags": [
+      "none"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 7758.89740789098,
+    "avg_hold_hrs": 0.3191980101219231,
+    "layers": {
+      "L1_InverseLoss": 70,
+      "L2_GhostDetect": 20,
+      "L3_Conviction": 0,
+      "L4_CTOReader": 35,
+      "L5_Deviation": 20
+    },
+    "tags": [
+      "smart_degen",
+      "axiom"
+    ],
+    "name": "",
+    "twitter": "",
+    "follow_count": 64
+  },
+  {
+    "addr": "H2KAvWycyqeHhqkMC1f83Pwju3B2MztLYdXVpNMcDs2V",
+    "tier": "NOISE",
+    "score": 26.5,
+    "primary_edge": "L1_InverseLoss",
+    "winrate": 0.4112337011033099,
+    "tokens": 2007,
+    "avg_entry_mcap": "N/A",
+    "best_call": "1 tokens >5x, 11 tokens 2-5x",
+    "consensus_deviation": "183%",
+    "red_flags": [
+      "none"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 18951.231642885592,
+    "avg_hold_hrs": 0.4897027777777778,
+    "layers": {
+      "L1_InverseLoss": 55,
+      "L2_GhostDetect": 0,
+      "L3_Conviction": 30,
+      "L4_CTOReader": 25,
+      "L5_Deviation": 30
+    },
+    "tags": [
+      "smart_degen",
+      "axiom"
+    ],
+    "name": "",
+    "twitter": "",
+    "follow_count": 428
+  },
+  {
+    "addr": "FFFz6LeDp41sqe5VusaLH7V2HFhidCnqTiYQhE6V2Zco",
+    "tier": "NOISE",
+    "score": 25.75,
+    "primary_edge": "L1_InverseLoss",
+    "winrate": 0.5046040515653776,
+    "tokens": 564,
+    "avg_entry_mcap": "N/A",
+    "best_call": "1 tokens >5x, 7 tokens 2-5x",
+    "consensus_deviation": "20%",
+    "red_flags": [
+      "none"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 39354.94622692487,
+    "avg_hold_hrs": 2.9868214854639583,
+    "layers": {
+      "L1_InverseLoss": 55,
+      "L2_GhostDetect": 15,
+      "L3_Conviction": 20,
+      "L4_CTOReader": 35,
+      "L5_Deviation": 0
+    },
+    "tags": [
+      "smart_degen",
+      "axiom"
+    ],
+    "name": "",
+    "twitter": "",
+    "follow_count": 861
+  },
+  {
+    "addr": "9LYGNLf8or3ZCsvdN1rfA22htVeXap889TSCVtpmFXUw",
+    "tier": "NOISE",
+    "score": 25.0,
+    "primary_edge": "L1_InverseLoss",
+    "winrate": 0.4890738813735692,
+    "tokens": 966,
+    "avg_entry_mcap": "N/A",
+    "best_call": "0 tokens >5x, 0 tokens 2-5x",
+    "consensus_deviation": "36%",
+    "red_flags": [
+      "none"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 7170.20326387546,
+    "avg_hold_hrs": 0.3209015493120592,
+    "layers": {
+      "L1_InverseLoss": 60,
+      "L2_GhostDetect": 20,
+      "L3_Conviction": 0,
+      "L4_CTOReader": 25,
+      "L5_Deviation": 20
+    },
+    "tags": [
+      "smart_degen",
+      "axiom"
+    ],
+    "name": "",
+    "twitter": "",
+    "follow_count": 24
+  },
+  {
+    "addr": "4NMLbGDzjYoBMH4Lkg5964D2XW9XAg6w9eUXJqsCUXg6",
+    "tier": "NOISE",
+    "score": 24.75,
+    "primary_edge": "L1_InverseLoss",
+    "winrate": 0.45627376425855515,
+    "tokens": 271,
+    "avg_entry_mcap": "N/A",
+    "best_call": "0 tokens >5x, 4 tokens 2-5x",
+    "consensus_deviation": "62%",
+    "red_flags": [
+      "none"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 8419.40239111563,
+    "avg_hold_hrs": 1.0642033542976939,
+    "layers": {
+      "L1_InverseLoss": 60,
+      "L2_GhostDetect": 35,
+      "L3_Conviction": 0,
+      "L4_CTOReader": 20,
+      "L5_Deviation": 0
+    },
+    "tags": [
+      "smart_degen",
+      "axiom"
+    ],
+    "name": "",
+    "twitter": "",
+    "follow_count": 83
+  },
+  {
+    "addr": "hahaA2GjzZbwgAwwryjmTb8VkmLt68hdZVHhtcpknpT",
+    "tier": "NOISE",
+    "score": 24.5,
+    "primary_edge": "L3_Conviction",
+    "winrate": 0.33531510107015455,
+    "tokens": 855,
+    "avg_entry_mcap": "N/A",
+    "best_call": "0 tokens >5x, 10 tokens 2-5x",
+    "consensus_deviation": "21%",
+    "red_flags": [
+      "none"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 7067.066215035106,
+    "avg_hold_hrs": 18.95819624394713,
+    "layers": {
+      "L1_InverseLoss": 25,
+      "L2_GhostDetect": 15,
+      "L3_Conviction": 30,
+      "L4_CTOReader": 30,
+      "L5_Deviation": 25
+    },
+    "tags": [
+      "padre",
+      "gmgn",
+      "smart_degen",
+      "axiom"
+    ],
+    "name": "",
+    "twitter": "AspectOnChain",
+    "follow_count": 343
+  },
+  {
+    "addr": "J2ECnk4MJQ8boxN77ss8fTkQRQxG7JmEUEGbARjxBPaz",
+    "tier": "NOISE",
+    "score": 24.0,
+    "primary_edge": "L1_InverseLoss",
+    "winrate": 0.5101214574898786,
+    "tokens": 503,
+    "avg_entry_mcap": "N/A",
+    "best_call": "0 tokens >5x, 2 tokens 2-5x",
+    "consensus_deviation": "29%",
+    "red_flags": [
+      "none"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 5334.210192503001,
+    "avg_hold_hrs": 3.1018997317236754,
+    "layers": {
+      "L1_InverseLoss": 60,
+      "L2_GhostDetect": 20,
+      "L3_Conviction": 0,
+      "L4_CTOReader": 35,
+      "L5_Deviation": 0
+    },
+    "tags": [
+      "smart_degen",
+      "axiom"
+    ],
+    "name": "",
+    "twitter": "",
+    "follow_count": 48
+  },
+  {
+    "addr": "9tTM4ntGtfNAFctnNWbYfij9m9HALKYfpKk9FobWDzBK",
+    "tier": "NOISE",
+    "score": 21.75,
+    "primary_edge": "L1_InverseLoss",
+    "winrate": 0.4093567251461988,
+    "tokens": 518,
+    "avg_entry_mcap": "N/A",
+    "best_call": "2 tokens >5x, 7 tokens 2-5x",
+    "consensus_deviation": "27%",
+    "red_flags": [
+      "none"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 2463.7128689676,
+    "avg_hold_hrs": 2.097057057057057,
+    "layers": {
+      "L1_InverseLoss": 35,
+      "L2_GhostDetect": 15,
+      "L3_Conviction": 30,
+      "L4_CTOReader": 25,
+      "L5_Deviation": 0
+    },
+    "tags": [
+      "smart_degen",
+      "axiom"
+    ],
+    "name": "",
+    "twitter": "",
+    "follow_count": 6
+  },
+  {
+    "addr": "31k5LuGrXoZtfwizju8w1JVU2KdJH7GwMr7fzdJnvCuv",
+    "tier": "NOISE",
+    "score": 21.0,
+    "primary_edge": "L1_InverseLoss",
+    "winrate": 0.5977229601518027,
+    "tokens": 532,
+    "avg_entry_mcap": "N/A",
+    "best_call": "1 tokens >5x, 0 tokens 2-5x",
+    "consensus_deviation": "25%",
+    "red_flags": [
+      "none"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 8600.747623268286,
+    "avg_hold_hrs": 3.124096700083542,
+    "layers": {
+      "L1_InverseLoss": 60,
+      "L2_GhostDetect": 0,
+      "L3_Conviction": 10,
+      "L4_CTOReader": 35,
+      "L5_Deviation": 0
+    },
+    "tags": [
+      "smart_degen",
+      "axiom"
+    ],
+    "name": "",
+    "twitter": "",
+    "follow_count": 8
+  },
+  {
+    "addr": "4M5mWUecEGKzAMH5AYrm8gg9zyK7MNbCdxwB1nMfFHVG",
+    "tier": "NOISE",
+    "score": 21.0,
+    "primary_edge": "L1_InverseLoss",
+    "winrate": 0.37788385043754974,
+    "tokens": 1267,
+    "avg_entry_mcap": "N/A",
+    "best_call": "0 tokens >5x, 4 tokens 2-5x",
+    "consensus_deviation": "79%",
+    "red_flags": [
+      "none"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 14981.818256347802,
+    "avg_hold_hrs": 1.0371647281698828,
+    "layers": {
+      "L1_InverseLoss": 60,
+      "L2_GhostDetect": 20,
+      "L3_Conviction": 0,
+      "L4_CTOReader": 20,
+      "L5_Deviation": 0
+    },
+    "tags": [
+      "padre",
+      "smart_degen",
+      "axiom"
+    ],
+    "name": "",
+    "twitter": "",
+    "follow_count": 52
+  },
+  {
+    "addr": "3Fq9icKNRfooDf3HwYERYuitQzxDsZ3FNfxFosqLhJMB",
+    "tier": "NOISE",
+    "score": 20.5,
+    "primary_edge": "L1_InverseLoss",
+    "winrate": 0.30405405405405406,
+    "tokens": 161,
+    "avg_entry_mcap": "N/A",
+    "best_call": "0 tokens >5x, 2 tokens 2-5x",
+    "consensus_deviation": "77%",
+    "red_flags": [
+      "none"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 2458.3994986077073,
+    "avg_hold_hrs": 52.92346594982079,
+    "layers": {
+      "L1_InverseLoss": 30,
+      "L2_GhostDetect": 15,
+      "L3_Conviction": 15,
+      "L4_CTOReader": 20,
+      "L5_Deviation": 25
+    },
+    "tags": [
+      "photon",
+      "smart_degen",
+      "padre"
+    ],
+    "name": "",
+    "twitter": "",
+    "follow_count": 15
+  },
+  {
+    "addr": "7wiEWKeG7sFUNh1TgujwCa9cmJtSSE4mNLDde7knjoeE",
+    "tier": "NOISE",
+    "score": 19.75,
+    "primary_edge": "L1_InverseLoss",
+    "winrate": 0.390625,
+    "tokens": 951,
+    "avg_entry_mcap": "N/A",
+    "best_call": "1 tokens >5x, 10 tokens 2-5x",
+    "consensus_deviation": "34%",
+    "red_flags": [
+      "3+ bot platforms: ['bullx', 'padre', 'axiom']"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 11824.671598045845,
+    "avg_hold_hrs": 1.6346602654451492,
+    "layers": {
+      "L1_InverseLoss": 30,
+      "L2_GhostDetect": 15,
+      "L3_Conviction": 30,
+      "L4_CTOReader": 20,
+      "L5_Deviation": 0
+    },
+    "tags": [
+      "bullx",
+      "padre",
+      "smart_degen",
+      "axiom"
+    ],
+    "name": "",
+    "twitter": "",
+    "follow_count": 297
+  },
+  {
+    "addr": "4TnX6yoKfJNMawZZxFdgn7uCeU3wbbNGDaSAVnpSPzaE",
+    "tier": "NOISE",
+    "score": 19.0,
+    "primary_edge": "L1_InverseLoss",
+    "winrate": 0.5725190839694656,
+    "tokens": 529,
+    "avg_entry_mcap": "N/A",
+    "best_call": "0 tokens >5x, 1 tokens 2-5x",
+    "consensus_deviation": "25%",
+    "red_flags": [
+      "none"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 7005.696653825324,
+    "avg_hold_hrs": 3.1416766435622767,
+    "layers": {
+      "L1_InverseLoss": 60,
+      "L2_GhostDetect": 0,
+      "L3_Conviction": 0,
+      "L4_CTOReader": 35,
+      "L5_Deviation": 0
+    },
+    "tags": [
+      "smart_degen",
+      "axiom"
+    ],
+    "name": "",
+    "twitter": "",
+    "follow_count": 4
+  },
+  {
+    "addr": "8RrhbNeV8vfbFPJNWyiho9uv6LmKhm7aJDWRAgxY61BC",
+    "tier": "NOISE",
+    "score": 19.0,
+    "primary_edge": "L1_InverseLoss",
+    "winrate": 0.5977229601518027,
+    "tokens": 532,
+    "avg_entry_mcap": "N/A",
+    "best_call": "1 tokens >5x, 2 tokens 2-5x",
+    "consensus_deviation": "25%",
+    "red_flags": [
+      "none"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 9518.679218531088,
+    "avg_hold_hrs": 3.1249879908103595,
+    "layers": {
+      "L1_InverseLoss": 50,
+      "L2_GhostDetect": 0,
+      "L3_Conviction": 10,
+      "L4_CTOReader": 35,
+      "L5_Deviation": 0
+    },
+    "tags": [
+      "smart_degen",
+      "axiom"
+    ],
+    "name": "",
+    "twitter": "",
+    "follow_count": 21
+  },
+  {
+    "addr": "J6kZjUBfRhgxXjcQWTyLJimZWKHT4evAJSmhN9rHAQkr",
+    "tier": "NOISE",
+    "score": 19.0,
+    "primary_edge": "L1_InverseLoss",
+    "winrate": 0.5549738219895288,
+    "tokens": 765,
+    "avg_entry_mcap": "N/A",
+    "best_call": "0 tokens >5x, 0 tokens 2-5x",
+    "consensus_deviation": "8%",
+    "red_flags": [
+      "none"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 13031.40505682039,
+    "avg_hold_hrs": 0.4567530864197531,
+    "layers": {
+      "L1_InverseLoss": 45,
+      "L2_GhostDetect": 0,
+      "L3_Conviction": 0,
+      "L4_CTOReader": 35,
+      "L5_Deviation": 20
+    },
+    "tags": [
+      "axiom",
+      "smart_degen"
+    ],
+    "name": "",
+    "twitter": "",
+    "follow_count": 109
+  },
+  {
+    "addr": "Eh2odq3L4QDtR8RgNJF8mnFa8BkKQKD4J9UCRicJjpFS",
+    "tier": "NOISE",
+    "score": 17.5,
+    "primary_edge": "L1_InverseLoss",
+    "winrate": 0.5242621310655328,
+    "tokens": 2000,
+    "avg_entry_mcap": "N/A",
+    "best_call": "0 tokens >5x, 0 tokens 2-5x",
+    "consensus_deviation": "182%",
+    "red_flags": [
+      "none"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 4979.811438526404,
+    "avg_hold_hrs": 1.075859861111111,
+    "layers": {
+      "L1_InverseLoss": 45,
+      "L2_GhostDetect": 0,
+      "L3_Conviction": 0,
+      "L4_CTOReader": 35,
+      "L5_Deviation": 10
+    },
+    "tags": [
+      "smart_degen"
+    ],
+    "name": "",
+    "twitter": "",
+    "follow_count": 30
+  },
+  {
+    "addr": "BYMFYuxCow6n9YCjxMNifUUxWKsddX3rDGt82qu1BGmH",
+    "tier": "NOISE",
+    "score": 16.25,
+    "primary_edge": "L2_GhostDetect",
+    "winrate": 0.32085561497326204,
+    "tokens": 187,
+    "avg_entry_mcap": "N/A",
+    "best_call": "0 tokens >5x, 6 tokens 2-5x",
+    "consensus_deviation": "74%",
+    "red_flags": [
+      "none"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 3337.69618681124,
+    "avg_hold_hrs": 0.4725044563279857,
+    "layers": {
+      "L1_InverseLoss": 20,
+      "L2_GhostDetect": 25,
+      "L3_Conviction": 10,
+      "L4_CTOReader": 5,
+      "L5_Deviation": 20
+    },
+    "tags": [
+      "fresh_wallet",
+      "smart_degen",
+      "axiom"
+    ],
+    "name": "",
+    "twitter": "",
+    "follow_count": 12
+  },
+  {
+    "addr": "E93PRtfG7Ngutk6MCpLTktkXGDGv3ec2k4XhA1vyBSD2",
+    "tier": "NOISE",
+    "score": 16.0,
+    "primary_edge": "L1_InverseLoss",
+    "winrate": 0.43548387096774194,
+    "tokens": 312,
+    "avg_entry_mcap": "N/A",
+    "best_call": "0 tokens >5x, 3 tokens 2-5x",
+    "consensus_deviation": "56%",
+    "red_flags": [
+      "none"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 8322.513607745994,
+    "avg_hold_hrs": 8.447222222222223,
+    "layers": {
+      "L1_InverseLoss": 50,
+      "L2_GhostDetect": 0,
+      "L3_Conviction": 10,
+      "L4_CTOReader": 20,
+      "L5_Deviation": 0
+    },
+    "tags": [
+      "smart_degen",
+      "padre"
+    ],
+    "name": "",
+    "twitter": "",
+    "follow_count": 18
+  },
+  {
+    "addr": "kfu5jkMzu4kYg7GzQnq2bJv14QaMxGmv8jSTCcJxc31",
+    "tier": "NOISE",
+    "score": 15.5,
+    "primary_edge": "L1_InverseLoss",
+    "winrate": 0.4358974358974359,
+    "tokens": 78,
+    "avg_entry_mcap": "N/A",
+    "best_call": "0 tokens >5x, 1 tokens 2-5x",
+    "consensus_deviation": "89%",
+    "red_flags": [
+      "none"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 9011.210202998964,
+    "avg_hold_hrs": 5.683265669515669,
+    "layers": {
+      "L1_InverseLoss": 30,
+      "L2_GhostDetect": 15,
+      "L3_Conviction": 0,
+      "L4_CTOReader": 10,
+      "L5_Deviation": 25
+    },
+    "tags": [
+      "padre",
+      "smart_degen"
+    ],
+    "name": "",
+    "twitter": "",
+    "follow_count": 24
+  },
+  {
+    "addr": "FX2MjjFCMkKWupyCQR49gdtSwEpc7fpGJKkFX4J9hjfs",
+    "tier": "NOISE",
+    "score": 12.0,
+    "primary_edge": "L1_InverseLoss",
+    "winrate": 0.49255952380952384,
+    "tokens": 679,
+    "avg_entry_mcap": "N/A",
+    "best_call": "0 tokens >5x, 0 tokens 2-5x",
+    "consensus_deviation": "4%",
+    "red_flags": [
+      "none"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 17581.96257177634,
+    "avg_hold_hrs": 1.5563200626442466,
+    "layers": {
+      "L1_InverseLoss": 35,
+      "L2_GhostDetect": 0,
+      "L3_Conviction": 0,
+      "L4_CTOReader": 25,
+      "L5_Deviation": 0
+    },
+    "tags": [
+      "smart_degen"
+    ],
+    "name": "",
+    "twitter": "",
+    "follow_count": 67
+  },
+  {
+    "addr": "5pMQkgpk9Gd55kB5Htzonf8A7qo5gxhJEqm6XAwYaFtp",
+    "tier": "NOISE",
+    "score": 8.75,
+    "primary_edge": "L1_InverseLoss",
+    "winrate": 0.32954545454545453,
+    "tokens": 176,
+    "avg_entry_mcap": "N/A",
+    "best_call": "0 tokens >5x, 4 tokens 2-5x",
+    "consensus_deviation": "75%",
+    "red_flags": [
+      "none"
+    ],
+    "confidence": "LOW",
+    "realized_pnl": 2687.13782061417,
+    "avg_hold_hrs": 0.25132102272727275,
+    "layers": {
+      "L1_InverseLoss": 20,
+      "L2_GhostDetect": 15,
+      "L3_Conviction": 0,
+      "L4_CTOReader": 5,
+      "L5_Deviation": 0
+    },
+    "tags": [
+      "bullx",
+      "smart_degen",
+      "axiom"
+    ],
+    "name": "",
+    "twitter": "",
+    "follow_count": 19
+  }
+]

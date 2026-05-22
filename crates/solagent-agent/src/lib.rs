@@ -242,6 +242,10 @@ pub struct AgentSubsystems {
     pub auto_tuner: Option<AutoTuner>,
     /// Optional Zerion client for wallet PnL + position enrichment.
     pub zerion: Option<solagent_data::ZerionClient>,
+    /// Shared cache of behaviorally-discovered wallets, updated by
+    /// the background behavioral scan task. Read by BehavioralSignal
+    /// during evaluation and by WhaleConsensusSignal for quality weighting.
+    pub behavioral_cache: Option<std::sync::Arc<solagent_signals::BehavioralWalletCache>>,
 }
 
 // ─── Agent ───────────────────────────────────────────────────────────────────
@@ -359,6 +363,7 @@ impl Agent {
                     )),
                 )),
                 zerion: None,
+                behavioral_cache: None,
             }),
             decisions: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             running: Arc::new(tokio::sync::RwLock::new(false)),
@@ -565,6 +570,7 @@ impl Agent {
             confluence.set_weight(2, runtime_weights.launch_momentum);
             confluence.set_weight(3, runtime_weights.volume_spike);
             confluence.set_weight(4, runtime_weights.social);
+            confluence.set_weight(5, runtime_weights.behavioral);
             confluence.set_threshold(runtime_threshold);
         }
 
@@ -1147,6 +1153,71 @@ impl Agent {
             None
         };
 
+        // Spawn behavioral intelligence background scan (every 4 hours).
+        let _behavioral_handle = if let Some(ref cache) = self.subsystems.behavioral_cache {
+            let cache = Arc::clone(cache);
+            let birdeye_key = std::env::var("BIRDEYE_API_KEY").ok();
+            let handle = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(4 * 3600));
+                interval.tick().await; // Skip first immediate tick
+                loop {
+                    interval.tick().await;
+                    tracing::info!("Starting periodic behavioral intelligence scan");
+                    let birdeye = solagent_data::BirdeyeClient::with_api_key(birdeye_key.clone());
+                    let scanner = solagent_behavioral::BehavioralScanner::new(birdeye);
+                    match scanner.scan().await {
+                        Ok(report) => {
+                            let mut wallets = Vec::new();
+                            for w in &report.wallets {
+                                let tier = match w.tier {
+                                    solagent_behavioral::report::Tier::Precognitive => {
+                                        solagent_signals::BehavioralTier::Precognitive
+                                    }
+                                    solagent_behavioral::report::Tier::Sovereign => {
+                                        solagent_signals::BehavioralTier::Sovereign
+                                    }
+                                    solagent_behavioral::report::Tier::Emerging => {
+                                        solagent_signals::BehavioralTier::Emerging
+                                    }
+                                    solagent_behavioral::report::Tier::Noise => {
+                                        solagent_signals::BehavioralTier::Noise
+                                    }
+                                };
+                                if tier >= solagent_signals::BehavioralTier::Emerging {
+                                    wallets.push(solagent_signals::BehavioralWallet {
+                                        address: w.address.clone(),
+                                        tier,
+                                        score: w.composite_score,
+                                        primary_edge: w.primary_edge.clone(),
+                                        red_flags: w.red_flags.clone(),
+                                    });
+                                }
+                            }
+                            let total = wallets.len();
+                            cache.update(wallets).await;
+                            let (prec, sov, em, noise) = cache.tier_counts();
+                            tracing::info!(
+                                total,
+                                precognitive = prec,
+                                sovereign = sov,
+                                emerging = em,
+                                noise,
+                                "Behavioral scan complete — wallet cache updated"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Behavioral scan failed (will retry in 4h)");
+                        }
+                    }
+                }
+            });
+            tracing::info!("Behavioral intelligence background scan started (every 4h)");
+            Some(handle)
+        } else {
+            tracing::info!("No behavioral cache configured — behavioral signal disabled");
+            None
+        };
+
         let mut scan_interval = tokio::time::interval(
             std::time::Duration::from_secs(self.config.scan_interval_secs),
         );
@@ -1232,6 +1303,21 @@ impl Agent {
                                     timestamp: Utc::now(),
                                 });
 
+                                // Check behavioral signal: query GMGN top traders for this token
+                                // against the behavioral wallet cache (SOVEREIGN/PRECOGNITIVE wallets).
+                                if let Some(ref cache) = self.subsystems.behavioral_cache {
+                                    if cache.len() > 0 {
+                                        // Find the behavioral signal in the confluence scorer
+                                        // and trigger its GMGN lookup for this token.
+                                        let confluence = self.subsystems.confluence.lock().unwrap();
+                                        for strategy in confluence.strategies() {
+                                            if let solagent_signals::StrategyKind::Behavioral(bs) = strategy {
+                                                let _ = bs.check_gmgn_traders(&token.address).await;
+                                            }
+                                        }
+                                    }
+                                }
+
                                 // Evaluate each token.
                                 match self.evaluate(token).await {
                                     Ok(result) => {
@@ -1242,6 +1328,7 @@ impl Agent {
                                             "launch_momentum": result.signals.iter().find(|s| s.strategy == "launch_momentum").map(|s| s.score).unwrap_or(0),
                                             "volume_spike": result.signals.iter().find(|s| s.strategy == "volume_spike").map(|s| s.score).unwrap_or(0),
                                             "social": result.signals.iter().find(|s| s.strategy == "social").map(|s| s.score).unwrap_or(0),
+                                            "behavioral": result.signals.iter().find(|s| s.strategy == "behavioral").map(|s| s.score).unwrap_or(0),
                                         }).to_string();
 
                                         if let Err(e) = self.subsystems.portfolio.insert_evaluation(

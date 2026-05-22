@@ -1,23 +1,15 @@
 [package]
-name = "solagent-agent"
+name = "solagent-behavioral"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
 solagent-core = { path = "../solagent-core" }
 solagent-data = { path = "../solagent-data" }
-solagent-signals = { path = "../solagent-signals" }
-solagent-safety = { path = "../solagent-safety" }
-solagent-risk = { path = "../solagent-risk" }
-solagent-exec = { path = "../solagent-exec" }
 solagent-portfolio = { path = "../solagent-portfolio" }
-solagent-behavioral = { path = "../solagent-behavioral" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
-uuid = { workspace = true }
-sqlx = { workspace = true }
-rand = { workspace = true }

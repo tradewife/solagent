@@ -1265,6 +1265,7 @@ pub enum StrategyKind {
     LaunchMomentum(LaunchMomentumSignal),
     VolumeSpike(VolumeSpikeSignal),
     Social(SocialSignal),
+    Behavioral(BehavioralSignal),
 }
 
 impl Strategy for StrategyKind {
@@ -1275,6 +1276,7 @@ impl Strategy for StrategyKind {
             StrategyKind::LaunchMomentum(s) => s.name(),
             StrategyKind::VolumeSpike(s) => s.name(),
             StrategyKind::Social(s) => s.name(),
+            StrategyKind::Behavioral(s) => s.name(),
         }
     }
 
@@ -1285,6 +1287,7 @@ impl Strategy for StrategyKind {
             StrategyKind::LaunchMomentum(s) => s.evaluate(token).await,
             StrategyKind::VolumeSpike(s) => s.evaluate(token).await,
             StrategyKind::Social(s) => s.evaluate(token).await,
+            StrategyKind::Behavioral(s) => s.evaluate(token).await,
         }
     }
 }
@@ -1319,6 +1322,7 @@ impl ConfluenceScorer {
         accumulation: AccumulationSignal,
         launch_momentum: LaunchMomentumSignal,
         volume_spike: VolumeSpikeSignal,
+        behavioral: BehavioralSignal,
         weights: &SignalWeights,
         threshold: f64,
     ) -> Self {
@@ -1327,6 +1331,7 @@ impl ConfluenceScorer {
         scorer.add_strategy(StrategyKind::Accumulation(accumulation), weights.accumulation);
         scorer.add_strategy(StrategyKind::LaunchMomentum(launch_momentum), weights.launch_momentum);
         scorer.add_strategy(StrategyKind::VolumeSpike(volume_spike), weights.volume_spike);
+        scorer.add_strategy(StrategyKind::Behavioral(behavioral), weights.behavioral);
         scorer
     }
 
@@ -1482,6 +1487,11 @@ impl ConfluenceScorer {
     pub fn strategy_count(&self) -> usize {
         self.strategies.len()
     }
+
+    /// Get an iterator over the strategy kinds (for behavioral GMGN lookups).
+    pub fn strategies(&self) -> impl Iterator<Item = &StrategyKind> {
+        self.strategies.iter()
+    }
 }
 
 /// Thread-safe runtime configuration for the auto-tuner.
@@ -1526,6 +1536,7 @@ impl RuntimeConfig {
             "launch_momentum" => w.launch_momentum = value,
             "volume_spike" => w.volume_spike = value,
             "social" => w.social = value,
+            "behavioral" => w.behavioral = value,
             _ => return Err(format!("Unknown weight field: {field}")),
         }
         Ok(())
@@ -1558,16 +1569,18 @@ pub struct SignalWeights {
     pub launch_momentum: f64,
     pub volume_spike: f64,
     pub social: f64,
+    pub behavioral: f64,
 }
 
 impl Default for SignalWeights {
     fn default() -> Self {
         Self {
-            whale_consensus: 0.30,
-            accumulation: 0.20,
-            launch_momentum: 0.20,
-            volume_spike: 0.15,
-            social: 0.15,
+            whale_consensus: 0.25,
+            accumulation: 0.15,
+            launch_momentum: 0.15,
+            volume_spike: 0.10,
+            social: 0.10,
+            behavioral: 0.25,
         }
     }
 }
@@ -1581,6 +1594,282 @@ pub struct ConfluenceResult {
     pub signals: Vec<Signal>,
     /// Whether the score passes the confluence threshold.
     pub passed: bool,
+}
+
+// ─── Behavioral Wallet Cache ─────────────────────────────────────────────────
+
+/// Tier classification for behaviorally-scored wallets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BehavioralTier {
+    Precognitive,
+    Sovereign,
+    Emerging,
+    Noise,
+}
+
+impl std::fmt::Display for BehavioralTier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BehavioralTier::Precognitive => write!(f, "PRECOGNITIVE"),
+            BehavioralTier::Sovereign => write!(f, "SOVEREIGN"),
+            BehavioralTier::Emerging => write!(f, "EMERGING"),
+            BehavioralTier::Noise => write!(f, "NOISE"),
+        }
+    }
+}
+
+/// A wallet discovered by the behavioral intelligence scanner.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BehavioralWallet {
+    pub address: String,
+    pub tier: BehavioralTier,
+    pub score: f64,
+    pub primary_edge: String,
+    pub red_flags: Vec<String>,
+}
+
+/// Shared cache of behaviorally-discovered wallets, updated by the
+/// background behavioral scan task. Read by BehavioralSignal and
+/// WhaleConsensusSignal for quality weighting.
+#[derive(Debug, Clone)]
+pub struct BehavioralWalletCache {
+    /// Address -> BehavioralWallet
+    wallets: Arc<DashMap<String, BehavioralWallet>>,
+    /// Timestamp of last scan.
+    last_scan: Arc<RwLock<Option<DateTime<Utc>>>>,
+}
+
+impl Default for BehavioralWalletCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BehavioralWalletCache {
+    pub fn new() -> Self {
+        Self {
+            wallets: Arc::new(DashMap::new()),
+            last_scan: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    /// Replace the entire cache with new scan results.
+    pub async fn update(&self, new_wallets: Vec<BehavioralWallet>) {
+        self.wallets.clear();
+        for w in new_wallets {
+            self.wallets.insert(w.address.clone(), w);
+        }
+        *self.last_scan.write().await = Some(Utc::now());
+    }
+
+    /// Get a wallet's tier and score, if known.
+    pub fn get(&self, address: &str) -> Option<(BehavioralTier, f64)> {
+        self.wallets.get(address).map(|w| (w.tier, w.score))
+    }
+
+    /// Check if a wallet is in the cache with SOVEREIGN or higher tier.
+    pub fn is_high_tier(&self, address: &str) -> bool {
+        self.wallets.get(address).map(|w| {
+            matches!(w.tier, BehavioralTier::Precognitive | BehavioralTier::Sovereign)
+        }).unwrap_or(false)
+    }
+
+    /// Get all wallets at or above the given tier.
+    pub fn get_by_tier(&self, min_tier: BehavioralTier) -> Vec<BehavioralWallet> {
+        self.wallets.iter()
+            .filter(|w| w.tier >= min_tier)
+            .map(|r| r.value().clone())
+            .collect()
+    }
+
+    /// Get count of wallets per tier.
+    pub fn tier_counts(&self) -> (usize, usize, usize, usize) {
+        let (mut prec, mut sov, mut em, mut noise) = (0, 0, 0, 0);
+        for w in self.wallets.iter() {
+            match w.tier {
+                BehavioralTier::Precognitive => prec += 1,
+                BehavioralTier::Sovereign => sov += 1,
+                BehavioralTier::Emerging => em += 1,
+                BehavioralTier::Noise => noise += 1,
+            }
+        }
+        (prec, sov, em, noise)
+    }
+
+    /// Total wallets in cache.
+    pub fn len(&self) -> usize {
+        self.wallets.len()
+    }
+
+    /// When was the last scan run?
+    pub async fn last_scan(&self) -> Option<DateTime<Utc>> {
+        *self.last_scan.read().await
+    }
+}
+
+impl PartialOrd for BehavioralTier {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for BehavioralTier {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let rank = |t: &Self| match t {
+            BehavioralTier::Noise => 0,
+            BehavioralTier::Emerging => 1,
+            BehavioralTier::Sovereign => 2,
+            BehavioralTier::Precognitive => 3,
+        };
+        rank(self).cmp(&rank(other))
+    }
+}
+
+// ─── Behavioral Signal ───────────────────────────────────────────────────────
+
+/// Signal that scores tokens based on behavioral intelligence:
+/// whether SOVEREIGN/PRECOGNITIVE wallets (discovered by the periodic
+/// behavioral scan) have recently traded the token.
+///
+/// Instead of relying on rate-limited Helius wallet watcher, this signal
+/// uses GMGN top-trader data to detect smart money interest at evaluation time.
+pub struct BehavioralSignal {
+    name: String,
+    cache: Arc<BehavioralWalletCache>,
+    /// Token -> (wallets that traded it, timestamp of detection).
+    token_wallets: Arc<DashMap<String, Vec<(String, BehavioralTier, DateTime<Utc>)>>>,
+    /// Path to gmgn-cli.
+    gmgn_cli_path: String,
+    #[allow(dead_code)]
+    chain: Chain,
+}
+
+impl BehavioralSignal {
+    pub fn new(cache: Arc<BehavioralWalletCache>, chain: Chain) -> Self {
+        Self {
+            name: "behavioral".to_string(),
+            cache,
+            token_wallets: Arc::new(DashMap::new()),
+            gmgn_cli_path: solagent_data::gmgn::GMGN_CLI_DEFAULT_PATH.to_string(),
+            chain,
+        }
+    }
+
+    /// Check if any high-tier behavioral wallets are among the top traders
+    /// for a given token via GMGN. Call this during evaluation.
+    pub async fn check_gmgn_traders(&self, token_address: &str) -> Vec<(String, BehavioralTier)> {
+        let output = match tokio::time::timeout(
+            Duration::from_secs(15),
+            tokio::process::Command::new(&self.gmgn_cli_path)
+                .args([
+                    "token", "traders",
+                    "--chain", "sol",
+                    "--address", token_address,
+                    "--tag", "smart_degen",
+                    "--order-by", "profit",
+                    "--direction", "desc",
+                    "--limit", "20",
+                    "--raw",
+                ])
+                .output(),
+        ).await {
+            Ok(Ok(o)) => o,
+            _ => return Vec::new(),
+        };
+
+        if !output.status.success() {
+            return Vec::new();
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut matches = Vec::new();
+
+        // GMGN returns { "list": [...] }
+        if let Ok(data) = serde_json::from_str::<serde_json::Value>(&stdout) {
+            if let Some(list) = data.get("list").and_then(|l| l.as_array()) {
+                for item in list {
+                    let addr = item.get("address")
+                        .and_then(|a| a.as_str())
+                        .unwrap_or("");
+                    if !addr.is_empty() {
+                        if let Some((tier, _score)) = self.cache.get(addr) {
+                            if tier >= BehavioralTier::Sovereign {
+                                matches.push((addr.to_string(), tier));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !matches.is_empty() {
+            let now = Utc::now();
+            let records: Vec<(String, BehavioralTier, DateTime<Utc>)> = matches.iter()
+                .map(|(a, t)| (a.clone(), *t, now))
+                .collect();
+            self.token_wallets.insert(token_address.to_string(), records);
+            tracing::info!(
+                token = &token_address[..token_address.len().min(12)],
+                count = matches.len(),
+                "Behavioral signal: high-tier wallets detected in GMGN traders"
+            );
+        }
+
+        matches
+    }
+}
+
+impl Strategy for BehavioralSignal {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    async fn evaluate(&self, token: &TokenInfo) -> Result<Signal> {
+        // Check cached detections first (from prior GMGN lookups).
+        let cached = self.token_wallets.get(&token.address).map(|r| {
+            r.value().clone()
+        }).unwrap_or_default();
+
+        let score = if cached.is_empty() {
+            0
+        } else {
+            // Score based on highest tier detected.
+            let best_tier = cached.iter()
+                .map(|(_, t, _)| *t)
+                .max()
+                .unwrap_or(BehavioralTier::Noise);
+            let count = cached.len();
+
+            let base = match best_tier {
+                BehavioralTier::Precognitive => 85,
+                BehavioralTier::Sovereign => 70,
+                BehavioralTier::Emerging => 45,
+                BehavioralTier::Noise => 0,
+            };
+
+            // Bonus for multiple wallets (consensus).
+            let consensus_bonus = if count >= 3 { 15 } else if count >= 2 { 8 } else { 0 };
+            (base + consensus_bonus).min(100) as u8
+        };
+
+        let reasoning = if cached.is_empty() {
+            "No behavioral wallets detected".to_string()
+        } else {
+            let tiers: Vec<String> = cached.iter()
+                .map(|(_, t, _)| format!("{t}"))
+                .collect();
+            format!("Behavioral: {}/100 ({} high-tier wallets: {})", score, cached.len(), tiers.join(", "))
+        };
+
+        Ok(Signal::new(
+            token.address.clone(),
+            token.chain,
+            &self.name,
+            score,
+            0.8,
+            reasoning,
+        ))
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────

@@ -68,10 +68,12 @@ solagent --config config/local.toml config show
 - Daily loss limit: $15 (halts trading)
 - Drawdown circuit breaker: 15% from peak (halts agent)
 - Stop loss: -15% per position
-- Take profit: +40% per position
-- Trailing stop: -8% from peak
-- Safety score threshold: 70/100 minimum to trade
+- Take profit: +300% per position
+- Trailing stop: -15% from peak
+- Safety score threshold: 60/100 minimum to trade
 - Cooldown: 5 min after any loss
+- Confluence progressive floor: 25 (minimum threshold after progressive lowering)
+- Position sizing: dynamic by confluence score + win rate, capped by available SOL cash (not total portfolio)
 
 ## Offline Resilience
 Every position opened by the agent gets automatic SL/TP/trailing stop levels persisted to SQLite. The monitor loop checks all open positions every 60 seconds against current prices (fetched from Birdeye). If the agent crashes or the machine reboots:
@@ -124,13 +126,13 @@ GMGN provides the smart money wallet data that feeds the Whale Consensus signal.
 - These events feed the WhaleConsensusSignal
 
 ## Signal Engine
-1. **Whale Consensus** (weight 0.30) — Multiple smart money wallets buy same token within 30 min
+1. **Whale Consensus** (weight 0.30) — Multiple smart money wallets buy same token within 1 hour
 2. **Accumulation** (weight 0.20) — Holder growth vs flat price = accumulation phase
 3. **Launch Momentum** (weight 0.20) — New token with rapid holder + volume growth
 4. **Volume Spike** (weight 0.15) — 3x+ average volume in rolling window
 5. **Social** (weight 0.15) — Twitter mention velocity + engagement
 
-Confluence threshold: 65/100 weighted composite required to trigger evaluation.
+Confluence threshold: 35/100 weighted composite required to trigger evaluation (progressive floor: 25).
 
 ## Safety Checks (8 per token)
 1. Mint authority revoked (15 pts)
