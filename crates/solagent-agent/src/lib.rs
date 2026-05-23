@@ -2000,4 +2000,167 @@ mod tests {
             "effective_threshold should be 25.0 when both at floor, got {effective}"
         );
     }
+
+    // ─── SOL Balance Caching Tests (VAL-STAB-008, VAL-STAB-009, VAL-STAB-010) ──
+
+    /// VAL-STAB-008: SOL balance returns cached value on RPC failure.
+    ///
+    /// When `get_sol_balance()` encounters an RPC failure (returns None), and a
+    /// previous successful fetch has cached a non-zero balance, the method must
+    /// return the cached value instead of 0.0.
+    #[tokio::test]
+    async fn test_sol_balance_returns_cached_on_rpc_failure() {
+        let event_bus = EventBus::new(16);
+        let agent = Agent::new_minimal(AgentConfig::default(), event_bus);
+
+        // Simulate a prior successful fetch by directly populating the cache.
+        *agent.cached_sol_balance.write().await = 0.5; // 0.5 SOL cached
+
+        // The minimal agent has no Solana provider configured, so exec.get_sol_balance()
+        // returns None (RPC failure path).
+        let balance = agent.get_sol_balance().await;
+
+        // Should return the cached value, not 0.0.
+        assert!(
+            (balance - 0.5).abs() < f64::EPSILON,
+            "get_sol_balance() should return cached 0.5 on RPC failure, got {balance}"
+        );
+
+        // Cache should remain unchanged (not overwritten to 0.0).
+        let cached = *agent.cached_sol_balance.read().await;
+        assert!(
+            (cached - 0.5).abs() < f64::EPSILON,
+            "cached_sol_balance should remain 0.5 after RPC failure, got {cached}"
+        );
+    }
+
+    /// VAL-STAB-009: SOL balance returns 0 only when no cached value exists.
+    ///
+    /// If the very first get_sol_balance() call fails (no prior successful fetch),
+    /// the cached value is 0.0 (the initialization default). The method must return
+    /// 0.0 and log a distinct warning indicating no cache is available.
+    #[tokio::test]
+    async fn test_sol_balance_returns_zero_when_no_cache() {
+        let event_bus = EventBus::new(16);
+        let agent = Agent::new_minimal(AgentConfig::default(), event_bus);
+
+        // Default cached_sol_balance is 0.0 (no prior fetch).
+        let cached_before = *agent.cached_sol_balance.read().await;
+        assert!(
+            (cached_before - 0.0).abs() < f64::EPSILON,
+            "cached_sol_balance should start at 0.0, got {cached_before}"
+        );
+
+        // RPC failure path (no provider in minimal agent).
+        let balance = agent.get_sol_balance().await;
+
+        // Should return 0.0 (no cache available).
+        assert!(
+            (balance - 0.0).abs() < f64::EPSILON,
+            "get_sol_balance() should return 0.0 when no cache exists, got {balance}"
+        );
+
+        // Cache should still be 0.0 (not set to anything else on failure).
+        let cached_after = *agent.cached_sol_balance.read().await;
+        assert!(
+            (cached_after - 0.0).abs() < f64::EPSILON,
+            "cached_sol_balance should still be 0.0 after first failure, got {cached_after}"
+        );
+    }
+
+    /// VAL-STAB-010: Cached SOL balance persists across multiple RPC failures.
+    ///
+    /// After caching a value on a simulated successful fetch, three consecutive
+    /// RPC failures must all return the same cached value. The cached value must
+    /// not decay, reset to 0, or change between failures.
+    #[tokio::test]
+    async fn test_sol_balance_cache_persists_across_multiple_failures() {
+        let event_bus = EventBus::new(16);
+        let agent = Agent::new_minimal(AgentConfig::default(), event_bus);
+
+        // Simulate a successful fetch populating the cache.
+        let cached_value = 1.234;
+        *agent.cached_sol_balance.write().await = cached_value;
+
+        // Simulate 3+ consecutive RPC failures.
+        for attempt in 1..=5 {
+            let balance = agent.get_sol_balance().await;
+            assert!(
+                (balance - cached_value).abs() < f64::EPSILON,
+                "Attempt {attempt}: get_sol_balance() should return cached {cached_value}, got {balance}"
+            );
+
+            // Verify cache was NOT overwritten.
+            let cached = *agent.cached_sol_balance.read().await;
+            assert!(
+                (cached - cached_value).abs() < f64::EPSILON,
+                "Attempt {attempt}: cached_sol_balance should remain {cached_value}, got {cached}"
+            );
+        }
+    }
+
+    /// Verify that cached value does not decay or change between failures.
+    /// This tests the "no intermediate code path overwrites cached_sol_balance
+    /// to 0.0 on failure" invariant more explicitly.
+    #[tokio::test]
+    async fn test_sol_balance_cache_constant_across_failures() {
+        let event_bus = EventBus::new(16);
+        let agent = Agent::new_minimal(AgentConfig::default(), event_bus);
+
+        // Set a known cache value.
+        *agent.cached_sol_balance.write().await = 2.718;
+
+        // Read the cache before any get_sol_balance() call.
+        let before = *agent.cached_sol_balance.read().await;
+
+        // Multiple failures.
+        for _ in 0..3 {
+            let _ = agent.get_sol_balance().await;
+            let after = *agent.cached_sol_balance.read().await;
+            assert!(
+                (after - before).abs() < f64::EPSILON,
+                "cached_sol_balance changed from {before} to {after} — must remain constant across failures"
+            );
+        }
+    }
+
+    /// Verify the distinction between "first failure with no cache" vs
+    /// "subsequent failure with cache" — the cached value enables the agent
+    /// to avoid reporting available_cash=0 when a balance was previously fetched.
+    #[tokio::test]
+    async fn test_sol_balance_caching_prevents_zero_available_cash() {
+        let event_bus = EventBus::new(16);
+        let agent = Agent::new_minimal(AgentConfig::default(), event_bus);
+
+        // Scenario: First fetch succeeds (cache gets populated).
+        *agent.cached_sol_balance.write().await = 0.05; // 0.05 SOL
+
+        // Subsequent fetch fails — should still return cached value.
+        let balance = agent.get_sol_balance().await;
+        assert!(
+            balance > 0.0,
+            "SOL balance should be > 0 after RPC failure with cached value, got {balance}"
+        );
+
+        // This would represent available_cash = balance * sol_price.
+        // The key assertion: no "available_cash=0" when cached balance exists.
+        let available_cash = balance * 150.0; // assume SOL = $150
+        assert!(
+            available_cash > 0.0,
+            "available_cash should be > 0 with cached balance, got {available_cash}"
+        );
+    }
+
+    /// Verify cache is initialized to 0.0 on new agent creation.
+    #[tokio::test]
+    async fn test_sol_balance_cache_initialized_to_zero() {
+        let event_bus = EventBus::new(16);
+        let agent = Agent::new_minimal(AgentConfig::default(), event_bus);
+
+        let cached = *agent.cached_sol_balance.read().await;
+        assert!(
+            (cached - 0.0).abs() < f64::EPSILON,
+            "cached_sol_balance should be initialized to 0.0, got {cached}"
+        );
+    }
 }
