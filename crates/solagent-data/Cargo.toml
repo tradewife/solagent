@@ -16,3 +16,5 @@ governor = "0.10"
 urlencoding = "2"
 dashmap = { workspace = true }
 helius = { workspace = true }
+tokio-stream = "0.1"
+futures-util = "0.3"

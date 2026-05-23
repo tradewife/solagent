@@ -236,8 +236,8 @@ pub struct AgentSubsystems {
     pub progressive_threshold_step: f64,
     /// Progressive threshold: minimum floor (never go below).
     pub progressive_threshold_floor: f64,
-    /// Wallet watcher for detecting smart money trades (Helius-backed).
-    pub watcher: Option<solagent_data::WalletWatcher>,
+    /// Wallet watcher for detecting smart money trades (WS-first with polling fallback).
+    pub watcher: Option<solagent_data::WsWatcher>,
     /// GMGN client for fetching holder count data.
     pub gmgn: solagent_data::GmgnClient,
     /// Runtime-configurable parameters (weights, threshold, risk limits)
@@ -1174,7 +1174,7 @@ impl Agent {
             let handle = tokio::spawn(async move {
                 watcher.run(shutdown_rx).await;
             });
-            tracing::info!("Wallet watcher background task started");
+            tracing::info!("WebSocket wallet watcher background task started");
             Some((handle, shutdown_tx))
         } else {
             tracing::info!("No wallet watcher configured -- whale consensus will rely on other signals");

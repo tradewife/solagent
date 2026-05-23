@@ -1126,9 +1126,10 @@ async fn main() -> Result<()> {
                     solagent_data::HeliusSdkClient::new(&helius_key)
                         .expect("Failed to create Helius SDK client")
                 );
-                let watcher_config = solagent_data::WatcherConfig::default();
-                let watcher = solagent_data::WalletWatcher::new(helius.clone(), event_bus.clone(), watcher_config);
-                tracing::info!("Helius SDK client initialized, wallet watcher configured");
+                // Use WebSocket-first watcher with polling fallback.
+                let ws_config = solagent_data::WsWatcherConfig::default();
+                let watcher = solagent_data::WsWatcher::new(helius.clone(), event_bus.clone(), ws_config);
+                tracing::info!("Helius SDK client initialized, WebSocket wallet watcher configured");
                 (Some(helius), Some(watcher), true)
             } else {
                 tracing::info!("No Helius API key -- wallet watcher disabled, DAS API unavailable");

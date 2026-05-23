@@ -17,7 +17,7 @@ use tokio::time::{Duration, interval};
 
 use crate::helius::{HeliusSdkClient, ParsedTransaction, SwapEvent};
 
-type LastSeenMap = DashMap<String, i64>;
+pub type LastSeenMap = DashMap<String, i64>;
 
 /// Configuration for the wallet watcher.
 #[derive(Debug, Clone)]
@@ -113,6 +113,20 @@ impl WalletWatcher {
         self.watched.read().await.len()
     }
 
+    /// Returns the watcher configuration.
+    pub fn config(&self) -> &WatcherConfig {
+        &self.config
+    }
+
+    /// Execute a single polling cycle over all watched wallets.
+    ///
+    /// Used by the WebSocket watcher's polling fallback when the WS connection
+    /// is down. Returns `Ok(())` when the cycle completes (even with per-wallet
+    /// errors, which are logged individually).
+    pub async fn poll_cycle(&self) -> Result<()> {
+        self.poll_all().await
+    }
+
     /// Run the polling loop until `shutdown` fires.
     pub async fn run(&self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
         let mut ticker = interval(self.config.poll_interval);
@@ -177,7 +191,7 @@ impl WalletWatcher {
             }
             max_ts = max_ts.max(ts);
 
-            for event in self.extract_events(tx, wallet) {
+            for event in Self::extract_events_static(tx, wallet, self.config.min_value_usd) {
                 self.event_bus.publish(event);
             }
         }
@@ -189,13 +203,16 @@ impl WalletWatcher {
         Ok(())
     }
 
-    /// Extract WalletBuy/WalletSell events from a parsed transaction.
+    /// Extract WalletBuy/WalletSell events from a parsed transaction (static version).
+    ///
+    /// This is a static method that can be called without a `WalletWatcher` instance,
+    /// allowing reuse by the WebSocket watcher.
     ///
     /// Strategy (in order of reliability):
     /// 1. `events.swap` -- authoritative structured swap data from Helius
     /// 2. `tokenTransfers` -- SPL token movements, cross-referenced with nativeTransfers
     /// 3. Skip non-swap transactions
-    fn extract_events(&self, tx: &ParsedTransaction, wallet: &WatchedWallet) -> Vec<Event> {
+    pub fn extract_events_static(tx: &ParsedTransaction, wallet: &WatchedWallet, min_value_usd: f64) -> Vec<Event> {
         let ts = tx
             .timestamp
             .and_then(|t| DateTime::from_timestamp(t, 0))
@@ -204,7 +221,7 @@ impl WalletWatcher {
         // Strategy 1: Use events.swap if available.
         if let Some(events) = &tx.events
             && let Some(swap) = &events.swap
-            && let Some(details) = self.parse_swap_event(swap, &wallet.address)
+            && let Some(details) = Self::parse_swap_event_static(swap, &wallet.address)
         {
             let amount_sol = details.sol_lamports as f64 / 1_000_000_000.0;
             let event = if details.is_buy {
@@ -241,7 +258,7 @@ impl WalletWatcher {
                 }
 
                 // Check if there's a corresponding native transfer indicating SOL movement.
-                let sol_amount = self.find_matching_native_transfer(
+                let sol_amount = Self::find_matching_native_transfer_static(
                     tx,
                     &wallet.address,
                     is_sender,
@@ -257,7 +274,7 @@ impl WalletWatcher {
                     continue;
                 };
 
-                if amount_sol < self.config.min_value_usd {
+                if amount_sol < min_value_usd {
                     continue;
                 }
 
@@ -294,7 +311,7 @@ impl WalletWatcher {
     /// - `nativeOutput`: SOL received (sell)
     /// - `tokenInputs`: tokens sent in (sell) -- has mint + userAccount
     /// - `tokenOutputs`: tokens received (buy) -- has mint + userAccount
-    fn parse_swap_event(&self, swap: &SwapEvent, wallet_address: &str) -> Option<SwapDetails> {
+    fn parse_swap_event_static(swap: &SwapEvent, wallet_address: &str) -> Option<SwapDetails> {
         // Check if wallet sent SOL (buy) or received SOL (sell).
         let sent_sol = swap.native_input.as_ref().and_then(|n| {
             if n.account == wallet_address {
@@ -369,8 +386,7 @@ impl WalletWatcher {
     ///
     /// For buys (wallet sending SOL): look for nativeTransfers where wallet is from.
     /// For sells (wallet receiving SOL): look for nativeTransfers where wallet is to.
-    fn find_matching_native_transfer(
-        &self,
+    fn find_matching_native_transfer_static(
         tx: &ParsedTransaction,
         wallet_address: &str,
         is_buy: bool,

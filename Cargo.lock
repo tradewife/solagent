@@ -5885,6 +5885,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "dashmap 6.2.1",
+ "futures-util",
  "governor 0.10.4",
  "helius",
  "reqwest 0.12.28",
@@ -5892,6 +5893,7 @@ dependencies = [
  "serde_json",
  "solagent-core",
  "tokio",
+ "tokio-stream",
  "tracing",
  "urlencoding",
 ]
