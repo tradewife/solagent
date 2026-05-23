@@ -50,6 +50,8 @@ pub struct SolanaProvider {
     current_rpc: RwLock<usize>,
     keypair: Arc<Keypair>,
     commitment: CommitmentConfig,
+    /// Optional Helius SDK client for DAS API token balance fetching.
+    helius_client: RwLock<Option<Arc<solagent_data::HeliusSdkClient>>>,
 }
 
 impl SolanaProvider {
@@ -68,7 +70,13 @@ impl SolanaProvider {
             current_rpc: RwLock::new(0),
             keypair: Arc::new(keypair),
             commitment,
+            helius_client: RwLock::new(None),
         })
+    }
+
+    /// Set the Helius SDK client for DAS API token balance fetching.
+    pub async fn set_helius_client(&self, client: Arc<solagent_data::HeliusSdkClient>) {
+        *self.helius_client.write().await = Some(client);
     }
 
     /// Get the next RPC client in the pool (round-robin).
@@ -170,18 +178,42 @@ impl SolanaProvider {
     }
 
     /// List all SPL token accounts owned by this wallet, returning (mint_address, raw_amount, decimals).
-    /// Falls back from Helius to public RPC on failure.
+    ///
+    /// Strategy:
+    /// 1. Try Helius DAS API `getAssetsByOwner` (fastest, richest data).
+    /// 2. Fall back to standard RPC `getTokenAccountsByOwner` if DAS fails.
+    ///
+    /// No `spl-token` CLI invocations — fully SDK-based.
     pub async fn get_all_token_balances(&self) -> Result<Vec<(String, u64, u8)>> {
-        match self.get_all_token_balances_inner().await {
-            Ok(balances) => Ok(balances),
-            Err(e) => {
-                tracing::warn!(error = %e, "Helius token balance fetch failed, trying public RPC");
-                self.get_all_token_balances_public().await
+        // Strategy 1: DAS API via Helius SDK.
+        let helius_guard = self.helius_client.read().await;
+        if let Some(ref helius) = *helius_guard {
+            match helius.get_token_balances_das(&self.pubkeys().to_string()).await {
+                Ok(balances) => {
+                    tracing::debug!(
+                        count = balances.len(),
+                        "Token balances fetched via DAS API"
+                    );
+                    return Ok(balances);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "DAS API token balance fetch failed, falling back to RPC"
+                    );
+                    // Fall through to RPC strategy below.
+                }
             }
         }
+
+        // Strategy 2: Standard Solana RPC getTokenAccountsByOwner.
+        self.get_all_token_balances_rpc().await
     }
 
-    async fn get_all_token_balances_inner(&self) -> Result<Vec<(String, u64, u8)>> {
+    /// Fetch token balances via standard Solana RPC `getTokenAccountsByOwner`.
+    ///
+    /// This is the fallback when the DAS API is unavailable or no Helius client is configured.
+    async fn get_all_token_balances_rpc(&self) -> Result<Vec<(String, u64, u8)>> {
         let address = self.pubkeys();
         let rpc = self.get_rpc().await;
         // Use ProgramId filter for the SPL Token program to get all token accounts.
@@ -203,9 +235,13 @@ impl SolanaProvider {
                     .and_then(|t| t.get("amount"))
                     .and_then(|s| s.as_str())
                     .and_then(|s| s.parse::<u64>().ok());
-                if let (Some(mint), Some(amount)) = (mint, amount) {
+                let decimals = data_val.get("tokenAmount")
+                    .and_then(|t| t.get("decimals"))
+                    .and_then(|d| d.as_u64())
+                    .map(|d| d as u8);
+                if let (Some(mint), Some(amount), Some(decimals)) = (mint, amount, decimals) {
                     if amount > 0 {
-                        balances.push((mint, amount, 6));  // default 6 decimals for parsed path
+                        balances.push((mint, amount, decimals));
                     }
                     continue;
                 }
@@ -230,72 +266,6 @@ impl SolanaProvider {
             });
         }
 
-        Ok(balances)
-    }
-
-    /// Public RPC fallback for token balance fetching.
-    /// Uses `spl-token accounts` CLI, which correctly discovers Associated Token Accounts
-    /// (ATAs). The `ProgramId` filter used by the Solana RPC `getTokenAccountsByOwner` only
-    /// returns accounts owned directly by the wallet's keypair — not ATAs owned by the
-    /// ATA program `ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL`.
-    async fn get_all_token_balances_public(&self) -> Result<Vec<(String, u64, u8)>> {
-        let pubkey = self.keypair.pubkey().to_string();
-        tracing::info!(wallet = %pubkey, "Fetching token balances via spl-token CLI");
-
-        let output = tokio::process::Command::new("spl-token")
-            .args([
-                "accounts",
-                "--owner",
-                &pubkey,
-                "--url",
-                "https://api.mainnet-beta.solana.com",
-                "--output",
-                "json-compact",
-            ])
-            .output()
-            .await?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("spl-token CLI failed: {stderr}");
-        }
-
-        #[derive(::serde::Deserialize)]
-        struct SplTokenAccount {
-            mint: String,
-            #[serde(rename = "tokenAmount")]
-            token_amount: SplTokenAmount,
-        }
-        #[derive(::serde::Deserialize)]
-        struct SplTokenAmount {
-            #[allow(dead_code)]
-            amount: String,
-            #[allow(dead_code)]
-            decimals: u8,
-            #[serde(rename = "uiAmount")]
-            ui_amount: f64,
-        }
-        #[derive(::serde::Deserialize)]
-        struct SplTokenAccountsOutput {
-            accounts: Vec<SplTokenAccount>,
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let parsed: SplTokenAccountsOutput = serde_json::from_str(&stdout)?;
-
-        let mut balances = Vec::new();
-        for account in parsed.accounts {
-            if account.token_amount.ui_amount > 0.0 {
-                let raw = (account.token_amount.ui_amount * 10f64.powi(account.token_amount.decimals as i32)) as u64;
-                balances.push((account.mint, raw, account.token_amount.decimals));
-            }
-        }
-
-        tracing::info!(
-            wallet = %pubkey,
-            count = balances.len(),
-            "spl-token CLI returned token balances"
-        );
         Ok(balances)
     }
 

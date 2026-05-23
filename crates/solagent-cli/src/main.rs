@@ -1121,16 +1121,24 @@ async fn main() -> Result<()> {
             let helius_key = config.as_ref()
                 .map(|c| c.chains.solana.helius_api_key.trim().to_string())
                 .unwrap_or_default();
-            let (watcher, wallet_registry) = if !helius_key.is_empty() {
-                let helius = std::sync::Arc::new(solagent_data::HeliusClient::new_with_key(helius_key));
+            let (helius_sdk, watcher, wallet_registry) = if !helius_key.is_empty() {
+                let helius = std::sync::Arc::new(
+                    solagent_data::HeliusSdkClient::new(&helius_key)
+                        .expect("Failed to create Helius SDK client")
+                );
                 let watcher_config = solagent_data::WatcherConfig::default();
-                let watcher = solagent_data::WalletWatcher::new(helius, event_bus.clone(), watcher_config);
-                tracing::info!("Helius wallet watcher configured");
-                (Some(watcher), true)
+                let watcher = solagent_data::WalletWatcher::new(helius.clone(), event_bus.clone(), watcher_config);
+                tracing::info!("Helius SDK client initialized, wallet watcher configured");
+                (Some(helius), Some(watcher), true)
             } else {
-                tracing::info!("No Helius API key -- wallet watcher disabled");
-                (None, false)
+                tracing::info!("No Helius API key -- wallet watcher disabled, DAS API unavailable");
+                (None, None, false)
             };
+
+            // Wire Helius SDK client to execution engine for DAS API token balances.
+            if let Some(ref helius) = helius_sdk {
+                exec.set_helius_client(helius.clone()).await;
+            }
 
             let subsystems = {
                 // Extract risk values for RuntimeConfig before risk_config is

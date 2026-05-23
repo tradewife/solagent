@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{Duration, interval};
 
-use crate::helius::{HeliusClient, ParsedTransaction, SwapEvent};
+use crate::helius::{HeliusSdkClient, ParsedTransaction, SwapEvent};
 
 type LastSeenMap = DashMap<String, i64>;
 
@@ -64,7 +64,7 @@ struct SwapDetails {
 /// Helius-based wallet watcher that polls for new transactions and emits events.
 #[derive(Clone)]
 pub struct WalletWatcher {
-    helius: Arc<HeliusClient>,
+    helius: Arc<HeliusSdkClient>,
     event_bus: EventBus,
     config: WatcherConfig,
     watched: Arc<RwLock<Vec<WatchedWallet>>>,
@@ -72,7 +72,7 @@ pub struct WalletWatcher {
 }
 
 impl WalletWatcher {
-    pub fn new(helius: Arc<HeliusClient>, event_bus: EventBus, config: WatcherConfig) -> Self {
+    pub fn new(helius: Arc<HeliusSdkClient>, event_bus: EventBus, config: WatcherConfig) -> Self {
         Self {
             helius,
             event_bus,

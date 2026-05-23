@@ -487,6 +487,14 @@ impl ExecutionEngine {
         self.solana_provider.as_ref().map(|p| p.pubkeys())
     }
 
+    /// Set the Helius SDK client on the Solana provider for DAS API token balance fetching.
+    /// No-op if no Solana provider is configured.
+    pub async fn set_helius_client(&self, client: Arc<solagent_data::HeliusSdkClient>) {
+        if let Some(provider) = &self.solana_provider {
+            provider.set_helius_client(client).await;
+        }
+    }
+
     /// Get all SPL token balances for the wallet (mint_address, raw_amount).
     /// Returns None if the Solana provider is not configured.
     pub async fn get_all_token_balances(&self) -> Option<Vec<(String, u64, u8)>> {

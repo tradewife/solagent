@@ -23,7 +23,7 @@ pub use dexscreener::{
 };
 pub use gmgn::{GmgnClient, GmgnTokenInfo, GMGN_CLI_DEFAULT_PATH};
 pub use helius::{
-    BalancesResponse, HeliusClient, NativeBalanceChange, NativeTransfer, ParsedTransaction,
+    BalancesResponse, HeliusSdkClient, NativeBalanceChange, NativeTransfer, ParsedTransaction,
     SwapEvent, TokenBalance, TokenBalanceChange, TokenTransfer, TransactionEvent,
     WebhookConfig,
 };
