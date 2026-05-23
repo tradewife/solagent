@@ -28,7 +28,9 @@ const WEIGHT_MIN: f64 = 0.05;
 const WEIGHT_MAX: f64 = 0.40;
 
 /// Bounds for confluence threshold.
-const THRESHOLD_MIN: f64 = 5.0;
+/// Minimum 25.0 matches the ABSOLUTE_FLOOR in lib.rs — the agent must never
+/// accept signals below this quality level.
+const THRESHOLD_MIN: f64 = 25.0;
 const THRESHOLD_MAX: f64 = 80.0;
 
 /// Bounds for max position size (USD).
@@ -558,7 +560,7 @@ mod tests {
     async fn test_auto_tuner_bounds_enforcement() {
         let portfolio = test_portfolio().await;
 
-        // ─── Lower bound: start at 7, win_rate < 0.30 → try -5 to get 2, clamp to 5.
+        // ─── Lower bound: start at 27, win_rate < 0.30 → try -5 to get 22, clamp to 25.
         for i in 0..5 {
             record_completed_trade(
                 &portfolio,
@@ -573,7 +575,7 @@ mod tests {
 
         let config = RuntimeConfig::new(
             SignalWeights::default(),
-            7.0,  // start near lower bound
+            27.0,  // start near lower bound
             15.0,
             3,
             15.0,
@@ -597,8 +599,8 @@ mod tests {
             threshold >= THRESHOLD_MIN,
             "Threshold should be clamped to min: {threshold} < {THRESHOLD_MIN}"
         );
-        assert!((threshold - THRESHOLD_MIN).abs() < f64::EPSILON || threshold == 7.0,
-            "Threshold should be at min=5 after lowering from 7, got {threshold}");
+        assert!((threshold - THRESHOLD_MIN).abs() < f64::EPSILON,
+            "Threshold should be at min={THRESHOLD_MIN} after lowering from 27, got {threshold}");
 
         // ─── Upper bound: start at 78, win_rate > 0.60 → try +5 to get 83, clamp to 80.
         // Need a new portfolio and tuner for this direction.

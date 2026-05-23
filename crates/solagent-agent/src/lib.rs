@@ -22,6 +22,11 @@ use auto_tuner::AutoTuner;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
+/// Absolute floor for the effective confluence threshold.
+/// The agent will never accept a signal with confluence below this value,
+/// regardless of auto-tuner adjustments or progressive threshold lowering.
+const ABSOLUTE_FLOOR: f64 = 25.0;
+
 // ─── Agent State Machine ─────────────────────────────────────────────────────
 
 /// Agent states in the trading lifecycle.
@@ -135,9 +140,9 @@ impl ProgressiveThreshold {
         }
     }
 
-    /// Create with default values: step=5, floor=20, failures=50.
+    /// Create with default values: step=5, floor=25, failures=50.
     pub fn with_original(original: f64) -> Self {
-        Self::new(original, 20.0, 5.0, 50)
+        Self::new(original, 25.0, 5.0, 50)
     }
 
     /// Create from config values.
@@ -361,7 +366,7 @@ impl Agent {
                 confluence_threshold: threshold,
                 progressive_threshold_failures: 50,
                 progressive_threshold_step: 5.0,
-                progressive_threshold_floor: 20.0,
+                progressive_threshold_floor: 25.0,
                 watcher: None,
                 gmgn: solagent_data::GmgnClient::new(),
                 runtime_config: runtime_config.clone(),
@@ -379,7 +384,7 @@ impl Agent {
             position_exits: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             eval_cooldown: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             progressive_threshold: Arc::new(tokio::sync::RwLock::new(
-                ProgressiveThreshold::from_config(threshold, 50, 5.0, 20.0),
+                ProgressiveThreshold::from_config(threshold, 50, 5.0, 25.0),
             )),
             cached_sol_balance: Arc::new(tokio::sync::RwLock::new(0.0)),
             consecutive_scan_failures: Arc::new(AtomicU32::new(0)),
@@ -590,12 +595,13 @@ impl Agent {
         let confluence_result = confluence.score(token).await?;
         drop(confluence);
 
-        // Effective threshold = min(runtime threshold, progressive threshold).
-        // This ensures the progressive safety net kicks in even if the runtime
-        // threshold is set higher.
+        // Effective threshold = max(ABSOLUTE_FLOOR, min(runtime threshold, progressive threshold)).
+        // The min() ensures the progressive safety net kicks in when the runtime
+        // threshold is set higher. The max(ABSOLUTE_FLOOR, ...) ensures the agent
+        // never accepts signals below the absolute quality floor (25.0).
         let runtime_threshold = *self.subsystems.runtime_config.confluence_threshold.read().await;
         let progressive = self.progressive_threshold.read().await.current();
-        let effective_threshold = runtime_threshold.min(progressive);
+        let effective_threshold = ABSOLUTE_FLOOR.max(runtime_threshold.min(progressive));
         let confluence_passed = confluence_result.composite_score as f64 >= effective_threshold;
         let confluence_score = confluence_result.composite_score;
         let signals = confluence_result.signals;
@@ -1411,7 +1417,11 @@ impl Agent {
                                             // Only count confluence failures for progressive threshold lowering.
                                             // Safety failures are orthogonal to confluence quality and should not
                                             // cause the agent to accept weaker signals.
-                                            let effective_threshold = self.progressive_threshold.read().await.current();
+                                            // Use the same effective_threshold formula as evaluate():
+                                            //   max(ABSOLUTE_FLOOR, min(runtime_threshold, progressive))
+                                            let progressive_val = self.progressive_threshold.read().await.current();
+                                            let runtime_val = *self.subsystems.runtime_config.confluence_threshold.read().await;
+                                            let effective_threshold = ABSOLUTE_FLOOR.max(runtime_val.min(progressive_val));
                                             let confluence_passed = result.confluence_score as f64 >= effective_threshold;
                                             if !confluence_passed {
                                                 self.progressive_threshold.write().await.record_failure();
@@ -1559,7 +1569,7 @@ mod tests {
 
     #[test]
     fn test_progressive_threshold_starts_at_original() {
-        let pt = ProgressiveThreshold::new(35.0, 20.0, 5.0, 50);
+        let pt = ProgressiveThreshold::new(35.0, 25.0, 5.0, 50);
         assert!((pt.current() - 35.0).abs() < f64::EPSILON);
         assert!((pt.original() - 35.0).abs() < f64::EPSILON);
         assert!(!pt.is_lowered());
@@ -1574,7 +1584,7 @@ mod tests {
 
     #[test]
     fn test_progressive_threshold_lowers_after_n_failures() {
-        let mut pt = ProgressiveThreshold::new(35.0, 20.0, 5.0, 50);
+        let mut pt = ProgressiveThreshold::new(35.0, 25.0, 5.0, 50);
 
         // Record 49 failures — should NOT lower yet.
         for _ in 0..49 {
@@ -1611,7 +1621,7 @@ mod tests {
 
     #[test]
     fn test_progressive_threshold_resets_on_success() {
-        let mut pt = ProgressiveThreshold::new(35.0, 20.0, 5.0, 50);
+        let mut pt = ProgressiveThreshold::new(35.0, 25.0, 5.0, 50);
 
         // Lower to 30.
         for _ in 0..50 {
@@ -1627,8 +1637,8 @@ mod tests {
 
     #[test]
     fn test_progressive_threshold_stepwise_lowering() {
-        // Start at 35, step=5, floor=20, failures=10 → should lower in steps: 35→30→25→20.
-        let mut pt = ProgressiveThreshold::new(35.0, 20.0, 5.0, 10);
+        // Start at 35, step=5, floor=25, failures=10 → should lower in steps: 35→30→25.
+        let mut pt = ProgressiveThreshold::new(35.0, 25.0, 5.0, 10);
 
         // First lowering: 35→30 after 10 failures.
         for _ in 0..10 {
@@ -1636,29 +1646,23 @@ mod tests {
         }
         assert!((pt.current() - 30.0).abs() < f64::EPSILON, "First lowering: should be 30, got {}", pt.current());
 
-        // Second lowering: 30→25 after another 10 failures.
+        // Second lowering: 30→25 (at floor) after another 10 failures.
         for _ in 0..10 {
             pt.record_failure();
         }
-        assert!((pt.current() - 25.0).abs() < f64::EPSILON, "Second lowering: should be 25, got {}", pt.current());
+        assert!((pt.current() - 25.0).abs() < f64::EPSILON, "Second lowering: should be at floor 25, got {}", pt.current());
 
-        // Third lowering: 25→20 (at floor) after another 10 failures.
-        for _ in 0..10 {
-            pt.record_failure();
-        }
-        assert!((pt.current() - 20.0).abs() < f64::EPSILON, "Third lowering: should be at floor 20, got {}", pt.current());
-
-        // No more lowering possible.
+        // No more lowering possible — already at floor.
         for _ in 0..10 {
             let lowered = pt.record_failure();
             assert!(!lowered, "Should not lower below floor");
         }
-        assert!((pt.current() - 20.0).abs() < f64::EPSILON);
+        assert!((pt.current() - 25.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn test_progressive_threshold_consecutive_counter_resets_on_success() {
-        let mut pt = ProgressiveThreshold::new(35.0, 20.0, 5.0, 50);
+        let mut pt = ProgressiveThreshold::new(35.0, 25.0, 5.0, 50);
 
         // 30 failures.
         for _ in 0..30 {
@@ -1688,13 +1692,13 @@ mod tests {
     #[test]
     fn test_progressive_threshold_exact_floor_step() {
         // When current - step would go below floor, clamp to floor.
-        let mut pt = ProgressiveThreshold::new(23.0, 20.0, 5.0, 10);
+        let mut pt = ProgressiveThreshold::new(27.0, 25.0, 5.0, 10);
 
         for _ in 0..10 {
             pt.record_failure();
         }
-        // 23 - 5 = 18, but floor is 20, so should clamp to 20.
-        assert!((pt.current() - 20.0).abs() < f64::EPSILON, "Should clamp to floor 20, got {}", pt.current());
+        // 27 - 5 = 22, but floor is 25, so should clamp to 25.
+        assert!((pt.current() - 25.0).abs() < f64::EPSILON, "Should clamp to floor 25, got {}", pt.current());
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -1904,5 +1908,96 @@ mod tests {
         // Next failure should start from 1 again.
         let n4 = agent.consecutive_scan_failures.fetch_add(1, Ordering::SeqCst);
         assert_eq!(n4, 0, "After reset, first increment should see 0 again");
+    }
+
+    // ─── Threshold Floor Enforcement Tests ────────────────────────────
+
+    /// Verify that the ABSOLUTE_FLOOR constant is 25.0.
+    #[test]
+    fn test_threshold_floor_enforcement_absolute_floor_is_25() {
+        assert!(
+            (ABSOLUTE_FLOOR - 25.0).abs() < f64::EPSILON,
+            "ABSOLUTE_FLOOR should be 25.0, got {ABSOLUTE_FLOOR}"
+        );
+    }
+
+    /// Verify that the effective_threshold formula (max(ABSOLUTE_FLOOR, min(runtime, progressive)))
+    /// never returns a value below 25.0 regardless of inputs.
+    #[test]
+    fn test_threshold_floor_enforcement_effective_never_below_floor() {
+        // When both runtime and progressive are below floor, effective should be ABSOLUTE_FLOOR.
+        let runtime = 10.0_f64;
+        let progressive = 15.0_f64;
+        let effective = ABSOLUTE_FLOOR.max(runtime.min(progressive));
+        assert!(
+            effective >= ABSOLUTE_FLOOR,
+            "effective_threshold should be >= ABSOLUTE_FLOOR ({ABSOLUTE_FLOOR}), got {effective}"
+        );
+        assert!(
+            (effective - ABSOLUTE_FLOOR).abs() < f64::EPSILON,
+            "effective_threshold should be exactly {ABSOLUTE_FLOOR} when both inputs are below floor, got {effective}"
+        );
+
+        // When runtime is below floor but progressive is above.
+        let runtime2 = 10.0_f64;
+        let progressive2 = 35.0_f64;
+        let effective2 = ABSOLUTE_FLOOR.max(runtime2.min(progressive2));
+        assert!(
+            effective2 >= ABSOLUTE_FLOOR,
+            "effective_threshold should be >= ABSOLUTE_FLOOR, got {effective2}"
+        );
+        assert!(
+            (effective2 - ABSOLUTE_FLOOR).abs() < f64::EPSILON,
+            "effective_threshold should be {ABSOLUTE_FLOOR} when runtime < floor < progressive, got {effective2}"
+        );
+
+        // When both are above floor.
+        let runtime3 = 40.0_f64;
+        let progressive3 = 50.0_f64;
+        let effective3 = ABSOLUTE_FLOOR.max(runtime3.min(progressive3));
+        assert!(
+            (effective3 - 40.0).abs() < f64::EPSILON,
+            "effective_threshold should be min(40, 50) = 40 when both above floor, got {effective3}"
+        );
+    }
+
+    /// Verify the ProgressiveThreshold default floor is 25.0.
+    #[test]
+    fn test_threshold_floor_enforcement_progressive_default_floor() {
+        let pt = ProgressiveThreshold::with_original(35.0);
+        // Lower stepwise until hitting floor.
+        let mut pt_mut = pt;
+        // 35 → 30 → 25 (at floor) with step=5, failures=50
+        for _ in 0..50 { pt_mut.record_failure(); } // 35 → 30
+        assert!((pt_mut.current() - 30.0).abs() < f64::EPSILON);
+        for _ in 0..50 { pt_mut.record_failure(); } // 30 → 25
+        assert!(
+            (pt_mut.current() - 25.0).abs() < f64::EPSILON,
+            "ProgressiveThreshold should stop at floor 25.0, got {}",
+            pt_mut.current()
+        );
+        // Should not lower below 25.
+        for _ in 0..50 {
+            let lowered = pt_mut.record_failure();
+            assert!(!lowered, "Should not lower below floor 25.0");
+        }
+        assert!(
+            (pt_mut.current() - 25.0).abs() < f64::EPSILON,
+            "ProgressiveThreshold should still be at floor 25.0 after more failures, got {}",
+            pt_mut.current()
+        );
+    }
+
+    /// Verify that when ProgressiveThreshold floor is 25.0 and runtime_threshold
+    /// is also 25.0, the effective_threshold is exactly 25.0.
+    #[test]
+    fn test_threshold_floor_enforcement_both_at_floor() {
+        let runtime = 25.0_f64;
+        let progressive = 25.0_f64;
+        let effective = ABSOLUTE_FLOOR.max(runtime.min(progressive));
+        assert!(
+            (effective - 25.0).abs() < f64::EPSILON,
+            "effective_threshold should be 25.0 when both at floor, got {effective}"
+        );
     }
 }

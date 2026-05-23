@@ -1150,7 +1150,7 @@ async fn main() -> Result<()> {
                 confluence_threshold,
                 progressive_threshold_failures: config.as_ref().map(|c| c.strategies.progressive_threshold_failures).unwrap_or(10),
                 progressive_threshold_step: config.as_ref().map(|c| c.strategies.progressive_threshold_step).unwrap_or(5.0),
-                progressive_threshold_floor: config.as_ref().map(|c| c.strategies.progressive_threshold_floor).unwrap_or(10.0),
+                progressive_threshold_floor: config.as_ref().map(|c| c.strategies.progressive_threshold_floor).unwrap_or(25.0),
                 watcher,
                 gmgn: solagent_data::GmgnClient::new(),
                 runtime_config: solagent_signals::RuntimeConfig::new(

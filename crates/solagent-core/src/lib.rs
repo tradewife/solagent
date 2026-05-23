@@ -67,7 +67,7 @@ pub struct StrategiesConfig {
 fn default_min_signal_count() -> usize { 2 }
 fn default_progressive_failures() -> u32 { 10 }
 fn default_progressive_step() -> f64 { 5.0 }
-fn default_progressive_floor() -> f64 { 10.0 }
+fn default_progressive_floor() -> f64 { 25.0 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RiskConfig {
