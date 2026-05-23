@@ -19,6 +19,7 @@ use solagent_core::serde_json;
 use solagent_core::uuid::Uuid;
 use solagent_core::{Chain, EventBus, Event, Signal, TokenInfo};
 use auto_tuner::AutoTuner;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 // ─── Agent State Machine ─────────────────────────────────────────────────────
@@ -264,6 +265,12 @@ pub struct Agent {
     /// Progressive threshold lowering: lowers confluence threshold after
     /// N consecutive failed evaluations, resets on successful trade.
     progressive_threshold: Arc<tokio::sync::RwLock<ProgressiveThreshold>>,
+    /// Last known SOL balance (cached on successful fetch). Avoids defaulting
+    /// to $0 when RPC is temporarily rate-limited.
+    cached_sol_balance: Arc<tokio::sync::RwLock<f64>>,
+    /// Consecutive scan failures counter for exponential backoff.
+    /// Reset to 0 on successful scan. Backoff delay = min(2^n * 2s, 120s).
+    consecutive_scan_failures: Arc<AtomicU32>,
 }
 
 impl Agent {
@@ -308,6 +315,8 @@ impl Agent {
             position_exits: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             eval_cooldown: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             progressive_threshold: Arc::new(tokio::sync::RwLock::new(progressive)),
+            cached_sol_balance: Arc::new(tokio::sync::RwLock::new(0.0)),
+            consecutive_scan_failures: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -372,6 +381,8 @@ impl Agent {
             progressive_threshold: Arc::new(tokio::sync::RwLock::new(
                 ProgressiveThreshold::from_config(threshold, 50, 5.0, 20.0),
             )),
+            cached_sol_balance: Arc::new(tokio::sync::RwLock::new(0.0)),
+            consecutive_scan_failures: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -676,8 +687,10 @@ impl Agent {
             dynamic_size = size,
             confluence = evaluation.confluence_score,
             win_rate = win_rate,
-            "Risk check completed"
-        );
+            available_cash = available_cash,
+            open_positions = positions.len(),
+            "Risk check completed ({})"
+        , report.reason);
 
         Ok(report.passed && risk.can_trade())
     }
@@ -872,18 +885,27 @@ impl Agent {
     }
 
     /// Get SOL balance from the wallet. Queries the Solana RPC for the real balance.
+    /// Caches the last known balance and returns it on RPC failure instead of $0.
     async fn get_sol_balance(&self) -> f64 {
         match self.subsystems.exec.get_sol_balance().await {
             Some(lamports) => {
                 let sol = lamports as f64 / 1_000_000_000.0;
                 tracing::debug!(sol_balance = sol, "SOL balance fetched");
+                *self.cached_sol_balance.write().await = sol;
                 sol
             }
             None => {
-                // If we can't get the balance but the provider is configured,
-                // try using the portfolio value from positions as a fallback.
-                tracing::warn!("Could not fetch SOL balance from RPC — using $0 balance");
-                0.0
+                let cached = *self.cached_sol_balance.read().await;
+                if cached > 0.0 {
+                    tracing::warn!(
+                        cached_sol = cached,
+                        "SOL balance RPC failed — using cached balance"
+                    );
+                    cached
+                } else {
+                    tracing::warn!("SOL balance RPC failed and no cached value — using $0");
+                    0.0
+                }
             }
         }
     }
@@ -1159,10 +1181,10 @@ impl Agent {
             let birdeye_key = std::env::var("BIRDEYE_API_KEY").ok();
             let handle = tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(4 * 3600));
-                interval.tick().await; // Skip first immediate tick
+                interval.tick().await; // Consume the first immediate tick
+                // Run the first scan immediately on startup, then every 4 hours.
                 loop {
-                    interval.tick().await;
-                    tracing::info!("Starting periodic behavioral intelligence scan");
+                    tracing::info!("Starting behavioral intelligence scan");
                     let birdeye = solagent_data::BirdeyeClient::with_api_key(birdeye_key.clone());
                     let scanner = solagent_behavioral::BehavioralScanner::new(birdeye);
                     match scanner.scan().await {
@@ -1183,15 +1205,17 @@ impl Agent {
                                         solagent_signals::BehavioralTier::Noise
                                     }
                                 };
-                                if tier >= solagent_signals::BehavioralTier::Emerging {
-                                    wallets.push(solagent_signals::BehavioralWallet {
-                                        address: w.address.clone(),
-                                        tier,
-                                        score: w.composite_score,
-                                        primary_edge: w.primary_edge.clone(),
-                                        red_flags: w.red_flags.clone(),
-                                    });
-                                }
+                                // Store ALL scored wallets — the match-time filter in
+                                // BehavioralSignal::check_gmgn_traders() handles tier gating.
+                                // Storing NOISE wallets allows future scans to promote them
+                                // as their scores improve across iterations.
+                                wallets.push(solagent_signals::BehavioralWallet {
+                                    address: w.address.clone(),
+                                    tier,
+                                    score: w.composite_score,
+                                    primary_edge: w.primary_edge.clone(),
+                                    red_flags: w.red_flags.clone(),
+                                });
                             }
                             let total = wallets.len();
                             cache.update(wallets).await;
@@ -1209,9 +1233,10 @@ impl Agent {
                             tracing::warn!(error = %e, "Behavioral scan failed (will retry in 4h)");
                         }
                     }
+                    interval.tick().await;
                 }
             });
-            tracing::info!("Behavioral intelligence background scan started (every 4h)");
+            tracing::info!("Behavioral intelligence background scan started (immediate + every 4h)");
             Some(handle)
         } else {
             tracing::info!("No behavioral cache configured — behavioral signal disabled");
@@ -1267,6 +1292,9 @@ impl Agent {
 
                     match self.scan().await {
                         Ok(tokens) => {
+                            // Reset backoff counter on successful scan.
+                            self.consecutive_scan_failures.store(0, Ordering::SeqCst);
+
                             // Search Twitter for discovered token CAs (top 5 per cycle to respect rate limits).
                             let addresses: Vec<String> = tokens.iter().take(5).map(|t| t.address.clone()).collect();
                             self.subsystems.confluence.lock().unwrap().poll_social_tokens(&addresses, 5).await;
@@ -1305,15 +1333,15 @@ impl Agent {
 
                                 // Check behavioral signal: query GMGN top traders for this token
                                 // against the behavioral wallet cache (SOVEREIGN/PRECOGNITIVE wallets).
-                                if let Some(ref cache) = self.subsystems.behavioral_cache {
-                                    if cache.len() > 0 {
-                                        // Find the behavioral signal in the confluence scorer
-                                        // and trigger its GMGN lookup for this token.
-                                        let confluence = self.subsystems.confluence.lock().unwrap();
-                                        for strategy in confluence.strategies() {
-                                            if let solagent_signals::StrategyKind::Behavioral(bs) = strategy {
-                                                let _ = bs.check_gmgn_traders(&token.address).await;
-                                            }
+                                if let Some(ref cache) = self.subsystems.behavioral_cache
+                                    && !cache.is_empty()
+                                {
+                                    // Find the behavioral signal in the confluence scorer
+                                    // and trigger its GMGN lookup for this token.
+                                    let confluence = self.subsystems.confluence.lock().unwrap();
+                                    for strategy in confluence.strategies() {
+                                        if let solagent_signals::StrategyKind::Behavioral(bs) = strategy {
+                                            let _ = bs.check_gmgn_traders(&token.address).await;
                                         }
                                     }
                                 }
@@ -1407,12 +1435,50 @@ impl Agent {
                             }
                         }
                         Err(e) => {
-                            tracing::error!(error = %e, "Scan failed");
+                            // Exponential backoff on scan failure.
+                            // Increment consecutive failures and compute delay: min(2^n * 2s, 120s).
+                            let n = self.consecutive_scan_failures.fetch_add(1, Ordering::SeqCst) + 1;
+                            let delay_secs = (2u64.saturating_pow(n.min(31)) * 2).min(120);
+
+                            tracing::error!(
+                                error = %e,
+                                consecutive_failures = n,
+                                backoff_level = n,
+                                backoff_delay_secs = delay_secs,
+                                "Scan failed — backing off"
+                            );
+
+                            // WARN at 10 consecutive failures with suggested action.
+                            if n == 10 {
+                                tracing::warn!(
+                                    consecutive_failures = n,
+                                    backoff_level = n,
+                                    backoff_delay_secs = delay_secs,
+                                    suggested_action = "Investigate: check DexScreener API availability, network connectivity, or API keys. Consider restarting agent if the issue persists.",
+                                    "10 consecutive scan failures — investigation recommended"
+                                );
+                            }
+
+                            // ERROR at 50 consecutive failures suggesting manual intervention.
+                            if n >= 50 {
+                                tracing::error!(
+                                    consecutive_failures = n,
+                                    backoff_level = n,
+                                    backoff_delay_secs = delay_secs,
+                                    suggested_action = "Manual intervention required: check API keys, network connectivity, and data source status. Agent may need to be restarted or reconfigured.",
+                                    "50+ consecutive scan failures — manual intervention recommended"
+                                );
+                            }
+
+                            // Sleep before the next scan attempt.
+                            tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
                         }
                     }
 
                     // Run auto-tuner after each full scan cycle.
+                    // Skip auto-tuner after a scan failure — there's no new data to tune on.
                     if let Some(ref tuner) = self.subsystems.auto_tuner
+                        && self.consecutive_scan_failures.load(Ordering::SeqCst) == 0
                         && let Err(e) = tuner.maybe_tune().await
                     {
                         tracing::warn!(error = %e, "Auto-tuner tune failed (non-fatal)");
@@ -1733,5 +1799,110 @@ mod tests {
         // Token has market cap and age → should be reflected in result.
         assert!(eval.market_cap.is_some());
         assert!(eval.age_hours.is_some());
+    }
+
+    // ─── Scan Backoff Tests ────────────────────────────────────────────
+
+    /// Calculate expected backoff delay for a given failure count n.
+    /// Formula: min(2^n * 2, 120) seconds.
+    fn expected_backoff_delay(n: u32) -> u64 {
+        (2u64.saturating_pow(n.min(31)) * 2).min(120)
+    }
+
+    #[test]
+    fn test_backoff_formula_first_failure() {
+        // n=1: 2^1 * 2 = 4
+        assert_eq!(expected_backoff_delay(1), 4);
+    }
+
+    #[test]
+    fn test_backoff_formula_second_failure() {
+        // n=2: 2^2 * 2 = 8
+        assert_eq!(expected_backoff_delay(2), 8);
+    }
+
+    #[test]
+    fn test_backoff_formula_third_failure() {
+        // n=3: 2^3 * 2 = 16
+        assert_eq!(expected_backoff_delay(3), 16);
+    }
+
+    #[test]
+    fn test_backoff_formula_fourth_failure() {
+        // n=4: 2^4 * 2 = 32
+        assert_eq!(expected_backoff_delay(4), 32);
+    }
+
+    #[test]
+    fn test_backoff_formula_fifth_failure() {
+        // n=5: 2^5 * 2 = 64
+        assert_eq!(expected_backoff_delay(5), 64);
+    }
+
+    #[test]
+    fn test_backoff_formula_sixth_failure() {
+        // n=6: 2^6 * 2 = 128, capped at 120
+        assert_eq!(expected_backoff_delay(6), 120);
+    }
+
+    #[test]
+    fn test_backoff_formula_capped_at_120() {
+        // n=7: 2^7 * 2 = 256, capped at 120
+        assert_eq!(expected_backoff_delay(7), 120);
+        // n=10: 2^10 * 2 = 2048, capped at 120
+        assert_eq!(expected_backoff_delay(10), 120);
+        // n=50: capped at 120
+        assert_eq!(expected_backoff_delay(50), 120);
+    }
+
+    #[test]
+    fn test_backoff_delay_non_decreasing() {
+        // Delays should be non-decreasing as n grows.
+        let mut prev = 0u64;
+        for n in 1..=20 {
+            let delay = expected_backoff_delay(n);
+            assert!(delay >= prev,
+                "Backoff delay for n={n} ({delay}s) should be >= previous ({prev}s)");
+            prev = delay;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_consecutive_scan_failures_initialized_to_zero() {
+        let event_bus = EventBus::new(16);
+        let agent = Agent::new_minimal(AgentConfig::default(), event_bus);
+        assert_eq!(
+            agent.consecutive_scan_failures.load(Ordering::SeqCst),
+            0,
+            "consecutive_scan_failures should start at 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_consecutive_scan_failures_increment_and_reset() {
+        let event_bus = EventBus::new(16);
+        let agent = Agent::new_minimal(AgentConfig::default(), event_bus);
+
+        // Simulate failures.
+        let n1 = agent.consecutive_scan_failures.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(n1, 0, "Before first increment, value should be 0");
+
+        let n2 = agent.consecutive_scan_failures.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(n2, 1, "Before second increment, value should be 1");
+
+        let n3 = agent.consecutive_scan_failures.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(n3, 2, "Before third increment, value should be 2");
+
+        // Reset.
+        agent.consecutive_scan_failures.store(0, Ordering::SeqCst);
+        assert_eq!(
+            agent.consecutive_scan_failures.load(Ordering::SeqCst),
+            0,
+            "After reset, value should be 0"
+        );
+
+        // Next failure should start from 1 again.
+        let n4 = agent.consecutive_scan_failures.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(n4, 0, "After reset, first increment should see 0 again");
     }
 }

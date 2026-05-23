@@ -1701,6 +1701,11 @@ impl BehavioralWalletCache {
         self.wallets.len()
     }
 
+    /// Whether the cache is empty.
+    pub fn is_empty(&self) -> bool {
+        self.wallets.is_empty()
+    }
+
     /// When was the last scan run?
     pub async fn last_scan(&self) -> Option<DateTime<Utc>> {
         *self.last_scan.read().await
@@ -1733,11 +1738,13 @@ impl Ord for BehavioralTier {
 ///
 /// Instead of relying on rate-limited Helius wallet watcher, this signal
 /// uses GMGN top-trader data to detect smart money interest at evaluation time.
+type BehavioralTokenMap = DashMap<String, Vec<(String, BehavioralTier, DateTime<Utc>)>>;
+
 pub struct BehavioralSignal {
     name: String,
     cache: Arc<BehavioralWalletCache>,
     /// Token -> (wallets that traded it, timestamp of detection).
-    token_wallets: Arc<DashMap<String, Vec<(String, BehavioralTier, DateTime<Utc>)>>>,
+    token_wallets: Arc<BehavioralTokenMap>,
     /// Path to gmgn-cli.
     gmgn_cli_path: String,
     #[allow(dead_code)]
@@ -1785,19 +1792,18 @@ impl BehavioralSignal {
         let mut matches = Vec::new();
 
         // GMGN returns { "list": [...] }
-        if let Ok(data) = serde_json::from_str::<serde_json::Value>(&stdout) {
-            if let Some(list) = data.get("list").and_then(|l| l.as_array()) {
-                for item in list {
-                    let addr = item.get("address")
-                        .and_then(|a| a.as_str())
-                        .unwrap_or("");
-                    if !addr.is_empty() {
-                        if let Some((tier, _score)) = self.cache.get(addr) {
-                            if tier >= BehavioralTier::Sovereign {
-                                matches.push((addr.to_string(), tier));
-                            }
-                        }
-                    }
+        if let Ok(data) = serde_json::from_str::<serde_json::Value>(&stdout)
+            && let Some(list) = data.get("list").and_then(|l| l.as_array())
+        {
+            for item in list {
+                let addr = item.get("address")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("");
+                if !addr.is_empty()
+                    && let Some((tier, _score)) = self.cache.get(addr)
+                    && tier >= BehavioralTier::Emerging
+                {
+                    matches.push((addr.to_string(), tier));
                 }
             }
         }
@@ -1811,7 +1817,7 @@ impl BehavioralSignal {
             tracing::info!(
                 token = &token_address[..token_address.len().min(12)],
                 count = matches.len(),
-                "Behavioral signal: high-tier wallets detected in GMGN traders"
+                "Behavioral signal: behavioral wallets detected in GMGN traders"
             );
         }
 

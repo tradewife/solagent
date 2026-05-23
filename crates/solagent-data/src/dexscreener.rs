@@ -233,4 +233,47 @@ impl DexScreenerClient {
         let profiles: Vec<BoostedToken> = self.client.get_json(&url).await?;
         Ok(profiles)
     }
+
+    /// Fetch Solana pairs sorted by 24h price change via the search endpoint.
+    /// Uses DexScreener's token search to discover pairs with extreme price
+    /// movements. Returns pairs filtered to Solana with valid price change data.
+    pub async fn get_solana_trending_pairs(&self, min_liquidity_usd: f64, limit: usize) -> Result<Vec<DexPair>> {
+        // DexScreener's search returns pairs matching the query. We use
+        // broad queries to discover active Solana tokens.
+        let queries = ["SOL", "pump", "solana"];
+        let mut all_pairs: Vec<DexPair> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for q in &queries {
+            let url = format!(
+                "{}/latest/dex/search?q={}",
+                self.base_url,
+                urlencoding::encode(q),
+            );
+            if let Ok(resp) = self.client.get_json::<DexSearchResponse>(&url).await
+                && let Some(pairs) = resp.pairs
+            {
+                for pair in pairs {
+                    if pair.chain_id != "solana" { continue; }
+                    let liq = pair.liquidity.as_ref().and_then(|l| l.usd).unwrap_or(0.0);
+                    if liq < min_liquidity_usd { continue; }
+                    if seen.contains(&pair.base_token.address) { continue; }
+                    seen.insert(pair.base_token.address.clone());
+                    all_pairs.push(pair);
+                }
+            }
+            // Small delay to stay within DexScreener rate limits.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+
+        // Sort by absolute 24h price change (most volatile first).
+        all_pairs.sort_by(|a, b| {
+            let change_a = a.price_change.as_ref().and_then(|c| c.h24).unwrap_or(0.0).abs();
+            let change_b = b.price_change.as_ref().and_then(|c| c.h24).unwrap_or(0.0).abs();
+            change_b.partial_cmp(&change_a).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        all_pairs.truncate(limit);
+        Ok(all_pairs)
+    }
 }

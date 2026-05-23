@@ -472,12 +472,12 @@ async fn main() -> Result<()> {
                 .or_else(|| {
                     // Try loading from .env file in current directory
                     let env_path = std::path::Path::new(".env");
-                    if env_path.exists() {
-                        if let Ok(contents) = std::fs::read_to_string(env_path) {
-                            for line in contents.lines() {
-                                if let Some(val) = line.strip_prefix("BIRDEYE_API_KEY=") {
-                                    return Some(val.trim().to_string());
-                                }
+                    if env_path.exists()
+                        && let Ok(contents) = std::fs::read_to_string(env_path)
+                    {
+                        for line in contents.lines() {
+                            if let Some(val) = line.strip_prefix("BIRDEYE_API_KEY=") {
+                                return Some(val.trim().to_string());
                             }
                         }
                     }
@@ -574,12 +574,11 @@ async fn main() -> Result<()> {
                         // Save JSON report
                         let report_path = format!("logs/behavioral_{}.json",
                             chrono::Utc::now().format("%Y%m%d_%H%M%S"));
-                        if let Ok(json_str) = serde_json::to_string_pretty(&report) {
-                            if std::fs::create_dir_all("logs").is_ok() {
-                                if std::fs::write(&report_path, json_str).is_ok() {
-                                    println!("\nFull report saved to: {}", report_path);
-                                }
-                            }
+                        if let Ok(json_str) = serde_json::to_string_pretty(&report)
+                            && std::fs::create_dir_all("logs").is_ok()
+                            && std::fs::write(&report_path, json_str).is_ok()
+                        {
+                            println!("\nFull report saved to: {}", report_path);
                         }
                     }
                 }

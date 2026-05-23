@@ -142,7 +142,7 @@ impl BehavioralReport {
     pub fn detailed(&self) -> String {
         let mut out = self.summary();
 
-        out.push_str(&format!("=== FULL RANKINGS ===\n"));
+        out.push_str("=== FULL RANKINGS ===\n");
         out.push_str(&format!("{:<40} {:<14} {:>5} {:>8} {:>5} {}\n",
             "Address", "Tier", "Score", "PnL", "Toks", "Primary Edge"));
         out.push_str(&"-".repeat(90));

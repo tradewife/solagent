@@ -49,6 +49,7 @@ pub struct BehavioralScanner {
     #[allow(dead_code)] // reserved for future Birdeye-based enrichment passes
     birdeye: BirdeyeClient,
     dex: DexScreenerClient,
+    gmgn: solagent_data::GmgnClient,
     config: ScanConfig,
 }
 
@@ -57,6 +58,7 @@ impl BehavioralScanner {
         Self {
             birdeye,
             dex: DexScreenerClient::new("https://api.dexscreener.com".to_string(), None),
+            gmgn: solagent_data::GmgnClient::new(),
             config: ScanConfig::default(),
         }
     }
@@ -65,6 +67,7 @@ impl BehavioralScanner {
         Self {
             birdeye,
             dex: DexScreenerClient::new("https://api.dexscreener.com".to_string(), None),
+            gmgn: solagent_data::GmgnClient::new(),
             config,
         }
     }
@@ -113,8 +116,8 @@ impl BehavioralScanner {
                             avg_hold_hours: 0.0,
                         });
 
-                        let is_crash = crash_tokens.contains(&token_addr);
-                        let is_moon = moon_tokens.contains(&token_addr);
+                        let is_crash = crash_tokens.contains(token_addr);
+                        let is_moon = moon_tokens.contains(token_addr);
 
                         let entry = acc.tokens.entry(token_addr.clone()).or_insert(TokenTrade {
                             pnl,
@@ -244,26 +247,26 @@ impl BehavioralScanner {
         let mut traders = Vec::new();
 
         // GMGN returns a JSON object with a "list" array
-        if let Ok(data) = serde_json::from_str::<serde_json::Value>(&stdout) {
-            if let Some(list) = data.get("list").and_then(|l| l.as_array()) {
-                for item in list {
-                    let address = item.get("address")
-                        .and_then(|a| a.as_str())
-                        .unwrap_or("")
-                        .to_string();
+        if let Ok(data) = serde_json::from_str::<serde_json::Value>(&stdout)
+            && let Some(list) = data.get("list").and_then(|l| l.as_array())
+        {
+            for item in list {
+                let address = item.get("address")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("")
+                    .to_string();
 
-                    let profit = item.get("profit")
-                        .or_else(|| item.get("realized_profit"))
-                        .and_then(|p| p.as_f64())
-                        .unwrap_or(0.0);
+                let profit = item.get("profit")
+                    .or_else(|| item.get("realized_profit"))
+                    .and_then(|p| p.as_f64())
+                    .unwrap_or(0.0);
 
-                    if !address.is_empty() {
-                        traders.push(GmgnTrader {
-                            address,
-                            pnl: profit,
-                            is_profitable: profit > 0.0,
-                        });
-                    }
+                if !address.is_empty() {
+                    traders.push(GmgnTrader {
+                        address,
+                        pnl: profit,
+                        is_profitable: profit > 0.0,
+                    });
                 }
             }
         }
@@ -271,61 +274,124 @@ impl BehavioralScanner {
         Ok(traders)
     }
 
-    /// Discover tokens with largest 24h price drops via DexScreener.
+    /// Discover tokens with largest 24h price drops via DexScreener + GMGN.
+    /// Uses boosted tokens, trending pairs, and GMGN trending for wide coverage.
     async fn discover_crash_tokens(&self) -> Result<Vec<String>> {
-        match self.dex.get_boosted_tokens().await {
-            Ok(boosts) => {
-                let sol_boosts: Vec<_> = boosts.iter()
-                    .filter(|b| b.chain_id.as_deref() == Some("solana"))
-                    .take(self.config.crash_token_count * 3)
-                    .collect();
+        let mut crash_addrs = Vec::new();
+        let mut seen = std::collections::HashSet::new();
 
-                let mut crash_addrs = Vec::new();
-                for boost in sol_boosts {
-                    if crash_addrs.len() >= self.config.crash_token_count { break; }
-                    if let Ok(Some(pair)) = self.dex.get_token_info(&boost.token_address).await {
-                        let change_24h = pair.price_change.as_ref().and_then(|c| c.h24).unwrap_or(0.0);
-                        if change_24h < -20.0 {
-                            crash_addrs.push(boost.token_address.clone());
-                        }
+        // Source 1: Boosted/profiled tokens.
+        if let Ok(boosts) = self.dex.get_boosted_tokens().await {
+            let sol_boosts: Vec<_> = boosts.iter()
+                .filter(|b| b.chain_id.as_deref() == Some("solana"))
+                .take(self.config.crash_token_count * 3)
+                .collect();
+
+            for boost in sol_boosts {
+                if crash_addrs.len() >= self.config.crash_token_count { break; }
+                if seen.contains(&boost.token_address) { continue; }
+                if let Ok(Some(pair)) = self.dex.get_token_info(&boost.token_address).await {
+                    let change_24h = pair.price_change.as_ref().and_then(|c| c.h24).unwrap_or(0.0);
+                    if change_24h < -20.0 {
+                        seen.insert(boost.token_address.clone());
+                        crash_addrs.push(boost.token_address.clone());
                     }
                 }
-                Ok(crash_addrs)
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to fetch boosted tokens from DexScreener");
-                Ok(Vec::new())
             }
         }
+
+        // Source 2: Trending pairs (wider discovery via DexScreener search).
+        if crash_addrs.len() < self.config.crash_token_count
+            && let Ok(pairs) = self.dex.get_solana_trending_pairs(500.0, 60).await
+        {
+            for pair in pairs {
+                if crash_addrs.len() >= self.config.crash_token_count { break; }
+                let addr = &pair.base_token.address;
+                if seen.contains(addr) { continue; }
+                let change_24h = pair.price_change.as_ref().and_then(|c| c.h24).unwrap_or(0.0);
+                if change_24h < -20.0 {
+                    seen.insert(addr.clone());
+                    crash_addrs.push(addr.clone());
+                }
+            }
+        }
+
+        // Source 3: GMGN trending tokens (broadest Solana coverage).
+        if crash_addrs.len() < self.config.crash_token_count {
+            let trending = self.gmgn.get_trending_tokens("24h", 50).await;
+            for (addr, _sym, change) in trending {
+                if crash_addrs.len() >= self.config.crash_token_count { break; }
+                if seen.contains(&addr) { continue; }
+                if change < -20.0 {
+                    seen.insert(addr.clone());
+                    crash_addrs.push(addr);
+                }
+            }
+        }
+
+        tracing::info!(count = crash_addrs.len(), "Discovered crash tokens");
+        Ok(crash_addrs)
     }
 
-    /// Discover tokens with largest 24h price gains via DexScreener.
+    /// Discover tokens with largest 24h price gains via DexScreener + GMGN.
+    /// Uses boosted tokens, trending pairs, and GMGN trending for wide coverage.
     async fn discover_moon_tokens(&self) -> Result<Vec<String>> {
-        match self.dex.get_boosted_tokens().await {
-            Ok(boosts) => {
-                let sol_boosts: Vec<_> = boosts.iter()
-                    .filter(|b| b.chain_id.as_deref() == Some("solana"))
-                    .take(self.config.moon_token_count * 3)
-                    .collect();
+        let mut moon_addrs = Vec::new();
+        let mut seen = std::collections::HashSet::new();
 
-                let mut moon_addrs = Vec::new();
-                for boost in sol_boosts {
-                    if moon_addrs.len() >= self.config.moon_token_count { break; }
-                    if let Ok(Some(pair)) = self.dex.get_token_info(&boost.token_address).await {
-                        let change_24h = pair.price_change.as_ref().and_then(|c| c.h24).unwrap_or(0.0);
-                        let liq = pair.liquidity.as_ref().and_then(|l| l.usd).unwrap_or(0.0);
-                        if change_24h > 50.0 && liq > 1000.0 {
-                            moon_addrs.push(boost.token_address.clone());
-                        }
+        // Source 1: Boosted/profiled tokens.
+        if let Ok(boosts) = self.dex.get_boosted_tokens().await {
+            let sol_boosts: Vec<_> = boosts.iter()
+                .filter(|b| b.chain_id.as_deref() == Some("solana"))
+                .take(self.config.moon_token_count * 3)
+                .collect();
+
+            for boost in sol_boosts {
+                if moon_addrs.len() >= self.config.moon_token_count { break; }
+                if seen.contains(&boost.token_address) { continue; }
+                if let Ok(Some(pair)) = self.dex.get_token_info(&boost.token_address).await {
+                    let change_24h = pair.price_change.as_ref().and_then(|c| c.h24).unwrap_or(0.0);
+                    let liq = pair.liquidity.as_ref().and_then(|l| l.usd).unwrap_or(0.0);
+                    if change_24h > 50.0 && liq > 1000.0 {
+                        seen.insert(boost.token_address.clone());
+                        moon_addrs.push(boost.token_address.clone());
                     }
                 }
-                Ok(moon_addrs)
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to fetch boosted tokens from DexScreener");
-                Ok(Vec::new())
             }
         }
+
+        // Source 2: Trending pairs (wider discovery via DexScreener search).
+        if moon_addrs.len() < self.config.moon_token_count
+            && let Ok(pairs) = self.dex.get_solana_trending_pairs(1000.0, 60).await
+        {
+            for pair in pairs {
+                if moon_addrs.len() >= self.config.moon_token_count { break; }
+                let addr = &pair.base_token.address;
+                if seen.contains(addr) { continue; }
+                let change_24h = pair.price_change.as_ref().and_then(|c| c.h24).unwrap_or(0.0);
+                let liq = pair.liquidity.as_ref().and_then(|l| l.usd).unwrap_or(0.0);
+                if change_24h > 50.0 && liq > 1000.0 {
+                    seen.insert(addr.clone());
+                    moon_addrs.push(addr.clone());
+                }
+            }
+        }
+
+        // Source 3: GMGN trending tokens.
+        if moon_addrs.len() < self.config.moon_token_count {
+            let trending = self.gmgn.get_trending_tokens("24h", 50).await;
+            for (addr, _sym, change) in trending {
+                if moon_addrs.len() >= self.config.moon_token_count { break; }
+                if seen.contains(&addr) { continue; }
+                if change > 50.0 {
+                    seen.insert(addr.clone());
+                    moon_addrs.push(addr);
+                }
+            }
+        }
+
+        tracing::info!(count = moon_addrs.len(), "Discovered moon tokens");
+        Ok(moon_addrs)
     }
 }
 
