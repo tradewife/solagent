@@ -17,3 +17,5 @@ chrono = { workspace = true }
 base64 = { workspace = true }
 bincode = "1"
 solana-sdk = { workspace = true }
+solana-client = { workspace = true }
+helius = { workspace = true }

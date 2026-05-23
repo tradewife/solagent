@@ -30,7 +30,10 @@ pub use helius::{
     WebhookConfig,
 };
 pub use http::RateLimitedClient;
-pub use jupiter::{JupiterClient, JupiterQuote, SwapTransaction};
+pub use jupiter::{
+    JupiterAccountMeta, JupiterClient, JupiterInstruction, JupiterQuote, SwapInstructions,
+    SwapTransaction,
+};
 pub use watcher::{WalletWatcher, WatchedWallet, WatcherConfig};
 pub use ws_watcher::{WsWatcher, WsWatcherConfig};
 pub use zerion::{

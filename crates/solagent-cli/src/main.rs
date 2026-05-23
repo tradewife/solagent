@@ -980,7 +980,7 @@ async fn main() -> Result<()> {
             };
 
             // Wire execution engine with Solana provider + Jupiter if private key is available.
-            let exec = if !dry_run {
+            let mut exec = if !dry_run {
                 let pk = config.as_ref()
                     .map(|c| c.chains.solana.private_key_bs58.trim().to_string())
                     .unwrap_or_default();
@@ -1139,6 +1139,7 @@ async fn main() -> Result<()> {
             // Wire Helius SDK client to execution engine for DAS API token balances.
             if let Some(ref helius) = helius_sdk {
                 exec.set_helius_client(helius.clone()).await;
+                exec.set_helius_execution_client(helius.clone());
             }
 
             let subsystems = {

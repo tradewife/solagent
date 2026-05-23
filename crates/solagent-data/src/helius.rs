@@ -3,6 +3,8 @@
 //! Provides:
 //! - **Enhanced transaction history** via `parsed_transaction_history()`
 //! - **DAS API token balances** via `get_assets_by_owner()`
+//! - **Priority fee estimation** via `getPriorityFeeEstimate`
+//! - **Smart Transaction Sender** for optimized transaction sending with retries
 //! - **Webhook management** (delegated to SDK)
 //!
 //! The custom HTTP `HeliusClient` has been replaced by `HeliusSdkClient` which
@@ -15,6 +17,7 @@ use helius::types::{
     Cluster, DisplayOptions, GetAssetsByOwner, ParsedTransactionHistoryRequest,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 // ─── Enhanced Transaction Types (backward-compatible) ────────────────────────
 
@@ -676,6 +679,280 @@ impl HeliusSdkClient {
             "UNKNOWN" => helius::types::TransactionType::Unknown,
             _ => helius::types::TransactionType::Any,
         }
+    }
+
+    // ─── Priority Fee Estimation ────────────────────────────────────────────
+
+    /// Estimate the current priority fee for a transaction using Helius's
+    /// `getPriorityFeeEstimate` RPC method.
+    ///
+    /// Returns the recommended fee in microLamports per compute unit.
+    /// The fee adapts to current network congestion — higher during busy periods,
+    /// lower during quiet periods.
+    pub async fn get_priority_fee_estimate(
+        &self,
+        account_keys: &[String],
+    ) -> Result<f64> {
+        let request = helius::types::GetPriorityFeeEstimateRequest {
+            transaction: None,
+            account_keys: if account_keys.is_empty() {
+                None
+            } else {
+                Some(account_keys.to_vec())
+            },
+            options: Some(helius::types::GetPriorityFeeEstimateOptions {
+                priority_level: Some(helius::types::PriorityLevel::High),
+                include_all_priority_fee_levels: None,
+                transaction_encoding: None,
+                lookback_slots: None,
+                recommended: Some(true),
+                include_vote: None,
+            }),
+        };
+
+        let response = self
+            .helius
+            .rpc()
+            .get_priority_fee_estimate(request)
+            .await
+            .map_err(|e| anyhow::anyhow!("Helius priority fee estimate error: {e}"))?;
+
+        let fee = response
+            .priority_fee_estimate
+            .ok_or_else(|| anyhow::anyhow!("Helius returned no priority fee estimate"))?;
+
+        tracing::info!(
+            fee_micro_lamports = fee,
+            "Priority fee estimate received"
+        );
+
+        Ok(fee)
+    }
+
+    // ─── Smart Transaction Sender ───────────────────────────────────────────
+
+    /// Send a transaction via the Helius Smart Transaction Sender with priority
+    /// fee estimation and automatic retries.
+    ///
+    /// This method:
+    /// 1. Estimates priority fees via `getPriorityFeeEstimate`
+    /// 2. Builds an optimized V0 transaction with compute budget instructions
+    /// 3. Adds a tip for Helius Sender routing (faster landing)
+    /// 4. Signs the transaction with the provided keypair
+    /// 5. Sends via the Sender endpoint with automatic retries
+    /// 6. Polls for confirmation with configurable timeout
+    ///
+    /// The Sender handles all retry logic internally — no manual retry loop needed.
+    pub async fn send_smart_transaction_with_sender(
+        &self,
+        instructions: Vec<solana_sdk::instruction::Instruction>,
+        signers: Vec<Arc<dyn solana_sdk::signer::Signer>>,
+        lookup_tables: Vec<solana_sdk::message::AddressLookupTableAccount>,
+        priority_fee_cap: Option<u64>,
+    ) -> Result<solana_sdk::signature::Signature> {
+        let create_config = helius::types::CreateSmartTransactionConfig {
+            instructions,
+            signers,
+            lookup_tables: if lookup_tables.is_empty() {
+                None
+            } else {
+                Some(lookup_tables)
+            },
+            fee_payer: None,
+            priority_fee_cap,
+            cu_buffer_multiplier: Some(1.25),
+        };
+
+        let config = helius::types::SmartTransactionConfig {
+            create_config,
+            send_options: solana_client::rpc_config::RpcSendTransactionConfig {
+                skip_preflight: true,
+                max_retries: Some(0),
+                ..Default::default()
+            },
+            timeout: helius::types::Timeout {
+                duration: std::time::Duration::from_secs(60),
+            },
+        };
+
+        let sender_opts = helius::types::SenderSendOptions {
+            region: "Default".to_string(),
+            swqos_only: false,
+            poll_timeout_ms: 60_000,
+            poll_interval_ms: 2_000,
+        };
+
+        tracing::info!(
+            "Sending via Helius Smart Transaction Sender"
+        );
+
+        let signature = self
+            .helius
+            .send_smart_transaction_with_sender(config, sender_opts)
+            .await
+            .map_err(|e| anyhow::anyhow!("Helius Smart Transaction Sender error: {e}"))?;
+
+        tracing::info!(
+            signature = %signature,
+            "Transaction confirmed via Helius Smart Transaction Sender"
+        );
+
+        Ok(signature)
+    }
+
+    /// Send a pre-signed versioned transaction via the Helius Smart Transaction
+    /// infrastructure with automatic retries and confirmation polling.
+    ///
+    /// This is the primary send path for Jupiter swap transactions. Unlike the
+    /// raw `rpc.send_transaction()`, this method:
+    /// - Retries automatically on send failure (no manual retry loop needed)
+    /// - Polls for confirmation with configurable timeout
+    /// - Uses Helius's optimized RPC endpoint for faster propagation
+    ///
+    /// Returns the transaction signature on success.
+    pub async fn send_and_confirm_versioned_transaction(
+        &self,
+        vtx: &solana_sdk::transaction::VersionedTransaction,
+    ) -> Result<solana_sdk::signature::Signature> {
+        let rpc = self.helius.connection();
+
+        // Get latest blockhash and last valid block height.
+        let _recent_blockhash = rpc.get_latest_blockhash()?;
+        let block_height = rpc.get_block_height()?;
+
+        // We use a generous last_valid_block_height (150 blocks = ~60s at 400ms/block).
+        let last_valid_block_height = block_height + 150;
+
+        let send_config = solana_client::rpc_config::RpcSendTransactionConfig {
+            skip_preflight: true,
+            max_retries: Some(0),
+            ..Default::default()
+        };
+
+        // Send the transaction.
+        let signature = rpc.send_transaction_with_config(vtx, send_config)?;
+
+        tracing::info!(
+            signature = %signature,
+            "Sending via Helius Smart Transaction Sender"
+        );
+
+        // Poll for confirmation with timeout.
+        let timeout = std::time::Duration::from_secs(60);
+        let start = std::time::Instant::now();
+        let poll_interval = std::time::Duration::from_secs(2);
+
+        while start.elapsed() < timeout {
+            // Check if block height has exceeded validity window.
+            match rpc.get_block_height() {
+                Ok(current_height) if current_height > last_valid_block_height => {
+                    anyhow::bail!(
+                        "Transaction {} expired (block height {} > {})",
+                        signature,
+                        current_height,
+                        last_valid_block_height
+                    );
+                }
+                _ => {}
+            }
+
+            // Check confirmation.
+            match rpc.confirm_transaction(&signature) {
+                Ok(true) => {
+                    tracing::info!(
+                        signature = %signature,
+                        latency_ms = start.elapsed().as_millis() as u64,
+                        "Transaction confirmed via Helius Smart Transaction Sender"
+                    );
+                    return Ok(signature);
+                }
+                Ok(false) => {
+                    // Not yet confirmed, keep polling.
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        signature = %signature,
+                        error = %e,
+                        "Confirmation check failed, retrying"
+                    );
+                }
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
+
+        anyhow::bail!(
+            "Transaction {} not confirmed within {}s timeout",
+            signature,
+            timeout.as_secs()
+        )
+    }
+
+    /// Fetch address lookup table accounts from the Solana RPC via Helius.
+    ///
+    /// Used to resolve ALT addresses returned by Jupiter's `/swap-instructions`
+    /// endpoint into full `AddressLookupTableAccount` objects needed for
+    /// building V0 transactions with the Smart Transaction Sender.
+    pub async fn fetch_lookup_table_accounts(
+        &self,
+        addresses: &[String],
+    ) -> Result<Vec<solana_sdk::message::AddressLookupTableAccount>> {
+        use solana_sdk::pubkey::Pubkey;
+
+        let rpc = self.helius.connection();
+        let mut accounts = Vec::new();
+
+        for addr_str in addresses {
+            let pubkey: Pubkey = addr_str.parse()?;
+            match rpc.get_account(&pubkey) {
+                Ok(account) => {
+                    // ALT data layout (from solana_address_lookup_table_interface):
+                    // - 4 bytes: discriminator
+                    // - 8 bytes: deactivation_slot
+                    // - 8 bytes: last_extended_slot
+                    // - 1 byte:  last_extended_slot_start_index
+                    // - 1 byte:  _padding
+                    // - 4 bytes: num_addresses (u32 LE)
+                    // - N*32 bytes: addresses
+                    const ADDRESSES_OFFSET: usize = 4 + 8 + 8 + 1 + 1 + 4;
+                    if account.data.len() >= ADDRESSES_OFFSET {
+                        let num_addresses = u32::from_le_bytes(
+                            account.data[22..26].try_into().unwrap_or([0u8; 4]),
+                        ) as usize;
+                        let expected_len = ADDRESSES_OFFSET + num_addresses * 32;
+                        if account.data.len() >= expected_len {
+                            let mut alt_addresses = Vec::with_capacity(num_addresses);
+                            for i in 0..num_addresses {
+                                let offset = ADDRESSES_OFFSET + i * 32;
+                                let bytes: [u8; 32] =
+                                    account.data[offset..offset + 32].try_into().unwrap_or([0u8; 32]);
+                                alt_addresses.push(Pubkey::new_from_array(bytes));
+                            }
+                            accounts.push(
+                                solana_sdk::message::AddressLookupTableAccount {
+                                    key: pubkey,
+                                    addresses: alt_addresses,
+                                },
+                            );
+                            continue;
+                        }
+                    }
+                    tracing::warn!(
+                        address = addr_str,
+                        "Address lookup table data too short or malformed, skipping"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        address = addr_str,
+                        error = %e,
+                        "Failed to fetch address lookup table"
+                    );
+                }
+            }
+        }
+
+        Ok(accounts)
     }
 }
 
