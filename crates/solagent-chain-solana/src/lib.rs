@@ -8,8 +8,8 @@ use anyhow::Result;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use solana_client::rpc_request::TokenAccountsFilter;
+use solana_commitment_config::CommitmentConfig;
 use solana_sdk::{
-    commitment_config::CommitmentConfig,
     pubkey::Pubkey,
     signature::{Keypair, Signer, Signature},
     transaction::Transaction,
@@ -89,11 +89,30 @@ impl SolanaProvider {
         &self.keypair
     }
 
-    /// Get SOL balance for an address.
+    /// Get SOL balance for an address. Tries all RPCs in the pool on failure.
     pub async fn get_balance(&self, address: &Pubkey) -> Result<u64> {
-        let rpc = self.get_rpc().await;
-        let balance = rpc.get_balance_with_commitment(address, self.commitment)?.value;
-        Ok(balance)
+        let start_idx = *self.current_rpc.read().await;
+        let pool_len = self.rpc_pool.len();
+        for i in 0..pool_len {
+            let idx = (start_idx + i) % pool_len;
+            let rpc = self.rpc_pool[idx].clone();
+            match rpc.get_balance_with_commitment(address, self.commitment) {
+                Ok(resp) => {
+                    // Advance round-robin past the working RPC.
+                    *self.current_rpc.write().await = (idx + 1) % pool_len;
+                    return Ok(resp.value);
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        rpc_index = idx,
+                        error = %e,
+                        "RPC balance fetch failed, trying next"
+                    );
+                    continue;
+                }
+            }
+        }
+        anyhow::bail!("All {} RPCs failed to fetch SOL balance", pool_len)
     }
 
     /// Get SPL token balance for an address and mint.

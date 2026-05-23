@@ -8,6 +8,7 @@ solagent-core = { path = "../solagent-core" }
 solagent-data = { path = "../solagent-data" }
 solana-sdk = { workspace = true }
 solana-client = { workspace = true }
+solana-commitment-config = { workspace = true }
 spl-token = { workspace = true }
 bs58 = { workspace = true }
 serde = { workspace = true }

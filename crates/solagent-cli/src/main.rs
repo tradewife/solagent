@@ -1006,7 +1006,7 @@ async fn main() -> Result<()> {
                     match solagent_chain_solana::SolanaProvider::new(
                         rpc_urls,
                         &pk,
-                        solana_sdk::commitment_config::CommitmentConfig::confirmed(),
+                        solana_commitment_config::CommitmentConfig::confirmed(),
                     ) {
                         Ok(provider) => {
                             tracing::info!(pubkey = %provider.pubkeys(), "Solana provider configured");
