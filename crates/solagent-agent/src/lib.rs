@@ -216,6 +216,156 @@ struct PositionExit {
     trailing_stop_pct: f64,
 }
 
+// ─── Hot-Token Tracker ────────────────────────────────────────────────────────
+
+/// Maximum number of tracked hot tokens (ring buffer bound).
+/// Prevents unbounded memory growth from token accumulation.
+const HOT_TOKEN_TRACKER_MAX_ENTRIES: usize = 100;
+
+/// Maximum age of a tracked token snapshot before pruning.
+/// Tokens older than 1 hour are evicted to keep the tracker fresh.
+const HOT_TOKEN_TRACKER_MAX_AGE_SECS: u64 = 3600; // 1 hour
+
+/// Snapshot of a token's data from a single scan cycle.
+/// Used to persist data across scan cycles so that signals (accumulation,
+/// volume_spike, launch_momentum) can accumulate multi-cycle history.
+#[derive(Debug, Clone)]
+pub struct TokenSnapshot {
+    pub address: String,
+    pub volume_24h: Option<f64>,
+    pub holder_count: Option<u64>,
+    pub price_usd: Option<f64>,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// In-memory hot-token tracker that persists token data across scan cycles.
+///
+/// After each scan, discovered tokens are added/updated in the tracker.
+/// Before signal evaluation, all tracked tokens are re-fed through
+/// `feed_scan_data()`, giving accumulation, volume_spike, and launch_momentum
+/// signals the multi-cycle data they need to produce non-zero scores.
+///
+/// The tracker is bounded at `HOT_TOKEN_TRACKER_MAX_ENTRIES` (100) entries
+/// using a ring-buffer eviction strategy. Entries older than 1 hour are
+/// pruned on each cycle to prevent stale data from affecting signals.
+///
+/// This is intentionally in-memory (not persisted to disk). Signals rebuild
+/// quickly after 2-3 scan cycles following an agent restart.
+pub struct HotTokenTracker {
+    /// Token snapshots, one per unique address (latest data only).
+    /// Bounded ring buffer — when full, oldest entries are evicted.
+    snapshots: std::collections::VecDeque<TokenSnapshot>,
+    /// Maximum number of entries (ring buffer capacity).
+    max_entries: usize,
+    /// Maximum age in seconds before an entry is considered stale.
+    max_age_secs: u64,
+}
+
+impl Default for HotTokenTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HotTokenTracker {
+    /// Create a new tracker with default settings (100 entries, 1 hour max age).
+    pub fn new() -> Self {
+        Self {
+            snapshots: std::collections::VecDeque::new(),
+            max_entries: HOT_TOKEN_TRACKER_MAX_ENTRIES,
+            max_age_secs: HOT_TOKEN_TRACKER_MAX_AGE_SECS,
+        }
+    }
+
+    /// Create a tracker with custom settings (for testing).
+    pub fn with_limits(max_entries: usize, max_age_secs: u64) -> Self {
+        Self {
+            snapshots: std::collections::VecDeque::new(),
+            max_entries,
+            max_age_secs,
+        }
+    }
+
+    /// Add or update a token's snapshot.
+    ///
+    /// If the token already exists in the tracker, its data is updated
+    /// and it's moved to the back of the ring buffer (most recently used).
+    /// If the token is new and the tracker is at capacity, the oldest entry
+    /// (front of the ring buffer) is evicted to make room.
+    pub fn upsert(
+        &mut self,
+        address: &str,
+        volume_24h: Option<f64>,
+        holder_count: Option<u64>,
+        price_usd: Option<f64>,
+    ) {
+        // Check if token already tracked — remove it so we can re-add at the back.
+        if let Some(idx) = self.snapshots.iter().position(|s| s.address == address) {
+            let mut existing = self.snapshots.remove(idx).unwrap();
+            // Preserve newer data: only update fields that are Some.
+            if volume_24h.is_some() {
+                existing.volume_24h = volume_24h;
+            }
+            if holder_count.is_some() {
+                existing.holder_count = holder_count;
+            }
+            if price_usd.is_some() {
+                existing.price_usd = price_usd;
+            }
+            existing.timestamp = Utc::now();
+            self.snapshots.push_back(existing);
+            return;
+        }
+
+        // New token — check capacity.
+        if self.snapshots.len() >= self.max_entries {
+            // Evict oldest entry (front of the ring buffer).
+            self.snapshots.pop_front();
+        }
+
+        self.snapshots.push_back(TokenSnapshot {
+            address: address.to_string(),
+            volume_24h,
+            holder_count,
+            price_usd,
+            timestamp: Utc::now(),
+        });
+    }
+
+    /// Prune entries older than `max_age_secs`.
+    ///
+    /// Removes all snapshots whose timestamp is more than `max_age_secs`
+    /// seconds ago. Should be called once per scan cycle to keep data fresh.
+    ///
+    /// Returns the number of pruned entries.
+    pub fn prune_stale(&mut self) -> usize {
+        let cutoff = Utc::now() - chrono::Duration::seconds(self.max_age_secs as i64);
+        let before = self.snapshots.len();
+        self.snapshots.retain(|s| s.timestamp >= cutoff);
+        before - self.snapshots.len()
+    }
+
+    /// Get all tracked snapshots (for re-feeding through signal engines).
+    pub fn snapshots(&self) -> impl Iterator<Item = &TokenSnapshot> {
+        self.snapshots.iter()
+    }
+
+    /// Number of currently tracked tokens.
+    pub fn len(&self) -> usize {
+        self.snapshots.len()
+    }
+
+    /// Whether the tracker is empty.
+    pub fn is_empty(&self) -> bool {
+        self.snapshots.is_empty()
+    }
+
+    /// Get a snapshot by token address.
+    pub fn get(&self, address: &str) -> Option<&TokenSnapshot> {
+        self.snapshots.iter().find(|s| s.address == address)
+    }
+}
+
 // ─── Subsystem References ────────────────────────────────────────────────────
 
 /// Holds references to all subsystems the agent needs.
@@ -276,6 +426,10 @@ pub struct Agent {
     /// Consecutive scan failures counter for exponential backoff.
     /// Reset to 0 on successful scan. Backoff delay = min(2^n * 2s, 120s).
     consecutive_scan_failures: Arc<AtomicU32>,
+    /// Hot-token tracker that persists token data across scan cycles.
+    /// Before each evaluation, tracked tokens are re-fed through the signal
+    /// engine so accumulation, volume_spike, and launch_momentum get multi-cycle data.
+    hot_token_tracker: Arc<tokio::sync::RwLock<HotTokenTracker>>,
 }
 
 impl Agent {
@@ -322,6 +476,7 @@ impl Agent {
             progressive_threshold: Arc::new(tokio::sync::RwLock::new(progressive)),
             cached_sol_balance: Arc::new(tokio::sync::RwLock::new(0.0)),
             consecutive_scan_failures: Arc::new(AtomicU32::new(0)),
+            hot_token_tracker: Arc::new(tokio::sync::RwLock::new(HotTokenTracker::new())),
         }
     }
 
@@ -388,6 +543,7 @@ impl Agent {
             )),
             cached_sol_balance: Arc::new(tokio::sync::RwLock::new(0.0)),
             consecutive_scan_failures: Arc::new(AtomicU32::new(0)),
+            hot_token_tracker: Arc::new(tokio::sync::RwLock::new(HotTokenTracker::new())),
         }
     }
 
@@ -558,6 +714,26 @@ impl Agent {
                 token.holder_count,
                 token.price_usd,
             );
+        }
+
+        // Add discovered tokens to the hot-token tracker so they persist
+        // across scan cycles. On subsequent cycles, the tracker will re-feed
+        // them through feed_scan_data() before evaluation, giving signals
+        // multi-cycle data.
+        {
+            let mut tracker = self.hot_token_tracker.write().await;
+            for token in &tokens {
+                tracker.upsert(
+                    &token.address,
+                    token.volume_24h,
+                    token.holder_count,
+                    token.price_usd,
+                );
+            }
+            let pruned = tracker.prune_stale();
+            if pruned > 0 {
+                tracing::debug!(pruned, "Pruned stale hot-token tracker entries");
+            }
         }
 
         Ok(tokens)
@@ -1313,6 +1489,30 @@ impl Agent {
                                 cd.retain(|_, t| *t + cooldown_duration > now);
                             }
 
+                            // Re-feed tracked tokens through signal detectors.
+                            // This gives accumulation, volume_spike, and launch_momentum
+                            // signals multi-cycle data for tokens seen in previous scans
+                            // that may not appear in the current scan results.
+                            {
+                                let tracker = self.hot_token_tracker.read().await;
+                                if !tracker.is_empty() {
+                                    let confluence = self.subsystems.confluence.lock().unwrap();
+                                    let count = tracker.len();
+                                    for snapshot in tracker.snapshots() {
+                                        confluence.feed_scan_data(
+                                            &snapshot.address,
+                                            snapshot.volume_24h,
+                                            snapshot.holder_count,
+                                            snapshot.price_usd,
+                                        );
+                                    }
+                                    tracing::debug!(
+                                        tracked_tokens = count,
+                                        "Re-fed hot-token tracker data through signal engine"
+                                    );
+                                }
+                            }
+
                             // Only evaluate N tokens per scan to respect API rate limits.
                             // Filter cooldown FIRST, then deduplicate by token address
                             // (DexScreener returns multiple pairs for same base token),
@@ -1564,6 +1764,7 @@ pub struct EvaluationResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use solagent_signals::Strategy;
 
     // ─── ProgressiveThreshold Tests ──────────────────────────────────────
 
@@ -2162,5 +2363,511 @@ mod tests {
             (cached - 0.0).abs() < f64::EPSILON,
             "cached_sol_balance should be initialized to 0.0, got {cached}"
         );
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // Hot-Token Tracker Tests (VAL-SIG-001, VAL-SIG-002, VAL-SIG-003, VAL-SIG-004, VAL-SIG-017)
+    // ════════════════════════════════════════════════════════════════════
+
+    /// Test: HotTokenTracker initializes empty.
+    #[test]
+    fn test_hot_token_tracker_starts_empty() {
+        let tracker = HotTokenTracker::new();
+        assert!(tracker.is_empty());
+        assert_eq!(tracker.len(), 0);
+    }
+
+    /// Test: upsert adds tokens and they can be retrieved.
+    #[test]
+    fn test_hot_token_tracker_upsert_adds_tokens() {
+        let mut tracker = HotTokenTracker::new();
+
+        tracker.upsert("TokenA", Some(1000.0), Some(50), Some(1.0));
+        tracker.upsert("TokenB", Some(2000.0), Some(100), Some(0.5));
+
+        assert_eq!(tracker.len(), 2);
+        assert!(tracker.get("TokenA").is_some());
+        assert!(tracker.get("TokenB").is_some());
+        assert!(tracker.get("TokenC").is_none());
+
+        let snap_a = tracker.get("TokenA").unwrap();
+        assert_eq!(snap_a.address, "TokenA");
+        assert_eq!(snap_a.volume_24h, Some(1000.0));
+        assert_eq!(snap_a.holder_count, Some(50));
+        assert_eq!(snap_a.price_usd, Some(1.0));
+    }
+
+    /// Test: upsert updates existing token data (dedup by address).
+    /// VAL-SIG-001: tokens from multiple cycles accumulate data.
+    #[test]
+    fn test_hot_token_tracker_upsert_updates_existing() {
+        let mut tracker = HotTokenTracker::new();
+
+        // Cycle 1: TokenA has 100 holders, price 1.0.
+        tracker.upsert("TokenA", Some(1000.0), Some(100), Some(1.0));
+        assert_eq!(tracker.len(), 1);
+
+        // Cycle 2: TokenA appears again with updated data.
+        tracker.upsert("TokenA", Some(2000.0), Some(150), Some(1.02));
+        assert_eq!(tracker.len(), 1, "Should still have 1 entry after update");
+
+        let snap = tracker.get("TokenA").unwrap();
+        assert_eq!(snap.volume_24h, Some(2000.0));
+        assert_eq!(snap.holder_count, Some(150));
+        assert_eq!(snap.price_usd, Some(1.02));
+    }
+
+    /// Test: upsert preserves existing data for None fields.
+    #[test]
+    fn test_hot_token_tracker_upsert_preserves_data_on_none() {
+        let mut tracker = HotTokenTracker::new();
+
+        tracker.upsert("TokenA", Some(1000.0), Some(100), Some(1.0));
+        // Update with only volume (holder_count and price are None).
+        tracker.upsert("TokenA", Some(2000.0), None, None);
+
+        let snap = tracker.get("TokenA").unwrap();
+        assert_eq!(snap.volume_24h, Some(2000.0), "Volume should be updated");
+        assert_eq!(snap.holder_count, Some(100), "Holder count should be preserved");
+        assert_eq!(snap.price_usd, Some(1.0), "Price should be preserved");
+    }
+
+    /// Test: Ring buffer bounded at max entries.
+    /// VAL-SIG-001: no memory leak from unbounded token accumulation.
+    #[test]
+    fn test_hot_token_tracker_ring_buffer_bounded() {
+        let mut tracker = HotTokenTracker::with_limits(5, 3600);
+
+        // Add 7 tokens to a tracker with max_entries=5.
+        for i in 0..7 {
+            tracker.upsert(
+                &format!("Token{i}"),
+                Some(i as f64 * 100.0),
+                Some(i * 10),
+                Some(i as f64),
+            );
+        }
+
+        assert_eq!(tracker.len(), 5, "Should be bounded at max_entries=5");
+
+        // First 2 tokens (Token0, Token1) should be evicted.
+        assert!(tracker.get("Token0").is_none(), "Token0 should be evicted");
+        assert!(tracker.get("Token1").is_none(), "Token1 should be evicted");
+
+        // Tokens 2-6 should still be tracked.
+        assert!(tracker.get("Token2").is_some());
+        assert!(tracker.get("Token6").is_some());
+    }
+
+    /// Test: Ring buffer eviction respects update order (updated tokens go to back).
+    #[test]
+    fn test_hot_token_tracker_update_refreshes_position() {
+        let mut tracker = HotTokenTracker::with_limits(3, 3600);
+
+        tracker.upsert("TokenA", Some(100.0), Some(10), Some(1.0));
+        tracker.upsert("TokenB", Some(200.0), Some(20), Some(2.0));
+        tracker.upsert("TokenC", Some(300.0), Some(30), Some(3.0));
+
+        // Update TokenA — should move to back of the ring buffer.
+        tracker.upsert("TokenA", Some(150.0), Some(15), Some(1.5));
+
+        // Add TokenD — should evict TokenB (oldest at front), NOT TokenA.
+        tracker.upsert("TokenD", Some(400.0), Some(40), Some(4.0));
+
+        assert_eq!(tracker.len(), 3);
+        assert!(tracker.get("TokenA").is_some(), "TokenA should survive (was refreshed)");
+        assert!(tracker.get("TokenB").is_none(), "TokenB should be evicted (oldest at front)");
+        assert!(tracker.get("TokenC").is_some());
+        assert!(tracker.get("TokenD").is_some());
+    }
+
+    /// Test: Prune removes entries older than max_age.
+    /// VAL-SIG-001: tracker prunes tokens older than 1 hour.
+    #[test]
+    fn test_hot_token_tracker_prune_stale() {
+        let mut tracker = HotTokenTracker::with_limits(100, 3600); // 1 hour max age
+
+        // Add a token with a stale timestamp (2 hours ago).
+        tracker.snapshots.push_back(TokenSnapshot {
+            address: "StaleToken".to_string(),
+            volume_24h: Some(1000.0),
+            holder_count: Some(50),
+            price_usd: Some(1.0),
+            timestamp: Utc::now() - chrono::Duration::hours(2),
+        });
+
+        // Add a fresh token.
+        tracker.upsert("FreshToken", Some(2000.0), Some(100), Some(2.0));
+
+        assert_eq!(tracker.len(), 2);
+
+        let pruned = tracker.prune_stale();
+        assert_eq!(pruned, 1, "Should prune 1 stale entry");
+        assert_eq!(tracker.len(), 1);
+        assert!(tracker.get("StaleToken").is_none(), "Stale token should be pruned");
+        assert!(tracker.get("FreshToken").is_some(), "Fresh token should remain");
+    }
+
+    /// Test: Prune with no stale entries prunes nothing.
+    #[test]
+    fn test_hot_token_tracker_prune_no_stale() {
+        let mut tracker = HotTokenTracker::new();
+
+        tracker.upsert("Token1", Some(100.0), Some(10), Some(1.0));
+        tracker.upsert("Token2", Some(200.0), Some(20), Some(2.0));
+
+        let pruned = tracker.prune_stale();
+        assert_eq!(pruned, 0, "Should prune nothing when all entries are fresh");
+        assert_eq!(tracker.len(), 2);
+    }
+
+    /// Test: Snapshots iterator returns all tracked entries.
+    #[test]
+    fn test_hot_token_tracker_snapshots_iterator() {
+        let mut tracker = HotTokenTracker::new();
+
+        tracker.upsert("TokenA", Some(100.0), Some(10), Some(1.0));
+        tracker.upsert("TokenB", Some(200.0), Some(20), Some(2.0));
+        tracker.upsert("TokenC", Some(300.0), Some(30), Some(3.0));
+
+        let addresses: Vec<&str> = tracker.snapshots().map(|s| s.address.as_str()).collect();
+        assert_eq!(addresses.len(), 3);
+        assert!(addresses.contains(&"TokenA"));
+        assert!(addresses.contains(&"TokenB"));
+        assert!(addresses.contains(&"TokenC"));
+    }
+
+    /// Test: After 3 scan cycles, tracked tokens have >=3 data points in signals.
+    /// Validates VAL-SIG-001: multi-cycle scan data accumulates in signal history.
+    #[tokio::test]
+    async fn test_hot_token_tracker_multi_cycle_accumulation() {
+        let event_bus = EventBus::new(16);
+        let agent = Agent::new_minimal(AgentConfig::default(), event_bus);
+
+        // Build a confluence scorer with all three dependent signals.
+        let mut confluence = solagent_signals::ConfluenceScorer::new(35.0);
+        confluence.add_strategy(
+            solagent_signals::StrategyKind::Accumulation(
+                solagent_signals::AccumulationSignal::new(Chain::Solana, 10),
+            ),
+            0.15,
+        );
+        confluence.add_strategy(
+            solagent_signals::StrategyKind::VolumeSpike(
+                solagent_signals::VolumeSpikeSignal::new(Chain::Solana, 3.0, 10),
+            ),
+            0.10,
+        );
+        confluence.add_strategy(
+            solagent_signals::StrategyKind::LaunchMomentum(
+                solagent_signals::LaunchMomentumSignal::new(Chain::Solana, 10),
+            ),
+            0.15,
+        );
+
+        let token_ca = "TrackedToken123";
+
+        // Simulate 3 scan cycles: feed data through tracker + direct feed.
+        // Cycle 1
+        confluence.feed_scan_data(token_ca, Some(1000.0), Some(100), Some(1.0));
+        agent.hot_token_tracker.write().await.upsert(
+            token_ca, Some(1000.0), Some(100), Some(1.0),
+        );
+
+        // Cycle 2 (re-feed tracker + new data)
+        for snapshot in agent.hot_token_tracker.read().await.snapshots() {
+            confluence.feed_scan_data(
+                &snapshot.address, snapshot.volume_24h, snapshot.holder_count, snapshot.price_usd,
+            );
+        }
+        confluence.feed_scan_data(token_ca, Some(1200.0), Some(150), Some(1.02));
+        agent.hot_token_tracker.write().await.upsert(
+            token_ca, Some(1200.0), Some(150), Some(1.02),
+        );
+
+        // Cycle 3
+        for snapshot in agent.hot_token_tracker.read().await.snapshots() {
+            confluence.feed_scan_data(
+                &snapshot.address, snapshot.volume_24h, snapshot.holder_count, snapshot.price_usd,
+            );
+        }
+        confluence.feed_scan_data(token_ca, Some(1100.0), Some(200), Some(1.05));
+        agent.hot_token_tracker.write().await.upsert(
+            token_ca, Some(1100.0), Some(200), Some(1.05),
+        );
+
+        // Now evaluate the token — accumulation should have >=3 snapshots and score > 0.
+        let token = TokenInfo {
+            address: token_ca.to_string(),
+            chain: Chain::Solana,
+            symbol: "TEST".to_string(),
+            name: "Test".to_string(),
+            decimals: 9,
+            price_usd: Some(1.05),
+            market_cap_usd: Some(50000.0),
+            volume_24h: Some(1100.0),
+            holder_count: Some(200),
+            created_at: Some(Utc::now() - chrono::Duration::minutes(30)),
+            pair_address: Some("pair123".to_string()),
+            lp_locked: None,
+            mint_authority_revoked: None,
+            freeze_authority_revoked: None,
+        };
+
+        let result = confluence.score(&token).await.unwrap();
+
+        let acc_score = result.signals.iter()
+            .find(|s| s.strategy == "accumulation")
+            .map(|s| s.score)
+            .unwrap_or(0);
+        assert!(acc_score > 0,
+            "Accumulation signal should score > 0 with 3+ snapshots of holder growth, got {acc_score}");
+
+        let vol_score = result.signals.iter()
+            .find(|s| s.strategy == "volume_spike")
+            .map(|s| s.score)
+            .unwrap_or(0);
+        // Volume spike needs 3+ data points — with tracker re-feeding we should have enough.
+        assert!(vol_score > 0,
+            "Volume spike signal should score > 0 with 3+ data points, got {vol_score}");
+    }
+
+    /// Test: AccumulationSignal scores > 0 for tokens with holder growth + stable price.
+    /// Validates VAL-SIG-002.
+    #[tokio::test]
+    async fn test_hot_token_tracker_accumulation_scores_nonzero() {
+        let mut tracker = HotTokenTracker::new();
+        let token_ca = "AccumToken";
+
+        // Simulate 3 cycles of holder growth with stable price.
+        tracker.upsert(token_ca, Some(10000.0), Some(100), Some(1.0));
+        // Manually advance: in real usage, timestamps differ per cycle.
+        // The accumulation signal uses record_snapshot which is called via feed_scan_data.
+        // Test by feeding 3 snapshots directly.
+        let acc = solagent_signals::AccumulationSignal::new(Chain::Solana, 10);
+        acc.record_snapshot(token_ca.to_string(), 100, 1.0);
+        acc.record_snapshot(token_ca.to_string(), 150, 1.02);
+        acc.record_snapshot(token_ca.to_string(), 200, 1.05);
+
+        let token = TokenInfo {
+            address: token_ca.to_string(),
+            chain: Chain::Solana,
+            symbol: "TEST".to_string(),
+            name: "Test".to_string(),
+            decimals: 9,
+            price_usd: Some(1.05),
+            market_cap_usd: Some(50000.0),
+            volume_24h: Some(10000.0),
+            holder_count: Some(200),
+            created_at: None,
+            pair_address: None,
+            lp_locked: None,
+            mint_authority_revoked: None,
+            freeze_authority_revoked: None,
+        };
+
+        let result = acc.evaluate(&token).await.unwrap();
+        assert!(result.score >= 60,
+            "Accumulation with 100% holder growth and <10% price change should score >= 60, got {}",
+            result.score);
+    }
+
+    /// Test: VolumeSpikeSignal scores > 0 with >=3 data points and a clear spike.
+    /// Validates VAL-SIG-003.
+    #[tokio::test]
+    async fn test_hot_token_tracker_volume_spike_scores_nonzero() {
+        let vs = solagent_signals::VolumeSpikeSignal::new(Chain::Solana, 3.0, 10);
+        let token_ca = "SpikeToken";
+
+        // 3 data points: avg = (1000+1200)/2 = 1100, current = 50000 → ratio ≈ 45x
+        vs.record(token_ca.to_string(), 1000.0);
+        vs.record(token_ca.to_string(), 1200.0);
+        vs.record(token_ca.to_string(), 50000.0); // spike!
+
+        let token = TokenInfo {
+            address: token_ca.to_string(),
+            chain: Chain::Solana,
+            symbol: "TEST".to_string(),
+            name: "Test".to_string(),
+            decimals: 9,
+            price_usd: Some(0.001),
+            market_cap_usd: None,
+            volume_24h: Some(50000.0),
+            holder_count: None,
+            created_at: None,
+            pair_address: None,
+            lp_locked: None,
+            mint_authority_revoked: None,
+            freeze_authority_revoked: None,
+        };
+
+        let result = vs.evaluate(&token).await.unwrap();
+        assert!(result.score >= 80,
+            "Volume spike with 45x ratio should score >= 80, got {}", result.score);
+    }
+
+    /// Test: LaunchMomentumSignal scores > 0 for new tokens with growing data.
+    /// Validates VAL-SIG-004.
+    #[tokio::test]
+    async fn test_hot_token_tracker_launch_momentum_scores_nonzero() {
+        let lm = solagent_signals::LaunchMomentumSignal::new(Chain::Solana, 10);
+        let token_ca = "LaunchToken";
+
+        lm.record(token_ca.to_string(), 1000.0, 50);
+        lm.record(token_ca.to_string(), 5000.0, 200);
+
+        let token = TokenInfo {
+            address: token_ca.to_string(),
+            chain: Chain::Solana,
+            symbol: "TEST".to_string(),
+            name: "Test".to_string(),
+            decimals: 9,
+            price_usd: Some(0.001),
+            market_cap_usd: Some(50000.0),
+            volume_24h: Some(5000.0),
+            holder_count: Some(200),
+            created_at: Some(Utc::now() - chrono::Duration::minutes(30)),
+            pair_address: Some("pair123".to_string()),
+            lp_locked: None,
+            mint_authority_revoked: None,
+            freeze_authority_revoked: None,
+        };
+
+        let result = lm.evaluate(&token).await.unwrap();
+        assert!(result.score > 0,
+            "Launch momentum should score > 0 for new token with growing data, got {}", result.score);
+    }
+
+    /// Test: Tracker handles the full flow: add tokens from scan, re-feed before eval.
+    /// Validates the integration flow described in the feature spec.
+    #[tokio::test]
+    async fn test_hot_token_tracker_full_scan_eval_flow() {
+        let mut tracker = HotTokenTracker::new();
+
+        // Simulate 3 scan cycles with 2 tokens.
+        // Cycle 1: discover TokenA and TokenB
+        tracker.upsert("TokenA", Some(1000.0), Some(100), Some(1.0));
+        tracker.upsert("TokenB", Some(500.0), Some(50), Some(0.5));
+        tracker.prune_stale();
+
+        // Cycle 2: TokenA re-appears, TokenC is new
+        tracker.upsert("TokenA", Some(1500.0), Some(150), Some(1.02));
+        tracker.upsert("TokenC", Some(800.0), Some(80), Some(0.8));
+        tracker.prune_stale();
+
+        // Cycle 3: TokenB re-appears after missing a cycle
+        tracker.upsert("TokenB", Some(700.0), Some(60), Some(0.55));
+        tracker.upsert("TokenA", Some(2000.0), Some(200), Some(1.05));
+        tracker.prune_stale();
+
+        // All 3 tokens should still be tracked.
+        assert_eq!(tracker.len(), 3);
+        assert!(tracker.get("TokenA").is_some());
+        assert!(tracker.get("TokenB").is_some());
+        assert!(tracker.get("TokenC").is_some());
+
+        // Verify TokenA has latest data.
+        let snap_a = tracker.get("TokenA").unwrap();
+        assert_eq!(snap_a.volume_24h, Some(2000.0));
+        assert_eq!(snap_a.holder_count, Some(200));
+        assert_eq!(snap_a.price_usd, Some(1.05));
+    }
+
+    /// Test: Tracker default max_entries is 100 (HOT_TOKEN_TRACKER_MAX_ENTRIES).
+    #[test]
+    fn test_hot_token_tracker_default_max_entries() {
+        assert_eq!(HOT_TOKEN_TRACKER_MAX_ENTRIES, 100);
+        let tracker = HotTokenTracker::new();
+        // Internal max_entries should be 100.
+        assert_eq!(tracker.max_entries, 100);
+    }
+
+    /// Test: Tracker default max_age is 1 hour (HOT_TOKEN_TRACKER_MAX_AGE_SECS).
+    #[test]
+    fn test_hot_token_tracker_default_max_age() {
+        assert_eq!(HOT_TOKEN_TRACKER_MAX_AGE_SECS, 3600);
+        let tracker = HotTokenTracker::new();
+        assert_eq!(tracker.max_age_secs, 3600);
+    }
+
+    /// Test: Empty tracker snapshots iterator returns nothing.
+    #[test]
+    fn test_hot_token_tracker_empty_snapshots_iterator() {
+        let tracker = HotTokenTracker::new();
+        let count = tracker.snapshots().count();
+        assert_eq!(count, 0);
+    }
+
+    /// Test: GMGN holder count enrichment feeds accumulation signal.
+    /// Validates VAL-SIG-017: holder counts from GMGN are stored in tracker
+    /// and re-fed through signals on subsequent cycles.
+    #[tokio::test]
+    async fn test_hot_token_tracker_preserves_holder_count_from_gmgn() {
+        let mut tracker = HotTokenTracker::new();
+
+        // Simulate scan cycle 1: token discovered with GMGN holder count.
+        tracker.upsert("TokenWithHolders", Some(5000.0), Some(100), Some(0.01));
+
+        // Simulate scan cycle 2: token re-appears but GMGN doesn't return holders.
+        // The tracker should preserve the previous holder count.
+        tracker.upsert("TokenWithHolders", Some(6000.0), None, Some(0.012));
+
+        let snap = tracker.get("TokenWithHolders").unwrap();
+        assert_eq!(snap.holder_count, Some(100),
+            "Holder count should be preserved when new data is None");
+        assert_eq!(snap.volume_24h, Some(6000.0),
+            "Volume should be updated");
+        assert_eq!(snap.price_usd, Some(0.012),
+            "Price should be updated");
+
+        // Re-feeding through feed_scan_data should include the preserved holder count.
+        let mut confluence = solagent_signals::ConfluenceScorer::new(35.0);
+        confluence.add_strategy(
+            solagent_signals::StrategyKind::Accumulation(
+                solagent_signals::AccumulationSignal::new(Chain::Solana, 10),
+            ),
+            0.15,
+        );
+
+        // Feed the tracker data through signals.
+        for snapshot in tracker.snapshots() {
+            confluence.feed_scan_data(
+                &snapshot.address,
+                snapshot.volume_24h,
+                snapshot.holder_count,
+                snapshot.price_usd,
+            );
+        }
+
+        // Verify the accumulation signal received the holder data.
+        // (It only has 1 data point so far, so score is 0, but the data is there.)
+        // Feed more data to see accumulation.
+        confluence.feed_scan_data("TokenWithHolders", Some(7000.0), Some(120), Some(0.013));
+        confluence.feed_scan_data("TokenWithHolders", Some(8000.0), Some(150), Some(0.014));
+
+        let token = TokenInfo {
+            address: "TokenWithHolders".to_string(),
+            chain: Chain::Solana,
+            symbol: "TEST".to_string(),
+            name: "Test".to_string(),
+            decimals: 9,
+            price_usd: Some(0.014),
+            market_cap_usd: Some(50000.0),
+            volume_24h: Some(8000.0),
+            holder_count: Some(150),
+            created_at: None,
+            pair_address: None,
+            lp_locked: None,
+            mint_authority_revoked: None,
+            freeze_authority_revoked: None,
+        };
+
+        let result = confluence.score(&token).await.unwrap();
+        let acc_score = result.signals.iter()
+            .find(|s| s.strategy == "accumulation")
+            .map(|s| s.score)
+            .unwrap_or(0);
+        assert!(acc_score > 0,
+            "Accumulation signal should score > 0 with holder growth data preserved by tracker, got {acc_score}");
     }
 }
