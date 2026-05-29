@@ -1548,6 +1548,8 @@ pub struct ConfluenceScorer {
     strategies: Vec<StrategyKind>,
     weights: Vec<f64>,
     threshold: f64,
+    /// Optional GMGN signal enrichment for boosting signals with pre-computed data.
+    pub gmgn_enrichment: Option<GmgnSignalEnrichment>,
 }
 
 impl ConfluenceScorer {
@@ -1556,6 +1558,7 @@ impl ConfluenceScorer {
             strategies: Vec::new(),
             weights: Vec::new(),
             threshold,
+            gmgn_enrichment: None,
         }
     }
 
@@ -1666,6 +1669,8 @@ impl ConfluenceScorer {
     }
 
     /// Evaluate all strategies for a token and produce a composite score.
+    /// When GMGN signal enrichment is available, applies bonus points for
+    /// smart money buy signals, KOL calls, and price surges.
     pub async fn score(&self, token: &TokenInfo) -> Result<ConfluenceResult> {
         let signals = self.evaluate_signals(token).await?;
         let weights = self.weights.clone();
@@ -1679,11 +1684,33 @@ impl ConfluenceScorer {
             weight_total += weight;
         }
 
-        let composite = if weight_total > 0.0 {
+        let mut composite = if weight_total > 0.0 {
             weighted_sum / weight_total
         } else {
             0.0
         };
+
+        // Apply GMGN signal enrichment boosts on top of the weighted composite.
+        if let Some(ref enrichment) = self.gmgn_enrichment {
+            let sm_boost = enrichment.get_sm_buy_boost(&token.address);
+            let kol_boost = enrichment.get_kol_call_boost(&token.address);
+            let price_boost = enrichment.get_price_surge_boost(&token.address);
+            let total_boost = sm_boost + kol_boost + price_boost;
+
+            if total_boost > 0.0 {
+                let before = composite;
+                composite = (composite + total_boost).min(100.0);
+                tracing::debug!(
+                    token = &token.address,
+                    sm_boost,
+                    kol_boost,
+                    price_boost,
+                    before,
+                    after = composite,
+                    "GMGN enrichment applied"
+                );
+            }
+        }
 
         Ok(ConfluenceResult {
             composite_score: composite as u8,
@@ -2137,6 +2164,201 @@ impl Strategy for BehavioralSignal {
             0.8,
             reasoning,
         ))
+    }
+}
+
+// ─── GMGN Signal Enrichment ──────────────────────────────────────────────────
+
+/// Enriches the signal engine with pre-computed GMGN market signals.
+///
+/// Queries GMGN for:
+/// - Smart money cluster-buy signals (signal_type 12) → boosts WhaleConsensus
+/// - KOL call signals (signal_type 13) → boosts Social/LaunchMomentum
+/// - Price surge signals (signal_type 6) → boosts VolumeSpike
+///
+/// Called once per scan cycle to build a map of token → signal boosts.
+/// Individual signals read from this map during evaluation without making
+/// additional API calls.
+#[derive(Debug, Clone)]
+pub struct GmgnSignalEnrichment {
+    /// Token address → smart money buy signal count and aggregate market cap.
+    sm_buy_signals: Arc<DashMap<String, GmgnSignalData>>,
+    /// Token address → KOL call signal data.
+    kol_call_signals: Arc<DashMap<String, GmgnSignalData>>,
+    /// Token address → price surge signal data.
+    price_surge_signals: Arc<DashMap<String, GmgnSignalData>>,
+}
+
+/// Aggregated signal data for a token from GMGN market signals.
+#[derive(Debug, Clone)]
+struct GmgnSignalData {
+    /// Number of signal events for this token.
+    count: usize,
+    /// Most recent trigger market cap.
+    #[allow(dead_code)]
+    trigger_mcap: Option<f64>,
+    /// Current market cap at signal time.
+    current_mcap: Option<f64>,
+}
+
+impl Default for GmgnSignalEnrichment {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GmgnSignalEnrichment {
+    pub fn new() -> Self {
+        Self {
+            sm_buy_signals: Arc::new(DashMap::new()),
+            kol_call_signals: Arc::new(DashMap::new()),
+            price_surge_signals: Arc::new(DashMap::new()),
+        }
+    }
+
+    /// Refresh all GMGN market signals. Call once per scan cycle.
+    /// Returns the number of unique tokens with signals.
+    pub async fn refresh(&self, gmgn: &solagent_data::GmgnClient) -> usize {
+        let mut total_tokens = HashSet::new();
+
+        // Smart money cluster-buy signals (type 12).
+        let sm_signals = gmgn.get_market_signals(12).await;
+        self.sm_buy_signals.clear();
+        for signal in &sm_signals {
+            self.sm_buy_signals.entry(signal.token_address.clone())
+                .and_modify(|e| {
+                    e.count += 1;
+                    e.current_mcap = signal.current_market_cap.or(e.current_mcap);
+                })
+                .or_insert(GmgnSignalData {
+                    count: 1,
+                    trigger_mcap: signal.trigger_market_cap,
+                    current_mcap: signal.current_market_cap,
+                });
+            total_tokens.insert(signal.token_address.clone());
+        }
+
+        // KOL call signals (type 13).
+        let kol_signals = gmgn.get_market_signals(13).await;
+        self.kol_call_signals.clear();
+        for signal in &kol_signals {
+            self.kol_call_signals.entry(signal.token_address.clone())
+                .and_modify(|e| {
+                    e.count += 1;
+                })
+                .or_insert(GmgnSignalData {
+                    count: 1,
+                    trigger_mcap: signal.trigger_market_cap,
+                    current_mcap: signal.current_market_cap,
+                });
+            total_tokens.insert(signal.token_address.clone());
+        }
+
+        // Price surge signals (type 6).
+        let price_signals = gmgn.get_market_signals(6).await;
+        self.price_surge_signals.clear();
+        for signal in &price_signals {
+            self.price_surge_signals.entry(signal.token_address.clone())
+                .and_modify(|e| {
+                    e.count += 1;
+                })
+                .or_insert(GmgnSignalData {
+                    count: 1,
+                    trigger_mcap: signal.trigger_market_cap,
+                    current_mcap: signal.current_market_cap,
+                });
+            total_tokens.insert(signal.token_address.clone());
+        }
+
+        let sm_count = sm_signals.len();
+        let kol_count = kol_signals.len();
+        let price_count = price_signals.len();
+        tracing::info!(
+            sm_buy = sm_count,
+            kol_call = kol_count,
+            price_surge = price_count,
+            unique_tokens = total_tokens.len(),
+            "GMGN signal enrichment refreshed"
+        );
+
+        total_tokens.len()
+    }
+
+    /// Get smart money buy signal boost for a token (0-25 bonus points).
+    /// Multiple SM cluster-buys = stronger signal.
+    pub fn get_sm_buy_boost(&self, token_address: &str) -> f64 {
+        if let Some(data) = self.sm_buy_signals.get(token_address) {
+            match data.count {
+                1 => 10.0,
+                2 => 18.0,
+                _ => 25.0,
+            }
+        } else {
+            0.0
+        }
+    }
+
+    /// Get KOL call signal boost for a token (0-15 bonus points).
+    pub fn get_kol_call_boost(&self, token_address: &str) -> f64 {
+        if let Some(data) = self.kol_call_signals.get(token_address) {
+            match data.count {
+                1 => 7.0,
+                2 => 12.0,
+                _ => 15.0,
+            }
+        } else {
+            0.0
+        }
+    }
+
+    /// Get price surge signal boost for a token (0-20 bonus points).
+    pub fn get_price_surge_boost(&self, token_address: &str) -> f64 {
+        if let Some(data) = self.price_surge_signals.get(token_address) {
+            match data.count {
+                1 => 10.0,
+                2 => 15.0,
+                _ => 20.0,
+            }
+        } else {
+            0.0
+        }
+    }
+
+    /// Get the number of SM buy signals for a token.
+    pub fn sm_buy_count(&self, token_address: &str) -> usize {
+        self.sm_buy_signals.get(token_address).map(|d| d.count).unwrap_or(0)
+    }
+
+    /// Get the number of KOL call signals for a token.
+    pub fn kol_call_count(&self, token_address: &str) -> usize {
+        self.kol_call_signals.get(token_address).map(|d| d.count).unwrap_or(0)
+    }
+
+    /// Get the number of price surge signals for a token.
+    pub fn price_surge_count(&self, token_address: &str) -> usize {
+        self.price_surge_signals.get(token_address).map(|d| d.count).unwrap_or(0)
+    }
+
+    /// Check if smart money is selling a token (exit signal).
+    /// Returns the number of sell events and aggregate sell amount.
+    pub async fn check_sm_exit_signals(
+        gmgn: &solagent_data::GmgnClient,
+        token_address: &str,
+    ) -> (usize, f64) {
+        let trades = gmgn.get_smart_money_trades(Some("sell")).await;
+        let mut count = 0;
+        let mut total_usd = 0.0;
+
+        for trade in &trades {
+            if let Some(ref addr) = trade.token_address {
+                if addr == token_address {
+                    count += 1;
+                    total_usd += trade.amount_usd.unwrap_or(0.0);
+                }
+            }
+        }
+
+        (count, total_usd)
     }
 }
 

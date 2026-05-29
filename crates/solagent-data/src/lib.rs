@@ -24,7 +24,10 @@ pub use dexscreener::{
     BoostedToken, DexPair, DexPairResponse, DexScreenerClient, DexSearchResponse,
     DexTokenResponse, TokenLink,
 };
-pub use gmgn::{GmgnClient, GmgnTokenInfo, GMGN_CLI_DEFAULT_PATH};
+pub use gmgn::{
+    GmgnClient, GmgnTokenInfo, GmgnTokenSecurity, GmgnTokenInfoFull, GmgnDevToken,
+    GmgnMarketSignal, GmgnSmartMoneyTrade, GMGN_CLI_DEFAULT_PATH,
+};
 pub use credit_tracker::{
     ApiCallType, CreditSnapshot, HeliusCreditTracker, DEFAULT_CREDIT_BUDGET,
 };

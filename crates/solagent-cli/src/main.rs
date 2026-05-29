@@ -1320,6 +1320,7 @@ async fn main() -> Result<()> {
                 zerion: None,
                 behavioral_cache: Some(behavioral_cache),
                 helius_credit_tracker,
+                gmgn_enrichment: None,
             }
             };
 

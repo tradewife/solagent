@@ -857,7 +857,9 @@ impl PortfolioManager {
     /// check if a matching open position exists in the DB. If any token is held
     /// on-chain but not recorded as an open position, create a position record.
     ///
-    /// Returns the number of positions reconciled (newly created).
+    /// Also closes any DB positions that have zero balance on-chain (stale positions).
+    ///
+    /// Returns the number of positions reconciled (newly created + stale closed).
     pub async fn reconcile_positions(
         &self,
         on_chain_balances: &[(String, u64, u8)],
@@ -870,8 +872,30 @@ impl PortfolioManager {
             .map(|p| p.token_address.clone())
             .collect();
 
+        // Build set of mints with non-zero on-chain balance.
+        let on_chain_mints: std::collections::HashSet<String> = on_chain_balances
+            .iter()
+            .filter(|(_, amount, _)| *amount > 0)
+            .map(|(mint, _, _)| mint.clone())
+            .collect();
+
         let mut reconciled = 0usize;
 
+        // ── Close stale positions (open in DB but zero on-chain) ─────────
+        for pos in &open_positions {
+            if !on_chain_mints.contains(&pos.token_address) {
+                tracing::warn!(
+                    token = %pos.token_address,
+                    id = &pos.id[..8],
+                    size_usd = pos.size_usd,
+                    "Closing stale position: open in DB but zero balance on-chain"
+                );
+                self.close_position(&pos.id, pos.current_price).await?;
+                reconciled += 1;
+            }
+        }
+
+        // ── Add missing positions (on-chain but not in DB) ───────────────
         for (mint, raw_amount, decimals) in on_chain_balances {
             // Skip SOL — only handle SPL tokens.
             if mint == "So11111111111111111111111111111111111111112" {
@@ -958,10 +982,10 @@ impl PortfolioManager {
         if reconciled > 0 {
             tracing::info!(
                 reconciled,
-                "Reconciliation complete: created position records for on-chain tokens"
+                "Reconciliation complete: synced DB with on-chain state (stale closed + missing created)"
             );
         } else {
-            tracing::debug!("Reconciliation: all on-chain positions already recorded");
+            tracing::debug!("Reconciliation: all on-chain positions match DB");
         }
 
         Ok(reconciled)

@@ -1,10 +1,11 @@
-//! GMGN API client for fetching token holder count and other on-chain data.
+//! GMGN API client for fetching token data, security checks, market signals,
+//! wallet profiling, and smart money tracking.
 //!
 //! Uses the `gmgn-cli` CLI tool as a subprocess to query token information.
 //! Includes rate limiting (0.5s delay between calls) and graceful error handling.
 
 use anyhow::Result;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -65,6 +66,154 @@ pub struct GmgnTokenStat {
     /// Holder count (duplicated from top-level).
     #[allow(dead_code)]
     pub holder_count: Option<u64>,
+}
+
+// ─── Token Security Response ─────────────────────────────────────────────────
+
+/// Response from `gmgn-cli token security --chain sol --address <CA> --raw`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GmgnTokenSecurity {
+    /// Token contract address.
+    #[allow(dead_code)]
+    pub address: String,
+    /// Whether the token is a honeypot.
+    pub is_honeypot: Option<bool>,
+    /// Whether the token is open source.
+    #[allow(dead_code)]
+    pub is_open_source: Option<bool>,
+    /// Whether mint authority is renounced.
+    pub is_mintable: Option<bool>,
+    /// Whether freeze authority is renounced (true = NOT renounced).
+    pub is_freeze_authority: Option<bool>,
+    /// Buy tax as decimal (e.g. 0.05 = 5%).
+    pub buy_tax: Option<f64>,
+    /// Sell tax as decimal (e.g. 0.05 = 5%).
+    pub sell_tax: Option<f64>,
+    /// Top 10 holder concentration as decimal.
+    pub top_10_holder_rate: Option<f64>,
+    /// LP burn percentage as decimal.
+    pub lp_burn_percent: Option<f64>,
+    /// Whether LP is burned.
+    pub lp_burned: Option<bool>,
+}
+
+// ─── Dev Wallet / Token Info Response ────────────────────────────────────────
+
+/// Full token info from GMGN including dev data, social links, and enrichment.
+/// Response from `gmgn-cli token info --chain sol --address <CA> --raw`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GmgnTokenInfoFull {
+    /// Token contract address.
+    pub address: String,
+    /// Token symbol.
+    pub symbol: String,
+    /// Token name.
+    pub name: String,
+    /// Total number of holders.
+    pub holder_count: u64,
+    /// Liquidity in USD (string).
+    pub liquidity: Option<String>,
+    /// Dev wallet address.
+    pub dev_address: Option<String>,
+    /// Whether dev still holds tokens.
+    pub dev_holding: Option<bool>,
+    /// Dev holding percentage.
+    pub dev_holding_percent: Option<f64>,
+    /// Number of tokens created by this dev.
+    pub dev_created_count: Option<u64>,
+    /// Best (highest ATH) token created by this dev.
+    pub dev_best_ath_marketcap: Option<f64>,
+    /// Whether the token is community-taken-over.
+    pub is_cto: Option<bool>,
+    /// KOL buyer count.
+    pub kol_buyer_count: Option<u64>,
+    /// Smart money buyer count.
+    pub smart_degen_buyer_count: Option<u64>,
+    /// Top-10 holder concentration as string (e.g. "0.15").
+    pub top_10_holder_rate: Option<String>,
+    /// Sniper wallet percentage.
+    pub sniper_holder_percent: Option<f64>,
+    /// Bundle percentage.
+    pub bundle_percent: Option<f64>,
+    /// Social links.
+    pub twitter: Option<String>,
+    pub website: Option<String>,
+    pub telegram: Option<String>,
+}
+
+// ─── Dev Created Tokens Response ─────────────────────────────────────────────
+
+/// A token created by a dev wallet.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GmgnDevToken {
+    /// Token contract address.
+    pub address: String,
+    /// Token symbol.
+    pub symbol: Option<String>,
+    /// Token name.
+    pub name: Option<String>,
+    /// All-time high market cap.
+    pub token_ath_mc: Option<f64>,
+    /// Current market cap.
+    pub current_market_cap: Option<f64>,
+    /// Whether the token has graduated to a DEX.
+    pub is_graduated: Option<bool>,
+}
+
+// ─── Market Signal Response ──────────────────────────────────────────────────
+
+/// A market signal from GMGN (smart money buy, KOL call, price surge, etc.).
+#[derive(Debug, Clone, Deserialize)]
+pub struct GmgnMarketSignal {
+    /// Token contract address.
+    pub token_address: String,
+    /// Token symbol.
+    pub token_symbol: Option<String>,
+    /// Market cap at trigger time.
+    pub trigger_market_cap: Option<f64>,
+    /// Current market cap.
+    pub current_market_cap: Option<f64>,
+    /// Trigger timestamp (Unix seconds).
+    pub trigger_timestamp: Option<i64>,
+    /// Signal type numeric code.
+    pub signal_type: Option<i64>,
+}
+
+// ─── Smart Money Trade Response ──────────────────────────────────────────────
+
+/// A smart money trade event from GMGN.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GmgnSmartMoneyTrade {
+    /// Wallet address.
+    pub address: Option<String>,
+    /// Token contract address.
+    pub token_address: Option<String>,
+    /// Token symbol.
+    pub token_symbol: Option<String>,
+    /// Side: "buy" or "sell".
+    pub side: Option<String>,
+    /// Amount in USD.
+    pub amount_usd: Option<f64>,
+    /// Token amount.
+    pub token_amount: Option<f64>,
+    /// Timestamp.
+    pub timestamp: Option<String>,
+}
+
+/// Wallet holdings from GMGN `portfolio holdings`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GmgnWalletHoldings {
+    pub total_value_usd: f64,
+    pub tokens: Vec<GmgnWalletToken>,
+}
+
+/// Single token in wallet holdings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GmgnWalletToken {
+    pub symbol: String,
+    pub mint: String,
+    pub quantity: f64,
+    pub value_usd: f64,
 }
 
 // ─── Client ──────────────────────────────────────────────────────────────────
@@ -286,6 +435,387 @@ impl GmgnClient {
         }
 
         tokens
+    }
+
+    // ─── New GMGN API Methods ─────────────────────────────────────────────
+
+    /// Internal helper: enforce rate limit before a CLI call.
+    async fn enforce_rate_limit(&self) {
+        let mut last = self.last_call.lock().await;
+        let elapsed = last.elapsed();
+        if elapsed < RATE_LIMIT_DELAY {
+            let sleep_time = RATE_LIMIT_DELAY - elapsed;
+            tokio::time::sleep(sleep_time).await;
+        }
+        *last = Instant::now();
+    }
+
+    /// Internal helper: run a gmgn-cli command and return stdout as String.
+    /// Returns None on any failure (timeout, non-zero exit, etc.).
+    async fn run_cli(&self, args: &[&str]) -> Option<String> {
+        self.enforce_rate_limit().await;
+        self.call_count.fetch_add(1, Ordering::Relaxed);
+
+        let output = tokio::time::timeout(
+            CLI_TIMEOUT,
+            tokio::process::Command::new(&self.cli_path)
+                .args(args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output(),
+        )
+        .await
+        .ok()?
+        .ok()?;
+
+        if !output.status.success() {
+            self.failure_count.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+
+        Some(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    /// Fetch token security data from GMGN.
+    /// Calls `gmgn-cli token security --chain sol --address <CA> --raw`.
+    ///
+    /// Returns LP burn status, honeypot check, buy/sell tax, top-10 concentration,
+    /// mint/freeze authority status — all Solana-native data that Birdeye may not provide.
+    pub async fn get_token_security(&self, token_ca: &str) -> Option<GmgnTokenSecurity> {
+        let stdout = self.run_cli(&[
+            "token", "security",
+            "--chain", "sol",
+            "--address", token_ca,
+            "--raw",
+        ]).await?;
+
+        match serde_json::from_str::<GmgnTokenSecurity>(&stdout) {
+            Ok(sec) => {
+                tracing::debug!(
+                    token = &token_ca[..token_ca.len().min(12)],
+                    honeypot = ?sec.is_honeypot,
+                    lp_burned = ?sec.lp_burned,
+                    "GMGN token security fetched"
+                );
+                Some(sec)
+            }
+            Err(e) => {
+                self.failure_count.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    token = &token_ca[..token_ca.len().min(12)],
+                    error = %e,
+                    "Failed to parse GMGN token security response"
+                );
+                None
+            }
+        }
+    }
+
+    /// Fetch full token info from GMGN including dev wallet data, social links,
+    /// smart money/KOL buyer counts, and holder concentration.
+    /// Calls `gmgn-cli token info --chain sol --address <CA> --raw`.
+    ///
+    /// This returns richer data than `get_holder_count()` which only extracts
+    /// the holder_count field from a basic parse.
+    pub async fn get_token_info_full(&self, token_ca: &str) -> Option<GmgnTokenInfoFull> {
+        let stdout = self.run_cli(&[
+            "token", "info",
+            "--chain", "sol",
+            "--address", token_ca,
+            "--raw",
+        ]).await?;
+
+        match serde_json::from_str::<GmgnTokenInfoFull>(&stdout) {
+            Ok(info) => {
+                tracing::debug!(
+                    token = &token_ca[..token_ca.len().min(12)],
+                    dev = ?info.dev_address.as_deref().map(|d| &d[..d.len().min(12)]),
+                    sm_buyers = ?info.smart_degen_buyer_count,
+                    kol_buyers = ?info.kol_buyer_count,
+                    "GMGN full token info fetched"
+                );
+                Some(info)
+            }
+            Err(e) => {
+                self.failure_count.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    token = &token_ca[..token_ca.len().min(12)],
+                    error = %e,
+                    "Failed to parse GMGN full token info response"
+                );
+                None
+            }
+        }
+    }
+
+    /// Fetch all tokens created by a dev wallet.
+    /// Calls `gmgn-cli portfolio created-tokens --chain sol --wallet <ADDR> --raw`.
+    ///
+    /// Returns each token's ATH mcap, current mcap, and graduation status.
+    /// Used for dev track record safety scoring.
+    pub async fn get_dev_created_tokens(&self, dev_wallet: &str) -> Vec<GmgnDevToken> {
+        let stdout = match self.run_cli(&[
+            "portfolio", "created-tokens",
+            "--chain", "sol",
+            "--wallet", dev_wallet,
+            "--order-by", "token_ath_mc",
+            "--raw",
+        ]).await {
+            Some(s) => s,
+            None => return Vec::new(),
+        };
+
+        // Response may be { "list": [...] } or a direct array.
+        let tokens: Vec<GmgnDevToken> = if let Ok(data) = serde_json::from_str::<serde_json::Value>(&stdout) {
+            let items = data.get("list")
+                .and_then(|l| l.as_array())
+                .cloned()
+                .unwrap_or_else(|| {
+                    data.as_array().cloned().unwrap_or_default()
+                });
+
+            items.iter().filter_map(|item| {
+                serde_json::from_value(item.clone()).ok()
+            }).collect()
+        } else {
+            Vec::new()
+        };
+
+        tracing::debug!(
+            dev = &dev_wallet[..dev_wallet.len().min(12)],
+            count = tokens.len(),
+            "GMGN dev created tokens fetched"
+        );
+
+        tokens
+    }
+
+    /// Fetch market signals from GMGN.
+    /// Calls `gmgn-cli market signal --chain sol --signal-type <TYPE> --raw`.
+    ///
+    /// Signal types:
+    /// - 6: Price surge
+    /// - 12: Smart money cluster buy
+    /// - 13: KOL call
+    /// - 18: Pump.fun claim
+    ///
+    /// Returns a list of recent signals with token addresses and market caps.
+    pub async fn get_market_signals(&self, signal_type: i64) -> Vec<GmgnMarketSignal> {
+        let stdout = match self.run_cli(&[
+            "market", "signal",
+            "--chain", "sol",
+            "--signal-type", &signal_type.to_string(),
+            "--raw",
+        ]).await {
+            Some(s) => s,
+            None => return Vec::new(),
+        };
+
+        // Response may be { "list": [...] } or { "data": { "list": [...] } }.
+        let signals: Vec<GmgnMarketSignal> = if let Ok(data) = serde_json::from_str::<serde_json::Value>(&stdout) {
+            let items = data.get("list")
+                .or_else(|| data.get("data").and_then(|d| d.get("list")))
+                .and_then(|l| l.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            items.iter().filter_map(|item| {
+                let addr = item.get("token_address")
+                    .or_else(|| item.get("address"))
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                if addr.is_empty() {
+                    return None;
+                }
+
+                Some(GmgnMarketSignal {
+                    token_address: addr,
+                    token_symbol: item.get("token_symbol")
+                        .or_else(|| item.get("symbol"))
+                        .and_then(|s| s.as_str())
+                        .map(|s| s.to_string()),
+                    trigger_market_cap: item.get("trigger_market_cap")
+                        .or_else(|| item.get("market_cap"))
+                        .and_then(|v| v.as_f64()),
+                    current_market_cap: item.get("current_market_cap")
+                        .and_then(|v| v.as_f64()),
+                    trigger_timestamp: item.get("trigger_timestamp")
+                        .or_else(|| item.get("timestamp"))
+                        .and_then(|v| v.as_i64()),
+                    signal_type: Some(signal_type),
+                })
+            }).collect()
+        } else {
+            Vec::new()
+        };
+
+        tracing::debug!(
+            signal_type,
+            count = signals.len(),
+            "GMGN market signals fetched"
+        );
+
+        signals
+    }
+
+    /// Fetch recent smart money trades (buy or sell side).
+    /// Calls `gmgn-cli track smartmoney --chain sol [--side buy|sell] --raw`.
+    ///
+    /// Returns recent trades from smart money wallets. When side is "sell",
+    /// can be used to detect smart money exit signals on held positions.
+    pub async fn get_smart_money_trades(&self, side: Option<&str>) -> Vec<GmgnSmartMoneyTrade> {
+        let mut args = vec![
+            "track", "smartmoney",
+            "--chain", "sol",
+            "--raw",
+        ];
+        if let Some(s) = side {
+            args.push("--side");
+            args.push(s);
+        }
+
+        let stdout = match self.run_cli(&args).await {
+            Some(s) => s,
+            None => return Vec::new(),
+        };
+
+        // Response may be { "list": [...] } or { "data": { "list": [...] } }.
+        let trades: Vec<GmgnSmartMoneyTrade> = if let Ok(data) = serde_json::from_str::<serde_json::Value>(&stdout) {
+            let items = data.get("list")
+                .or_else(|| data.get("data").and_then(|d| d.get("list")))
+                .and_then(|l| l.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            items.iter().filter_map(|item| {
+                let token_addr = item.get("token")
+                    .or_else(|| item.get("token_address"))
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                if token_addr.is_empty() {
+                    return None;
+                }
+
+                Some(GmgnSmartMoneyTrade {
+                    address: item.get("address")
+                        .or_else(|| item.get("wallet"))
+                        .and_then(|a| a.as_str())
+                        .map(|s| s.to_string()),
+                    token_address: Some(token_addr),
+                    token_symbol: item.get("token_symbol")
+                        .or_else(|| item.get("symbol"))
+                        .and_then(|s| s.as_str())
+                        .map(|s| s.to_string()),
+                    side: item.get("side")
+                        .or_else(|| item.get("action"))
+                        .and_then(|s| s.as_str())
+                        .map(|s| s.to_string()),
+                    amount_usd: item.get("amount_usd")
+                        .or_else(|| item.get("value"))
+                        .and_then(|v| v.as_f64()),
+                    token_amount: item.get("token_amount")
+                        .or_else(|| item.get("amount"))
+                        .and_then(|v| v.as_f64()),
+                    timestamp: item.get("timestamp")
+                        .or_else(|| item.get("time"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                })
+            }).collect()
+        } else {
+            Vec::new()
+        };
+
+        tracing::debug!(
+            side = ?side,
+            count = trades.len(),
+            "GMGN smart money trades fetched"
+        );
+
+        trades
+    }
+
+    /// Get wallet token holdings via `gmgn-cli portfolio holdings`.
+    ///
+    /// Returns total USD value of all holdings and individual token positions.
+    /// Uses GMGN API key auth (normal level).
+    pub async fn get_wallet_holdings(&self, chain: &str, wallet: &str) -> Option<GmgnWalletHoldings> {
+        let output = match self.run_cli(&[
+            "portfolio", "holdings",
+            "--chain", chain,
+            "--wallet", wallet,
+            "--raw",
+        ]).await {
+            Some(o) => o,
+            None => return None,
+        };
+
+        match serde_json::from_str::<serde_json::Value>(&output) {
+            Ok(val) => {
+                // GMGN returns either an array of positions or {data: [...]}.
+                let positions = if val.is_array() {
+                    val.as_array().cloned().unwrap_or_default()
+                } else if val.is_object() {
+                    val.get("data")
+                        .and_then(|d| d.as_array().cloned())
+                        .unwrap_or_default()
+                } else {
+                    return None;
+                };
+
+                let mut total_usd = 0.0;
+                let mut tokens = Vec::new();
+
+                for pos in &positions {
+                    let attrs = pos.get("attributes").unwrap_or(pos);
+                    let value_usd = attrs.get("value")
+                        .or_else(|| attrs.get("usd_value"))
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    total_usd += value_usd;
+
+                    let token_info = attrs.get("token").or_else(|| attrs.get("fungible_info"));
+                    let symbol = token_info
+                        .and_then(|t| t.get("symbol"))
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let mint = token_info
+                        .and_then(|t| t.get("address").or_else(|| t.get("implementation")))
+                        .and_then(|a| a.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let quantity = attrs.get("amount")
+                        .or_else(|| attrs.get("quantity"))
+                        .and_then(|v| {
+                            // Quantity can be a number or {numeric: ...}.
+                            v.as_f64().or_else(|| v.get("numeric").and_then(|n| n.as_f64()))
+                        })
+                        .unwrap_or(0.0);
+
+                    tokens.push(GmgnWalletToken {
+                        symbol,
+                        mint,
+                        quantity,
+                        value_usd,
+                    });
+                }
+
+                Some(GmgnWalletHoldings {
+                    total_value_usd: total_usd,
+                    tokens,
+                })
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to parse GMGN wallet holdings");
+                self.failure_count.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
     }
 }
 

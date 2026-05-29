@@ -2,9 +2,9 @@
 
 ## What This Is
 
-Autonomous Solana trading agent in Rust. Scans DexScreener for opportunities, evaluates through 6-signal confluence engine with hot-token tracker for multi-cycle data, runs 8-point Birdeye safety checks with per-signal reasoning, executes via Jupiter V6 with Helius Smart Transaction Sender, manages risk with institutional-grade controls. Smart money wallets sourced from GMGN. WebSocket-first wallet monitoring with polling fallback. Runs 24/7 with offline resilience.
+Autonomous Solana trading agent in Rust. Scans DexScreener for opportunities, evaluates through 6-signal confluence engine with GMGN signal enrichment (+SM buy/KOL call/price surge) and hot-token tracker for multi-cycle data, runs 11-point Birdeye + GMGN safety checks (LP burn, dev track record, cross-validated security) with per-signal reasoning, executes via Jupiter V6 with Helius Smart Transaction Sender, manages risk with institutional-grade controls including smart money exit detection. Smart money wallets sourced from GMGN. WebSocket-first wallet monitoring with polling fallback. Runs 24/7 with offline resilience.
 
-**All 4 mission milestones complete (stabilize, helius-integration, signal-revival, hardening). 18 features implemented. 300 tests passing (0 failures). Release build passes clean with 0 warnings. solana-sdk 3.0 + helius SDK v1.x integrated. WebSocket wallet monitoring operational. Smart Transaction Sender for execution. Hot-token tracker for multi-cycle signal data.**
+**All 4 mission milestones complete (stabilize, helius-integration, signal-revival, hardening) + GMGN deep integration. 25 features implemented. 300 tests passing (0 failures). Release build passes clean with 0 warnings. solana-sdk 3.0 + helius SDK v1.x integrated. WebSocket wallet monitoring operational. Smart Transaction Sender for execution. Hot-token tracker for multi-cycle signal data. GMGN-enriched safety, signals, and exit detection.**
 
 ## Build Status
 
@@ -19,6 +19,7 @@ Autonomous Solana trading agent in Rust. Scans DexScreener for opportunities, ev
 | 6 | Agent Loop, CLI & Skills | DONE |
 | 7 | Deployment & Hardening (local) | DONE |
 | 8 | GMGN Integration & Wallet Seeding | DONE |
+| 9 | GMGN Deep Integration (Safety + Signals + Exit Detection) | DONE |
 | — | Mission: Stabilize | DONE |
 | — | Mission: Helius Integration | DONE |
 | — | Mission: Signal Revival | DONE |
@@ -67,15 +68,16 @@ crates/
 │   ├── http.rs              # Rate-limited HTTP client (reqwest + governor)
 │   ├── dexscreener.rs       # DexScreener client
 │   ├── birdeye.rs           # Birdeye client
+│   ├── gmgn.rs              # GMGN client (9 methods: token info, security, dev tokens, market signals, SM trades, wallet holdings, etc.)
 │   ├── helius.rs            # Helius SDK v1.x (WebSocket monitoring, parsed tx, Smart Transaction Sender)
 │   ├── jupiter.rs           # Jupiter V6 client (quote + swap transaction)
 │   ├── zerion.rs            # Zerion API client (portfolio, positions, PnL, prices)
 │   └── watcher.rs           # WalletWatcher (WebSocket-first, polling fallback, EventBus events)
 ├── solagent-chain-solana/   # Solana RPC pool, keypair mgmt, pump.fun parsing (solana-sdk 3.0)
 ├── solagent-chain-base/     # Base/alloy provider (stubs — lower priority)
-├── solagent-signals/        # All 6 signals + ConfluenceScorer + RegistryScoreCache + BehavioralWalletCache + HotTokenTracker
+├── solagent-signals/        # All 6 signals + ConfluenceScorer + RegistryScoreCache + BehavioralWalletCache + HotTokenTracker + GmgnSignalEnrichment
 ├── solagent-behavioral/     # 5-layer behavioral intelligence scanner (DexScreener + GMGN)
-├── solagent-safety/         # 8-point safety scoring with live Birdeye data + dev blacklist
+├── solagent-safety/         # 11-point safety scoring with Birdeye + GMGN data + dev blacklist + dev track record
 ├── solagent-risk/           # Position sizing, dynamic exit profiles, drawdown, circuit breaker
 ├── solagent-exec/           # Jupiter V6 execution with Helius Smart Transaction Sender + retry + pre-flight checks
 ├── solagent-portfolio/      # SQLite wallet registry + portfolio manager + Helius credit tracking
@@ -88,10 +90,15 @@ crates/
 ```
 DexScreener ──┐
 Birdeye ──────┤──> Signal Engine (6) + HotTokenTracker ──> Confluence Scorer ──> Safety Check ──> Risk Manager ──> Execution (Jupiter + Smart TX Sender)
-Helius SDK ───┤       ↑                                                                                        │
-GMGN ─────────┘       │                                                                                        ▼
-                      ├── BehavioralWalletCache <── Behavioral Scanner (4h cycle)                  Portfolio Manager (SQLite)
-                      └── WhaleConsensus quality weighting                                         + Helius credit tracking
+Helius SDK ───┤       ↑     ↑                                ↑ + GMGN boost         │ + GMGN checks         │                   │
+GMGN ─────────┤       │     │                                │  (SM/KOL/surge)       │  (LP, dev, honeypot)   │                   │
+              │       │     └── GmgnSignalEnrichment ────────┘                        │                       ▼                   ▼
+              │       │          (refreshed each scan cycle)                          └── Dev Track Record    Portfolio Manager
+              │       └── BehavioralWalletCache <── Behavioral Scanner (4h cycle)         (graduation rate,       (SQLite)
+              │            WhaleConsensus quality weighting                                  best ATH)            + Helius credit tracking
+              │                         │
+              │                         ▼
+              └── SM Exit Detection (monitor loop: tightens stops, forces close)
 ```
 
 ### Agent State Machine
@@ -192,6 +199,13 @@ Per-signal reasoning and diagnostic detail logged for each evaluation.
 - **Seed script**: `scripts/seed-wallets.sh` for periodic refresh
 - **Dry run verified**: agent starts, loads wallets, scans tokens, evaluates safety+confluence
 
+### Phase 9: GMGN Deep Integration (Safety + Signals + Exit Detection)
+- **GmgnClient extended** with 6 methods (token security, full token info, dev created tokens, market signals, smart money trades, wallet holdings)
+- **3 new safety checks**: LP burn/lock from GMGN (fills Birdeye "not available" gap), dev track record scoring (launch count/graduation rate/best ATH), GMGN cross-validated honeypot + tax
+- **GmgnSignalEnrichment**: Pre-computed market signals (SM cluster-buy, KOL call, price surge) refreshed each scan cycle; boosts confluence by up to +60 pts
+- **Smart money exit detection**: Monitor loop queries GMGN for SM sell activity on held positions; 2+ sellers tightens trailing stop to 50%, 3+ sellers + >$500 sells forces position close
+- **GMGN skills directory**: 46 skills indexed from `https://gmgn.ai/static/opstatic/skills.json` across 5 categories; search on demand, install on demand
+
 ### Mission Completion (May 2025)
 
 All 4 milestones completed with 18 features implemented:
@@ -246,20 +260,28 @@ Background task runs every 4 hours. Uses DexScreener (crash/moon token discovery
 
 Tier output: PRECOGNITIVE (90-100), SOVEREIGN (75-89), EMERGING (55-74), NOISE (<55).
 
-## Safety Checks Detail
+## Safety Checks Detail (11: 8 Birdeye + 3 GMGN)
 
+### Birdeye (original)
 | Check | Points | Method |
 |-------|--------|--------|
 | Mint authority revoked | 15 | Birdeye security API |
 | Freeze authority revoked | 10 | Birdeye security API |
-| LP lock status | 0-20 | Birdeye security API |
+| LP lock status | 0-20 | Birdeye security API (often "not available") |
 | Top 10 holder concentration < 20% | 0-15 | Birdeye holder API |
 | Dev wallet not blacklisted | 0-15 | SQLite dev_blacklist |
 | Dev holdings < 5% | 0-10 | Birdeye security API |
 | Not a honeypot | 0-15 | Birdeye security API |
 | Buy/sell tax < 5% | 0-10 | Birdeye security API |
 
-Threshold: 70/100 to proceed.
+### GMGN-Enriched (new)
+| Check | Points | Method |
+|-------|--------|--------|
+| LP burn/lock from GMGN | 0-100 | `gmgn-cli token security` → lp_burned, lp_burn_percent |
+| Dev track record | 0-100 | `gmgn-cli portfolio created-tokens` → launch count, graduation rate, best ATH |
+| GMGN cross-validated honeypot + tax | 0-100 | `gmgn-cli token security` → is_honeypot, buy_tax, sell_tax |
+
+Threshold: 60/100 weighted composite to proceed.
 
 ## Risk Parameters (tuned for < 1 SOL wallet)
 
@@ -288,8 +310,8 @@ Threshold: 70/100 to proceed.
 | Birdeye | ~1 req/sec | Safety + prices | Cache 30s |
 | Jupiter | Unlimited | Swap execution | Use freely |
 | Helius | 1M credits/mo | WebSocket wallet monitoring + RPC + Smart TX Sender | WebSocket ~80% fewer calls than polling; credit usage tracked in SQLite |
-| GMGN | 20 req/sec | Wallet discovery/profiling | Used during seeding only |
-| Zerion | 60K calls/mo (2K/day) | Portfolio, PnL, positions | 8 RPS, ~20 calls/day for sync + tune |
+| GMGN | 20 req/sec | Wallet discovery/profiling + token security + dev track record + market signals + SM exit detection + wallet holdings | Rate-limited (0.5s); used throughout agent lifecycle |
+| Zerion | 60K calls/mo (2K/day) | Portfolio, PnL, positions (primary balance source) | 8 RPS, ~20 calls/day for sync + tune |
 
 ## External Tools
 
@@ -316,6 +338,9 @@ cf50762 feat: upgrade solana-sdk/solana-client to 3.0, add helius SDK, bump spl-
 
 ## Known Issues & Recent Fixes
 
+- **LP lock always "not available"** — Fixed: GMGN token security provides LP burn/lock data that Birdeye doesn't offer.
+- **No dev track record visibility** — Fixed: GMGN dev created-tokens endpoint provides launch history, graduation rate, and best ATH for rug-pull prediction.
+- **No sell-side intelligence** — Fixed: SM exit detection in monitor loop queries GMGN for smart money selling on held positions; tightens stops or forces close.
 - **Whale consensus was dead** — Fixed: BehavioralSignal as 6th strategy with GMGN top-trader detection, WebSocket-first monitoring, behavioral tier data boosts whale consensus quality weighting.
 - **Accumulation/Volume spike stuck at baseline** — Fixed: HotTokenTracker now persists signal data across scan cycles for longitudinal analysis.
 - **Confluence threshold cratered to floor** — Fixed: absolute floor enforced at 25.0 (was allowing lower).
@@ -344,6 +369,7 @@ cf50762 feat: upgrade solana-sdk/solana-client to 3.0, add helius SDK, bump spl-
 - **Endpoints**: portfolio overview, token positions, FIFO PnL (realized/unrealized/ROI)
 - **Auto-tuner**: logs Zerion PnL cross-check during each tuning cycle (optional)
 - **Agent enrichment**: every ~4h, refreshes top 10 wallet scores from Zerion PnL and emits `WalletHold` events for positions held by watched wallets
+- **Multi-provider fallback**: Zerion → GMGN → Helius RPC → cached (balance and reconciliation tolerate individual API outages)
 - **CLI**: `solagent portfolio sync --address <WALLET>` — fetch portfolio + positions + PnL
 - **Config**: `ZERION_API_KEY` env var or `[data] zerion_api_key` in config/local.toml
 - **Free tier**: 60K calls/mo, 10 RPS — budget ~20 calls/day for daily sync + tune cycles

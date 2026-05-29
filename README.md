@@ -1,15 +1,18 @@
 # SolAgent
 
-Autonomous Solana trading agent built in Rust. Scans for opportunities via DexScreener, evaluates through a 6-signal confluence engine with hot-token tracker for multi-cycle data and per-signal reasoning, runs 8-point safety checks against live Birdeye data, executes via Jupiter V6 with Helius Smart Transaction Sender, and manages risk with institutional-grade controls. Smart money wallets sourced from GMGN. WebSocket-first wallet monitoring. Runs 24/7 with offline resilience.
+Autonomous Solana trading agent built in Rust. Scans for opportunities via DexScreener, evaluates through a 6-signal confluence engine with GMGN signal enrichment (smart money buy signals, KOL calls, price surges) and hot-token tracker for multi-cycle data, runs 11-point safety checks against live Birdeye + GMGN data (including LP burn status, dev track record, and cross-validated security), executes via Jupiter V6 with Helius Smart Transaction Sender, and manages risk with institutional-grade controls including smart money exit detection. Smart money wallets sourced from GMGN. WebSocket-first wallet monitoring. Runs 24/7 with offline resilience.
 
 ## Key Features
 
-- **6-signal confluence engine**: Whale Consensus, Behavioral, Accumulation, Launch Momentum, Volume Spike, Social — with weighted scoring and per-signal diagnostic reasoning
+- **6-signal confluence engine**: Whale Consensus, Behavioral, Accumulation, Launch Momentum, Volume Spike, Social — with weighted scoring, per-signal diagnostic reasoning, and GMGN signal enrichment (+60 bonus from SM buy/KOL call/price surge signals)
+- **GMGN deep integration**: 6 GmgnClient methods — token security, full token info, dev created tokens, market signals (SM buy/KOL call/price surge), smart money trades, wallet holdings — powering safety checks, signal enrichment, exit detection, and balance fallback
+- **11-point safety scoring**: 8 original Birdeye checks + GMGN LP burn status (fills Birdeye gap), dev track record scoring (launch history, graduation rate, best ATH), GMGN cross-validated honeypot/tax checks
+- **Smart money exit detection**: Monitor loop queries GMGN for SM sell activity on held positions; 2+ SM sellers tightens trailing stop, 3+ forces position close
 - **Hot-token tracker**: Persists signal data across scan cycles for longitudinal accumulation/volume analysis
+- **Multi-provider data fallback**: Wallet balance and reconciliation via Zerion → GMGN → Helius RPC → cached (tolerates individual API outages without halting the agent)
 - **WebSocket-first wallet monitoring**: Real-time transaction streaming via Helius SDK with automatic polling fallback (~80% fewer API calls than polling)
 - **Helius Smart Transaction Sender**: Priority fee estimation for reliable swap execution
 - **Helius credit budget tracking**: Persistent SQLite tracking of API credit usage
-- **8-point safety scoring**: Mint/freeze authority, LP lock, holder concentration, dev blacklist, honeypot, tax checks
 - **Behavioral intelligence scanner**: 5-layer algorithm classifying wallets into PRECOGNITIVE/SOVEREIGN/EMERGING/NOISE tiers
 - **Dynamic risk management**: Position sizing by confluence + win rate, circuit breaker, trailing stops, exponential backoff
 - **`solagent status` CLI**: Structured health snapshot of agent, positions, and API budgets
@@ -115,15 +118,17 @@ solagent/
 ```
 DexScreener ──┐
 Birdeye ──────┤──> Signal Engine (6) + HotTokenTracker ──> Confluence Scorer ──> Safety Check
-Helius SDK ───┤       ↑                                                        │
-GMGN ─────────┘       │                                                        ▼
-                      ├── BehavioralWalletCache <── Behavioral Scanner    Risk Manager
-                      └── WhaleConsensus quality weighting                     │
-                                                                                   ▼
-                                                        Execution Engine (Jupiter + Smart TX Sender)
-                                                                                   │
-                                                                                   ▼
-                                                                 Portfolio Manager (SQLite)
+Helius SDK ───┤       ↑     ↑                                ↑ + GMGN enrichment     │
+GMGN ─────────┤       │     │                                │  (+SM buy/KOL/surge)   ▼
+              │       │     │                                                     Risk Manager
+              │       │     └── GMGN SignalEnrichment (SM buy, KOL call,              │
+              │       │          price surge → confluence boost)                       ▼
+              │       └── BehavioralWalletCache <── Behavioral Scanner     Execution Engine
+              │            WhaleConsensus quality weighting                   (Jupiter + Smart TX Sender)
+              │                         │                                          │
+              │                         ▼                                          ▼
+              └── SM Exit Detection (monitor)                     Portfolio Manager (SQLite)
+                  (tightens stops, forces close)                   + Helius credit tracking
 ```
 
 ### Agent State Machine
@@ -147,7 +152,24 @@ Scanning → Evaluating → RiskCheck → Executing → Monitoring
 
 Confluence threshold: 35/100 (progressive floor: 25, absolute floor: 25.0).
 
-## Risk Management
+## Safety Checks (11 per token)
+
+### Birdeye (8 original)
+1. Mint authority revoked (15 pts)
+2. Freeze authority revoked (10 pts)
+3. LP lock status (0-20 pts)
+4. Top 10 holder concentration < 20% (0-15 pts)
+5. Dev wallet clean / not blacklisted (0-15 pts)
+6. Dev holdings < 5% (0-10 pts)
+7. Not a honeypot (0-15 pts)
+8. Buy/sell tax < 5% (0-10 pts)
+
+### GMGN-Enriched (3 new)
+9. LP burn/lock from GMGN (0-100 pts) — fills the gap where Birdeye returns "not available"
+10. Dev track record (0-100 pts) — scores launch count, graduation rate, best ATH; flags serial rugger devs
+11. GMGN cross-validated honeypot + tax — independent Solana-native confirmation
+
+Threshold: 60/100 weighted composite to proceed.
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|
@@ -165,26 +187,41 @@ Confluence threshold: 35/100 (progressive floor: 25, absolute floor: 25.0).
 
 ## GMGN Integration
 
-Smart money wallets are sourced from [GMGN](https://gmgn.ai) via their API:
+GMGN provides deep on-chain data beyond smart money wallet discovery. The agent uses 6 GmgnClient methods across safety, signals, monitoring, and balance:
 
+### Data Sources
+| Method | GMGN CLI Command | Used By |
+|--------|-------------------|---------|
+| `get_token_security()` | `gmgn-cli token security` | Safety: LP burn, honeypot, tax, mint/freeze |
+| `get_token_info_full()` | `gmgn-cli token info` | Safety: dev wallet, SM/KOL buyer counts |
+| `get_dev_created_tokens()` | `gmgn-cli portfolio created-tokens` | Safety: dev track record, graduation rate |
+| `get_market_signals()` | `gmgn-cli market signal` | Signals: SM buy (type 12), KOL call (type 13), price surge (type 6) |
+| `get_smart_money_trades()` | `gmgn-cli track smartmoney --side sell` | Monitor: SM exit detection on held positions |
+| `get_wallet_holdings()` | `gmgn-cli portfolio holdings` | Balance fallback: wallet token holdings + total USD |
+
+### Signal Enrichment
+Pre-computed GMGN market signals boost confluence scoring each scan cycle:
+- Smart money cluster-buy → +10/18/25 pts (1/2/3+ signals)
+- KOL call → +7/12/15 pts (1/2/3+ signals)
+- Price surge → +10/15/20 pts (1/2/3+ signals)
+- Maximum total boost: +60 pts on top of weighted composite
+
+### Smart Money Exit Detection
+The monitor loop queries GMGN for SM sell activity on all held positions:
+- **2+ SM sellers**: Trailing stop tightened to 50% of normal distance (more likely to exit on pullback)
+- **3+ SM sellers + >$500 total sells**: Position force-closed immediately
+
+### Wallet Seeding
 ```bash
-# Discover active smart money wallets
+./scripts/seed-wallets.sh           # pull fresh SM + KOL wallets
 gmgn-cli track smartmoney --chain sol --limit 100 --raw
-
-# Discover KOL wallets
 gmgn-cli track kol --chain sol --limit 100 --raw
-
-# Profile a specific wallet (win rate, PnL, trade stats)
 gmgn-cli portfolio stats --chain sol --wallet <ADDR> --raw
-
-# Research a token (price, safety, holders, smart money exposure)
 gmgn-cli token info --chain sol --address <TOKEN_CA>
-
-# Seed SolAgent registry from GMGN
-./scripts/seed-wallets.sh
 ```
 
 6 GMGN skills installed at `.agents/skills/`: gmgn-track, gmgn-portfolio, gmgn-token, gmgn-market, gmgn-swap, gmgn-cooking.
+GMGN skills directory: 46 skills across 5 categories (trading, data analytics, monitor, news/media, cooking) at `https://gmgn.ai/static/opstatic/skills.json`.
 
 ## API Budget
 
@@ -194,8 +231,8 @@ gmgn-cli token info --chain sol --address <TOKEN_CA>
 | Birdeye | ~1 req/sec | Safety + prices |
 | Jupiter | Unlimited | Swap execution |
 | Helius | 1M credits/mo | WebSocket monitoring + Smart TX Sender + RPC (credit usage tracked) |
-| GMGN | 20 req/sec | Smart money discovery + profiling |
-| Zerion | 60K calls/mo | Portfolio, PnL, positions |
+| GMGN | 20 req/sec | SM discovery + profiling + token security + dev track record + market signals + SM exit detection + wallet holdings |
+| Zerion | 60K calls/mo | Portfolio, PnL, positions (primary balance source) |
 
 ## Testing
 

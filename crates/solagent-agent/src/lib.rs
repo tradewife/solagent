@@ -405,6 +405,9 @@ pub struct AgentSubsystems {
     /// Optional Helius credit tracker — records estimated credit usage per API call
     /// and provides threshold warnings at 50% and 90% consumption.
     pub helius_credit_tracker: Option<std::sync::Arc<solagent_data::HeliusCreditTracker>>,
+    /// GMGN signal enrichment — pre-computed market signals (SM buy, KOL call,
+    /// price surge) refreshed each scan cycle. Boosts confluence scoring.
+    pub gmgn_enrichment: Option<std::sync::Arc<solagent_signals::GmgnSignalEnrichment>>,
 }
 
 // ─── Agent ───────────────────────────────────────────────────────────────────
@@ -462,6 +465,16 @@ impl Agent {
 
         subsystems.auto_tuner = Some(auto_tuner);
         subsystems.zerion = if zerion_for_agent.is_enabled() { Some(zerion_for_agent) } else { None };
+
+        // Enable GMGN on the safety evaluator for LP burn, dev track record,
+        // and token security cross-validation. Create a separate instance
+        // since GmgnClient is not Clone (it holds a Mutex for rate limiting).
+        subsystems.safety.gmgn = Some(solagent_data::GmgnClient::new());
+
+        // Initialize GMGN signal enrichment and attach to the confluence scorer.
+        let gmgn_enrichment = std::sync::Arc::new(solagent_signals::GmgnSignalEnrichment::new());
+        subsystems.confluence.lock().unwrap().gmgn_enrichment = Some((*gmgn_enrichment).clone());
+        subsystems.gmgn_enrichment = Some(gmgn_enrichment);
 
         // Extract the credit tracker before subsystems is moved into Arc.
         let helius_credit_tracker = subsystems.helius_credit_tracker.take();
@@ -544,6 +557,7 @@ impl Agent {
                 zerion: None,
                 behavioral_cache: None,
                 helius_credit_tracker: None,
+                gmgn_enrichment: None,
             }),
             decisions: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             running: Arc::new(tokio::sync::RwLock::new(false)),
@@ -1116,13 +1130,56 @@ impl Agent {
         (cash - fee_reserve).max(0.0)
     }
 
-    /// Get SOL balance from the wallet. Queries the Solana RPC for the real balance.
-    /// Caches the last known balance and returns it on RPC failure instead of $0.
+    /// Get SOL balance from the wallet.
+    /// Priority: Zerion → GMGN → Helius RPC → cached.
     async fn get_sol_balance(&self) -> f64 {
+        let wallet = self.config.wallet_address.as_deref();
+        let sol_price = self.get_sol_price().await;
+
+        // 1. Try Zerion portfolio (reliable, works without Helius credits).
+        if let Some(ref zerion) = self.subsystems.zerion {
+            if let Some(w) = wallet {
+                if let Ok(portfolio) = zerion.get_portfolio(w).await {
+                    let estimated_sol = if sol_price > 0.0 {
+                        portfolio.total_value_usd / sol_price
+                    } else {
+                        0.0
+                    };
+                    tracing::debug!(
+                        portfolio_usd = portfolio.total_value_usd,
+                        estimated_sol,
+                        "SOL balance from Zerion"
+                    );
+                    *self.cached_sol_balance.write().await = estimated_sol;
+                    return estimated_sol;
+                }
+            }
+        }
+
+        // 2. Try GMGN wallet holdings.
+        if let Some(w) = wallet {
+            if let Some(holdings) = self.subsystems.gmgn.get_wallet_holdings("sol", w).await {
+                let estimated_sol = if sol_price > 0.0 {
+                    holdings.total_value_usd / sol_price
+                } else {
+                    0.0
+                };
+                tracing::debug!(
+                    portfolio_usd = holdings.total_value_usd,
+                    token_count = holdings.tokens.len(),
+                    estimated_sol,
+                    "SOL balance from GMGN"
+                );
+                *self.cached_sol_balance.write().await = estimated_sol;
+                return estimated_sol;
+            }
+        }
+
+        // 3. Fallback to Helius RPC.
         match self.subsystems.exec.get_sol_balance().await {
             Some(lamports) => {
                 let sol = lamports as f64 / 1_000_000_000.0;
-                tracing::debug!(sol_balance = sol, "SOL balance fetched");
+                tracing::debug!(sol_balance = sol, "SOL balance from RPC");
                 *self.cached_sol_balance.write().await = sol;
                 sol
             }
@@ -1131,11 +1188,11 @@ impl Agent {
                 if cached > 0.0 {
                     tracing::warn!(
                         cached_sol = cached,
-                        "SOL balance RPC failed — using cached balance"
+                        "All live sources failed — using cached balance"
                     );
                     cached
                 } else {
-                    tracing::warn!("SOL balance RPC failed and no cached value — using $0");
+                    tracing::warn!("All balance sources failed — using $0");
                     0.0
                 }
             }
@@ -1210,7 +1267,8 @@ impl Agent {
         }
     }
 
-    /// Monitor open positions (check stop-loss, take-profit, trailing stops).
+    /// Monitor open positions (check stop-loss, take-profit, trailing stops,
+    /// and smart money exit signals).
     async fn monitor(&self) -> Result<()> {
         self.transition(AgentState::Monitoring).await;
 
@@ -1218,6 +1276,30 @@ impl Agent {
         if positions.is_empty() {
             return Ok(());
         }
+
+        // ─── Smart Money Exit Detection ────────────────────────────────
+        // Check if smart money is selling any tokens we currently hold.
+        // This is a negative signal that tightens trailing stops or triggers
+        // early exit when multiple SM wallets are dumping a held position.
+        let sm_exit_tokens: std::collections::HashMap<String, (usize, f64)> = {
+            let mut exits = std::collections::HashMap::new();
+            for pos in &positions {
+                let (count, total_usd) = solagent_signals::GmgnSignalEnrichment::check_sm_exit_signals(
+                    &self.subsystems.gmgn,
+                    &pos.token_address,
+                ).await;
+                if count > 0 {
+                    tracing::warn!(
+                        token = &pos.token_address,
+                        sm_sellers = count,
+                        total_sell_usd = total_usd,
+                        "Smart money EXIT signal detected on held position"
+                    );
+                    exits.insert(pos.token_address.clone(), (count, total_usd));
+                }
+            }
+            exits
+        };
 
         for pos in &positions {
             // Get current price from DexScreener.
@@ -1256,6 +1338,33 @@ impl Agent {
             drop(exits);
 
             // Check stop conditions with per-position trailing stop.
+            // Smart money exit signal tightens the trailing stop aggressively.
+            let mut effective_trailing_pct = trailing_pct;
+            if let Some((sm_count, sm_total_usd)) = sm_exit_tokens.get(&pos.token_address) {
+                // If 2+ smart money wallets are selling, halve the trailing stop distance
+                // (tighter stop = more likely to exit on any pullback).
+                if *sm_count >= 2 {
+                    effective_trailing_pct = (trailing_pct / 2.0).max(0.03);
+                    tracing::warn!(
+                        token = &pos.token_address,
+                        sm_sellers = sm_count,
+                        original_trailing = trailing_pct,
+                        tightened_trailing = effective_trailing_pct,
+                        "Tightening trailing stop due to smart money exit signal"
+                    );
+                }
+                // If 3+ SM wallets are dumping with >$500 total sells, force close.
+                if *sm_count >= 3 && *sm_total_usd > 500.0 {
+                    tracing::warn!(
+                        token = &pos.token_address,
+                        sm_sellers = sm_count,
+                        sm_total_usd,
+                        "Smart money mass exit — forcing position close"
+                    );
+                    // Fall through to close logic below with should_close = Some.
+                }
+            }
+
             let risk = self.subsystems.risk.lock().unwrap();
             let should_close = risk.check_stop_conditions(
                 current_price,
@@ -1263,8 +1372,19 @@ impl Agent {
                 pos.stop_loss,
                 pos.take_profit,
                 Some(peak_price),
-                trailing_pct,
+                effective_trailing_pct,
             );
+
+            // Override: force close on SM mass exit.
+            let sm_force_close = sm_exit_tokens.get(&pos.token_address)
+                .map(|(count, usd)| *count >= 3 && *usd > 500.0)
+                .unwrap_or(false);
+
+            let should_close = if sm_force_close {
+                Some(format!("Smart money mass exit ({} sellers)", sm_exit_tokens.get(&pos.token_address).unwrap().0))
+            } else {
+                should_close
+            };
             drop(risk);
 
             if let Some(reason) = should_close {
@@ -1323,35 +1443,113 @@ impl Agent {
     pub async fn run(&self) -> Result<()> {
         *self.running.write().await = true;
 
-        // Reconcile on-chain positions with the database on startup.
-        // This catches positions opened before the agent crashed or trades
-        // that were confirmed on-chain but whose confirmation timed out.
-        tracing::info!("Running on-chain position reconciliation on startup");
-        match self.subsystems.exec.reconcile_positions(
-            &self.subsystems.portfolio,
-            &self.subsystems.dex,
-        ).await {
-            Ok(count) => {
-                let open_positions = self.subsystems.portfolio.get_open_positions().await
-                    .map(|p| p.len()).unwrap_or(0);
-                if count > 0 {
-                    tracing::warn!(
-                        reconciled = count,
-                        open_positions,
-                        "Found {} on-chain positions missing from DB — records created ({} total open positions now tracked)",
-                        count, open_positions + count,
-                    );
-                } else {
-                    tracing::info!(
-                        open_positions,
-                        "Reconciliation: all {} on-chain positions already in DB",
-                        open_positions,
-                    );
+        // Reconcile positions with the database on startup.
+        // Priority: Zerion → GMGN → on-chain (DAS API).
+        tracing::info!("Running position reconciliation on startup");
+        let mut reconciled_count = 0usize;
+
+        // 1. Try Zerion first.
+        if let Some(ref zerion) = self.subsystems.zerion {
+            if let Some(ref wallet) = self.config.wallet_address {
+                match zerion.get_positions(wallet).await {
+                    Ok(positions) => {
+                        let zerion_balances: Vec<(String, u64, u8)> = positions.iter()
+                            .filter(|p| p.value_usd > 0.01)
+                            .filter_map(|p| {
+                                let mint = p.implementation.as_ref()
+                                    .and_then(|imp| imp.split(':').next_back().map(|s| s.to_string()))
+                                    .unwrap_or_default();
+                                if mint.is_empty() { return None; }
+                                let raw = (p.quantity * 1_000_000_000.0) as u64;
+                                Some((mint, raw, 9u8))
+                            })
+                            .collect();
+                        if !zerion_balances.is_empty() {
+                            match self.subsystems.portfolio.reconcile_positions(
+                                &zerion_balances,
+                                &self.subsystems.dex,
+                            ).await {
+                                Ok(count) => {
+                                    reconciled_count = count;
+                                    tracing::info!(reconciled = count, "Zerion reconciliation complete");
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "Zerion reconciliation failed (non-fatal)");
+                                }
+                            }
+                        } else {
+                            tracing::info!("Zerion reconciliation: no token positions found");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Zerion positions fetch failed — trying next source");
+                    }
                 }
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to reconcile positions on startup (non-fatal)");
+        }
+
+        // 2. Try GMGN wallet holdings.
+        if reconciled_count == 0 {
+            if let Some(ref wallet) = self.config.wallet_address {
+                if let Some(holdings) = self.subsystems.gmgn.get_wallet_holdings("sol", wallet).await {
+                    let gmgn_balances: Vec<(String, u64, u8)> = holdings.tokens.iter()
+                        .filter(|t| t.value_usd > 0.01 && !t.mint.is_empty())
+                        .filter_map(|t| {
+                            let raw = (t.quantity * 1_000_000_000.0) as u64;
+                            Some((t.mint.clone(), raw, 9u8))
+                        })
+                        .collect();
+                    if !gmgn_balances.is_empty() {
+                        match self.subsystems.portfolio.reconcile_positions(
+                            &gmgn_balances,
+                            &self.subsystems.dex,
+                        ).await {
+                            Ok(count) => {
+                                reconciled_count = count;
+                                tracing::info!(reconciled = count, "GMGN reconciliation complete");
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "GMGN reconciliation failed (non-fatal)");
+                            }
+                        }
+                    } else {
+                        tracing::info!("GMGN reconciliation: no token positions found");
+                    }
+                }
             }
+        }
+
+        // 3. Fallback to on-chain (DAS API via Helius).
+        if reconciled_count == 0 && self.subsystems.exec.solana_pubkey().is_some() {
+            match self.subsystems.exec.reconcile_positions(
+                &self.subsystems.portfolio,
+                &self.subsystems.dex,
+            ).await {
+                Ok(count) => {
+                    reconciled_count = count;
+                    if count > 0 {
+                        tracing::warn!(reconciled = count, "On-chain reconciliation found missing positions");
+                    } else {
+                        tracing::info!("On-chain reconciliation: all positions already in DB");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "On-chain reconciliation also failed (non-fatal)");
+                }
+            }
+        }
+
+        let open_positions = self.subsystems.portfolio.get_open_positions().await
+            .map(|p| p.len()).unwrap_or(0);
+        if reconciled_count > 0 {
+            tracing::info!(
+                reconciled = reconciled_count,
+                open_positions,
+                "Reconciliation complete: {} positions reconciled, {} total open",
+                reconciled_count, open_positions,
+            );
+        } else {
+            tracing::info!(open_positions, "Reconciliation complete: {} open positions tracked", open_positions);
         }
 
         // Clean up phantom positions (from wrong token decimals inflating size_usd).
@@ -1597,6 +1795,16 @@ impl Agent {
                     // Poll social signal (twitter search) each scan cycle.
                     if let Err(e) = self.subsystems.confluence.lock().unwrap().poll_social().await {
                         tracing::debug!(error = %e, "Social signal poll skipped");
+                    }
+
+                    // Refresh GMGN market signals (SM buy, KOL call, price surge).
+                    // This makes enrichment data available to confluence scoring
+                    // without per-token API calls during evaluation.
+                    if let Some(ref enrichment) = self.subsystems.gmgn_enrichment {
+                        let count = enrichment.refresh(&self.subsystems.gmgn).await;
+                        if count > 0 {
+                            tracing::info!(unique_tokens = count, "GMGN market signals loaded into enrichment cache");
+                        }
                     }
 
                     // Poll curated Twitter account timelines for token-specific mentions.
@@ -1860,13 +2068,69 @@ impl Agent {
                         tracing::error!(error = %e, "Monitor failed");
                     }
 
-                    // Periodically reconcile on-chain positions with DB
-                    // to catch any positions from trades that were confirmed late.
-                    if let Err(e) = self.subsystems.exec.reconcile_positions(
-                        &self.subsystems.portfolio,
-                        &self.subsystems.dex,
-                    ).await {
-                        tracing::debug!(error = %e, "Periodic reconciliation skipped (non-fatal)");
+                    // Periodically reconcile positions with DB to catch any from
+                    // trades that were confirmed late. Zerion → GMGN → on-chain.
+                    let wallet = self.config.wallet_address.as_deref();
+                    let mut periodic_done = false;
+
+                    // 1. Zerion.
+                    if !periodic_done {
+                        if let Some(ref zerion) = self.subsystems.zerion {
+                            if let Some(w) = wallet {
+                                if let Ok(positions) = zerion.get_positions(w).await {
+                                    let balances: Vec<(String, u64, u8)> = positions.iter()
+                                        .filter(|p| p.value_usd > 0.01)
+                                        .filter_map(|p| {
+                                            let mint = p.implementation.as_ref()
+                                                .and_then(|imp| imp.split(':').next_back().map(|s| s.to_string()))
+                                                .unwrap_or_default();
+                                            if mint.is_empty() { return None; }
+                                            Some((mint, (p.quantity * 1_000_000_000.0) as u64, 9u8))
+                                        })
+                                        .collect();
+                                    if !balances.is_empty() {
+                                        if let Err(e) = self.subsystems.portfolio.reconcile_positions(
+                                            &balances,
+                                            &self.subsystems.dex,
+                                        ).await {
+                                            tracing::debug!(error = %e, "Periodic Zerion reconciliation skipped");
+                                        }
+                                        periodic_done = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // 2. GMGN.
+                    if !periodic_done {
+                        if let Some(w) = wallet {
+                            if let Some(holdings) = self.subsystems.gmgn.get_wallet_holdings("sol", w).await {
+                                let balances: Vec<(String, u64, u8)> = holdings.tokens.iter()
+                                    .filter(|t| t.value_usd > 0.01 && !t.mint.is_empty())
+                                    .filter_map(|t| Some((t.mint.clone(), (t.quantity * 1_000_000_000.0) as u64, 9u8)))
+                                    .collect();
+                                if !balances.is_empty() {
+                                    if let Err(e) = self.subsystems.portfolio.reconcile_positions(
+                                        &balances,
+                                        &self.subsystems.dex,
+                                    ).await {
+                                        tracing::debug!(error = %e, "Periodic GMGN reconciliation skipped");
+                                    }
+                                    periodic_done = true;
+                                }
+                            }
+                        }
+                    }
+
+                    // 3. On-chain.
+                    if !periodic_done {
+                        if let Err(e) = self.subsystems.exec.reconcile_positions(
+                            &self.subsystems.portfolio,
+                            &self.subsystems.dex,
+                        ).await {
+                            tracing::debug!(error = %e, "Periodic on-chain reconciliation skipped");
+                        }
                     }
 
                     // Periodic Zerion enrichment: refresh wallet scores and emit
