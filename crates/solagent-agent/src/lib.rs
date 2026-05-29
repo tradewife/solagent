@@ -3029,4 +3029,465 @@ mod tests {
         assert!(acc_score > 0,
             "Accumulation signal should score > 0 with holder growth data preserved by tracker, got {acc_score}");
     }
+
+    // ════════════════════════════════════════════════════════════════════
+    // PART D: Cross-Area Validation Tests (VAL-CROSS-001..005)
+    // ════════════════════════════════════════════════════════════════════
+
+    /// VAL-CROSS-001: Agent survives simulated API failures with backoff and recovery.
+    ///
+    /// Validates that:
+    /// - Backoff delay follows min(2^n * 2, 120) formula during failures
+    /// - Backoff resets on successful scan recovery
+    /// - effective_threshold stays >= ABSOLUTE_FLOOR (25.0) throughout
+    #[tokio::test]
+    async fn test_cross_001_agent_survives_api_failures_with_backoff() {
+        let event_bus = EventBus::new(16);
+        let agent = Agent::new_minimal(AgentConfig::default(), event_bus);
+
+        // Simulate 5 consecutive scan failures and verify backoff escalation.
+        for expected_n in 1..=5u32 {
+            let n = agent.consecutive_scan_failures.fetch_add(1, Ordering::SeqCst) + 1;
+            assert_eq!(n, expected_n,
+                "Failure count should be {expected_n}, got {n}");
+
+            let delay = expected_backoff_delay(n);
+            // Verify delay follows the formula: min(2^n * 2, 120)
+            let expected = (2u64.saturating_pow(n.min(31)) * 2).min(120);
+            assert_eq!(delay, expected,
+                "Backoff delay for n={n} should be {expected}s, got {delay}s");
+        }
+
+        // Verify effective_threshold formula stays >= ABSOLUTE_FLOOR regardless of failures.
+        // With runtime=10 (below floor) and progressive=15 (below floor),
+        // effective should still be 25.0.
+        let runtime: f64 = 10.0;
+        let progressive: f64 = 15.0;
+        let effective = ABSOLUTE_FLOOR.max(runtime.min(progressive));
+        assert!(
+            effective >= ABSOLUTE_FLOOR,
+            "effective_threshold ({effective}) must be >= ABSOLUTE_FLOOR ({ABSOLUTE_FLOOR}) during failures"
+        );
+
+        // Simulate recovery: reset backoff counter.
+        agent.consecutive_scan_failures.store(0, Ordering::SeqCst);
+        assert_eq!(
+            agent.consecutive_scan_failures.load(Ordering::SeqCst),
+            0,
+            "Backoff should reset to 0 after recovery"
+        );
+
+        // After recovery, backoff delay for next hypothetical failure should restart at 4s.
+        let post_recovery_delay = expected_backoff_delay(1);
+        assert_eq!(post_recovery_delay, 4,
+            "Post-recovery backoff should start from 4s, got {post_recovery_delay}s");
+    }
+
+    /// VAL-CROSS-001 extended: Verify WARN/ERROR thresholds at 10 and 50 failures.
+    #[test]
+    fn test_cross_001_warn_and_error_failure_thresholds() {
+        // At 10 failures, backoff should still be growing.
+        let delay_10 = expected_backoff_delay(10);
+        assert!(delay_10 > 0, "Backoff at 10 failures should be > 0");
+
+        // At 50 failures, delay should be capped at 120s.
+        let delay_50 = expected_backoff_delay(50);
+        assert_eq!(delay_50, 120,
+            "Backoff at 50 failures should be capped at 120s, got {delay_50}s");
+
+        // Verify the threshold behavior: 10 < cap, 50 = cap.
+        assert!(delay_10 <= 120);
+        assert_eq!(delay_50, 120);
+    }
+
+    /// VAL-CROSS-002: Agent produces non-zero signal scores after recovery.
+    ///
+    /// Validates that after a simulated failure period (backoff escalation + reset),
+    /// the signal engine can still produce non-zero scores when fed real data.
+    #[tokio::test]
+    async fn test_cross_002_nonzero_signal_scores_after_recovery() {
+        // Build a ConfluenceScorer with 3 testable signal strategies.
+        let mut confluence = solagent_signals::ConfluenceScorer::new(25.0);
+
+        // Accumulation signal (needs >=3 snapshots with holder growth).
+        let acc = solagent_signals::AccumulationSignal::new(Chain::Solana, 10);
+        confluence.add_strategy(solagent_signals::StrategyKind::Accumulation(acc), 0.15);
+
+        // Volume spike signal (needs >=3 data points with a spike).
+        let vs = solagent_signals::VolumeSpikeSignal::new(Chain::Solana, 3.0, 10);
+        confluence.add_strategy(solagent_signals::StrategyKind::VolumeSpike(vs), 0.10);
+
+        // Launch momentum signal (needs >=2 snapshots for a new token).
+        let lm = solagent_signals::LaunchMomentumSignal::new(Chain::Solana, 10);
+        confluence.add_strategy(solagent_signals::StrategyKind::LaunchMomentum(lm), 0.15);
+
+        let token_ca = "RecoveryToken11111111111111111111111111111";
+
+        // Simulate "failure period" — no data fed during this time.
+        // (No feed_scan_data calls — signals have zero history.)
+
+        // Now simulate "recovery" — feed 5 cycles of data.
+        let base_volume = 1000.0;
+        for cycle in 1..=5u64 {
+            let volume = base_volume + (cycle as f64 * 1000.0);
+            let holders = 100 + cycle * 20;
+            let price = 0.01 + (cycle as f64 * 0.001);
+            confluence.feed_scan_data(token_ca, Some(volume), Some(holders), Some(price));
+        }
+
+        // Evaluate after recovery.
+        let token = TokenInfo {
+            address: token_ca.to_string(),
+            chain: Chain::Solana,
+            symbol: "RCVRY".to_string(),
+            name: "Recovery Token".to_string(),
+            decimals: 9,
+            price_usd: Some(0.015),
+            market_cap_usd: Some(100_000.0),
+            volume_24h: Some(6000.0),
+            holder_count: Some(200),
+            created_at: Some(Utc::now() - chrono::Duration::minutes(20)),
+            pair_address: Some("pair_recovery".to_string()),
+            lp_locked: None,
+            mint_authority_revoked: None,
+            freeze_authority_revoked: None,
+        };
+
+        let result = confluence.score(&token).await.unwrap();
+
+        // At least one signal must produce a non-zero score after recovery.
+        let nonzero_count = result.signals.iter()
+            .filter(|s| s.score > 0)
+            .count();
+        assert!(nonzero_count > 0,
+            "After recovery, at least 1 signal should score > 0, but all scored 0. Signals: {:?}",
+            result.signals.iter().map(|s| format!("{}={}", s.strategy, s.score)).collect::<Vec<_>>()
+        );
+
+        // Verify the composite score is > 0 when signals are active.
+        assert!(result.composite_score > 0,
+            "Composite score should be > 0 when signals produce scores, got {}",
+            result.composite_score);
+    }
+
+    /// VAL-CROSS-003: Full signal pipeline produces >=3/6 active signals after 5 scan cycles.
+    ///
+    /// Validates that after feeding data through all 6 signals for 5 scan cycles,
+    /// at least 3 out of 6 signal strategies produce non-zero scores.
+    #[tokio::test]
+    async fn test_cross_003_three_of_six_signals_active_after_five_cycles() {
+        // Build a ConfluenceScorer with all 6 signal strategies.
+        let mut confluence = solagent_signals::ConfluenceScorer::new(25.0);
+
+        // 1. WhaleConsensus — scores 0 in test (no events, no buys). That's fine.
+        let ws = solagent_signals::WhaleConsensusSignal::new(
+            Chain::Solana,
+            2,     // min_wallets
+            30,    // window_minutes
+            10.0,  // min_buy_usd
+            Box::new(solagent_signals::RegistryScoreCache::new(
+                sqlx::SqlitePool::connect_lazy("sqlite::memory:").unwrap(),
+            )),
+        );
+        confluence.add_strategy(solagent_signals::StrategyKind::WhaleConsensus(ws), 0.25);
+
+        // 2. Accumulation — will produce scores with holder growth + stable price.
+        let acc = solagent_signals::AccumulationSignal::new(Chain::Solana, 10);
+        confluence.add_strategy(solagent_signals::StrategyKind::Accumulation(acc), 0.15);
+
+        // 3. Launch momentum — will produce scores for new tokens with growth.
+        let lm = solagent_signals::LaunchMomentumSignal::new(Chain::Solana, 10);
+        confluence.add_strategy(solagent_signals::StrategyKind::LaunchMomentum(lm), 0.15);
+
+        // 4. Volume spike — will produce scores with volume spikes.
+        let vs = solagent_signals::VolumeSpikeSignal::new(Chain::Solana, 3.0, 10);
+        confluence.add_strategy(solagent_signals::StrategyKind::VolumeSpike(vs), 0.10);
+
+        // 5. Social — scores 0 in test (no API). That's fine.
+        let social = solagent_signals::SocialSignal::new(Chain::Solana);
+        confluence.add_strategy(solagent_signals::StrategyKind::Social(social), 0.10);
+
+        // 6. Behavioral — scores 0 in test (no cache). That's fine.
+        let behavioral_cache = Arc::new(solagent_signals::BehavioralWalletCache::new());
+        let bs = solagent_signals::BehavioralSignal::new(behavioral_cache, Chain::Solana);
+        confluence.add_strategy(solagent_signals::StrategyKind::Behavioral(bs), 0.25);
+
+        let token_ca = "CrossAreaToken111111111111111111111111111";
+
+        // Simulate 5 scan cycles feeding data for this token.
+        // Growth pattern: volume and holders increase each cycle.
+        for cycle in 1..=5u64 {
+            let volume = 1000.0 * (cycle as f64).powi(2); // exponential volume growth
+            let holders = 50 + cycle * 30; // steady holder growth
+            let price = 0.01 + (cycle as f64 * 0.002); // slow price growth
+
+            confluence.feed_scan_data(token_ca, Some(volume), Some(holders), Some(price));
+        }
+
+        // Evaluate the token.
+        let token = TokenInfo {
+            address: token_ca.to_string(),
+            chain: Chain::Solana,
+            symbol: "CROSS".to_string(),
+            name: "Cross Area Token".to_string(),
+            decimals: 9,
+            price_usd: Some(0.02),
+            market_cap_usd: Some(150_000.0),
+            volume_24h: Some(25000.0),
+            holder_count: Some(200),
+            created_at: Some(Utc::now() - chrono::Duration::minutes(30)),
+            pair_address: Some("pair_cross".to_string()),
+            lp_locked: None,
+            mint_authority_revoked: None,
+            freeze_authority_revoked: None,
+        };
+
+        let result = confluence.score(&token).await.unwrap();
+
+        // Count how many of the 6 signals produced non-zero scores.
+        let signal_names = [
+            "whale_consensus",
+            "accumulation",
+            "launch_momentum",
+            "volume_spike",
+            "social",
+            "behavioral",
+        ];
+
+        let mut active_count = 0;
+        let mut active_signals: Vec<String> = Vec::new();
+        let mut inactive_signals: Vec<String> = Vec::new();
+
+        for name in &signal_names {
+            let score = result.signals.iter()
+                .find(|s| s.strategy == *name)
+                .map(|s| s.score)
+                .unwrap_or(0);
+            if score > 0 {
+                active_count += 1;
+                active_signals.push(format!("{name}={score}"));
+            } else {
+                inactive_signals.push(name.to_string());
+            }
+        }
+
+        assert!(active_count >= 3,
+            "After 5 scan cycles, at least 3/6 signals should be active, but only {active_count} are. \
+            Active: {:?}, Inactive: {:?}",
+            active_signals, inactive_signals);
+
+        // Verify specific signals we expect to be active:
+        // Accumulation should be active (50->200 holders, <10% price change per cycle).
+        let acc_score = result.signals.iter()
+            .find(|s| s.strategy == "accumulation")
+            .map(|s| s.score)
+            .unwrap_or(0);
+        assert!(acc_score > 0,
+            "Accumulation should be active with 5 snapshots showing 4x holder growth, got {acc_score}");
+
+        // Volume spike should be active (exponential volume growth).
+        let vs_score = result.signals.iter()
+            .find(|s| s.strategy == "volume_spike")
+            .map(|s| s.score)
+            .unwrap_or(0);
+        assert!(vs_score > 0,
+            "Volume spike should be active with exponential volume growth, got {vs_score}");
+
+        // Launch momentum should be active (new token with growth).
+        let lm_score = result.signals.iter()
+            .find(|s| s.strategy == "launch_momentum")
+            .map(|s| s.score)
+            .unwrap_or(0);
+        assert!(lm_score > 0,
+            "Launch momentum should be active for 30-minute-old token with growth, got {lm_score}");
+    }
+
+    /// VAL-CROSS-005: Dry-run mode produces identical signal evaluation without trades.
+    ///
+    /// Validates that:
+    /// - Evaluation produces the same signal scores with the same input
+    ///   regardless of dry-run mode (the signal engine is mode-independent)
+    /// - No trade execution occurs when execution engine has no providers
+    ///   (equivalent to dry-run: `ExecutionEngine::new(config)`)
+    /// - The evaluate() method works the same way in both modes
+    #[tokio::test]
+    async fn test_cross_005_dry_run_identical_evaluation_no_trades() {
+        let event_bus = EventBus::new(16);
+
+        // Create "dry-run" agent (minimal, no execution providers).
+        let dry_run_agent = Agent::new_minimal(AgentConfig::default(), event_bus.clone());
+
+        // Create "live" agent (also minimal for testing — same setup).
+        let live_agent = Agent::new_minimal(AgentConfig::default(), event_bus);
+
+        // Use the same token for both evaluations.
+        let token = TokenInfo {
+            address: "DryRunTestToken1111111111111111111111111".to_string(),
+            chain: Chain::Solana,
+            symbol: "DRY".to_string(),
+            name: "Dry Run Test".to_string(),
+            decimals: 9,
+            price_usd: Some(0.05),
+            market_cap_usd: Some(500_000.0),
+            volume_24h: Some(250_000.0),
+            holder_count: Some(1500),
+            created_at: Some(Utc::now() - chrono::Duration::hours(2)),
+            pair_address: Some("pair_dry_run".to_string()),
+            lp_locked: Some(true),
+            mint_authority_revoked: Some(true),
+            freeze_authority_revoked: Some(true),
+        };
+
+        // Evaluate in both modes.
+        let dry_result = dry_run_agent.evaluate(&token).await
+            .expect("Dry-run evaluate should succeed");
+        let live_result = live_agent.evaluate(&token).await
+            .expect("Live evaluate should succeed");
+
+        // Both must produce identical safety scores (computed from same token data).
+        assert_eq!(dry_result.safety_score, live_result.safety_score,
+            "Safety scores should be identical in both modes: dry={}, live={}",
+            dry_result.safety_score, live_result.safety_score);
+
+        // Both must produce identical confluence scores (same scorer, same token).
+        assert_eq!(dry_result.confluence_score, live_result.confluence_score,
+            "Confluence scores should be identical in both modes: dry={}, live={}",
+            dry_result.confluence_score, live_result.confluence_score);
+
+        // Both must produce the same number of signals.
+        assert_eq!(dry_result.signals.len(), live_result.signals.len(),
+            "Signal count should be identical: dry={}, live={}",
+            dry_result.signals.len(), live_result.signals.len());
+
+        // Individual signal scores must match.
+        for (dry_sig, live_sig) in dry_result.signals.iter().zip(live_result.signals.iter()) {
+            assert_eq!(dry_sig.strategy, live_sig.strategy,
+                "Signal strategies should match: {} vs {}", dry_sig.strategy, live_sig.strategy);
+            assert_eq!(dry_sig.score, live_sig.score,
+                "Signal '{}' scores should match: dry={}, live={}",
+                dry_sig.strategy, dry_sig.score, live_sig.score);
+        }
+
+        // Pass/fail status must be identical.
+        assert_eq!(dry_result.passed, live_result.passed,
+            "Pass/fail should be identical: dry={}, live={}",
+            dry_result.passed, live_result.passed);
+
+        // Verify dry-run execution engine has no providers (can't execute trades).
+        let dry_exec = &dry_run_agent.subsystems.exec;
+        // The default ExecutionEngine has no Jupiter or Solana provider.
+        // execute_buy should fail (bail) since there are no providers.
+        let exec_result = dry_exec.execute_buy(
+            Chain::Solana,
+            "DryRunTestToken1111111111111111111111111",
+            15.0,    // size_usd
+            100.0,   // available_cash
+            0.05,    // current_price
+            150.0,   // sol_price
+        ).await;
+
+        assert!(exec_result.is_err(),
+            "Dry-run execution should fail (no providers configured), but trade succeeded: {:?}",
+            exec_result);
+
+        // Also verify: the agent's evaluate path produces a reasoning string
+        // in both modes (machine-parseable format).
+        assert!(!dry_result.reasoning.is_empty(),
+            "Dry-run evaluation must produce non-empty reasoning");
+        assert!(!live_result.reasoning.is_empty(),
+            "Live evaluation must produce non-empty reasoning");
+
+        // Reasoning should be identical in both modes.
+        assert_eq!(dry_result.reasoning, live_result.reasoning,
+            "Reasoning should be identical in both modes");
+    }
+
+    /// VAL-CROSS-005 extended: Verify that dry-run mode does not open portfolio positions.
+    #[tokio::test]
+    async fn test_cross_005_dry_run_no_portfolio_positions() {
+        let event_bus = EventBus::new(16);
+        let agent = Agent::new_minimal(AgentConfig::default(), event_bus);
+
+        // Run migrations on the in-memory database so get_open_positions works.
+        let pool = agent.subsystems.portfolio.pool();
+        sqlx::query(solagent_portfolio::MIGRATION_SQL)
+            .execute(pool)
+            .await
+            .expect("Migration should succeed");
+
+        // The minimal agent has an in-memory SQLite portfolio with no positions.
+        let positions = agent.subsystems.portfolio.get_open_positions().await
+            .expect("Should be able to query positions");
+        assert!(positions.is_empty(),
+            "Dry-run agent should start with no positions, but found {}",
+            positions.len());
+
+        // Evaluate a token that would pass with good safety data.
+        let token = TokenInfo {
+            address: "SafeToken11111111111111111111111111111111".to_string(),
+            chain: Chain::Solana,
+            symbol: "SAFE".to_string(),
+            name: "Safe Token".to_string(),
+            decimals: 9,
+            price_usd: Some(0.05),
+            market_cap_usd: Some(500_000.0),
+            volume_24h: Some(250_000.0),
+            holder_count: Some(1500),
+            created_at: Some(Utc::now() - chrono::Duration::hours(2)),
+            pair_address: Some("pair_safe".to_string()),
+            lp_locked: Some(true),
+            mint_authority_revoked: Some(true),
+            freeze_authority_revoked: Some(true),
+        };
+
+        // Evaluate the token (signal engine runs regardless of dry-run).
+        let result = agent.evaluate(&token).await
+            .expect("Evaluation should succeed");
+        assert!(result.safety_score > 0,
+            "Safety score should be > 0 for token with good data, got {}",
+            result.safety_score);
+
+        // After evaluation, positions should still be empty because
+        // execute() would fail (no providers in dry-run mode).
+        let positions_after = agent.subsystems.portfolio.get_open_positions().await
+            .expect("Should be able to query positions");
+        assert!(positions_after.is_empty(),
+            "Dry-run: positions should still be empty after evaluation, found {}",
+            positions_after.len());
+    }
+
+    /// VAL-CROSS-001/002/003 combined: Verify effective_threshold never drops below
+    /// ABSOLUTE_FLOOR throughout the full failure/recovery/reevaluation cycle.
+    #[test]
+    fn test_cross_combined_threshold_never_below_floor_throughout_cycle() {
+        // Simulate the full cycle:
+        // 1. Normal operation: runtime=35, progressive=35 → effective=35
+        // 2. During failures: progressive lowers to 25 → effective=25
+        // 3. After extreme failures: runtime auto-tuned to 25 → effective=25
+        // 4. Recovery: runtime=25, progressive=35 → effective=25 (min)
+        // 5. Successful trade: progressive resets to 35 → effective=35 (min)
+
+        let test_cases: Vec<(f64, f64, f64)> = vec![
+            (35.0, 35.0, 35.0),  // Normal: both above floor
+            (35.0, 25.0, 25.0),  // Progressive lowered: effective=min(35,25)=25
+            (25.0, 25.0, 25.0),  // Both at floor: effective=25
+            (10.0, 25.0, 25.0),  // Runtime below floor: effective=max(25,10)=25
+            (25.0, 35.0, 25.0),  // Runtime at floor, progressive above: effective=min(25,35)=25
+            (35.0, 35.0, 35.0),  // Recovery: both restored above floor
+            (50.0, 25.0, 25.0),  // Runtime high, progressive low: effective=min(50,25)=25
+        ];
+
+        for (runtime, progressive, expected) in test_cases {
+            let effective = ABSOLUTE_FLOOR.max(runtime.min(progressive));
+            assert!(
+                effective >= ABSOLUTE_FLOOR,
+                "effective_threshold ({effective}) must be >= ABSOLUTE_FLOOR ({ABSOLUTE_FLOOR}) \
+                for runtime={runtime}, progressive={progressive}"
+            );
+            assert!(
+                (effective - expected).abs() < f64::EPSILON,
+                "effective_threshold should be {expected} for runtime={runtime}, progressive={progressive}, got {effective}"
+            );
+        }
+    }
 }

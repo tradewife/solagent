@@ -297,11 +297,13 @@ impl AutoTuner {
         })
         .collect();
 
-        // L1 normalize so all weights sum to 1.0.
+        // L1 normalize so all weights sum to 1.0, then re-clamp to bounds.
+        // Normalization can push individual weights above WEIGHT_MAX when the
+        // pre-normalization sum < 1.0, so we clamp again after dividing.
         let sum: f64 = new.iter().sum();
         if sum > 0.0 {
             for w in &mut new {
-                *w /= sum;
+                *w = (*w / sum).clamp(WEIGHT_MIN, WEIGHT_MAX);
             }
         }
 
