@@ -100,7 +100,7 @@ enum Commands {
         #[arg(long, default_value = "50")]
         min_pnl: f64,
         /// Minimum number of tokens a wallet must appear in
-        #[arg(long, default_value = "2")]
+        #[arg(long, default_value = "1")]
         min_appearances: usize,
         /// Output as JSON instead of formatted text
         #[arg(long)]

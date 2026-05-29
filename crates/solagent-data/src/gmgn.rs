@@ -5,6 +5,7 @@
 
 use anyhow::Result;
 use serde::Deserialize;
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -207,6 +208,84 @@ impl GmgnClient {
     /// Get the total number of GMGN failures.
     pub fn failure_count(&self) -> u64 {
         self.failure_count.load(Ordering::Relaxed)
+    }
+
+    /// Fetch trending token addresses from GMGN (via `gmgn-cli market trending`).
+    ///
+    /// Returns a list of (address, symbol, price_change_24h_percent) tuples
+    /// for the top trending tokens on Solana. Useful as a broader token
+    /// discovery source for behavioral analysis.
+    pub async fn get_trending_tokens(&self, interval: &str, limit: usize) -> Vec<(String, String, f64)> {
+        // Enforce rate limit.
+        {
+            let mut last = self.last_call.lock().await;
+            let elapsed = last.elapsed();
+            if elapsed < RATE_LIMIT_DELAY {
+                let sleep_time = RATE_LIMIT_DELAY - elapsed;
+                tokio::time::sleep(sleep_time).await;
+            }
+            *last = Instant::now();
+        }
+
+        self.call_count.fetch_add(1, Ordering::Relaxed);
+
+        let output = match tokio::time::timeout(
+            Duration::from_secs(30),
+            tokio::process::Command::new(&self.cli_path)
+                .args([
+                    "market", "trending",
+                    "--chain", "sol",
+                    "--interval", interval,
+                    "--limit", &limit.to_string(),
+                    "--raw",
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output(),
+        ).await {
+            Ok(Ok(o)) => o,
+            _ => {
+                self.failure_count.fetch_add(1, Ordering::Relaxed);
+                return Vec::new();
+            }
+        };
+
+        if !output.status.success() {
+            self.failure_count.fetch_add(1, Ordering::Relaxed);
+            return Vec::new();
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut tokens = Vec::new();
+
+        if let Ok(data) = serde_json::from_str::<serde_json::Value>(&stdout) {
+            // Response is { "data": { "rank": [...] } }
+            let items = data.get("data")
+                .and_then(|d| d.get("rank"))
+                .and_then(|r| r.as_array());
+
+            if let Some(items) = items {
+                for item in items {
+                    let addr = item.get("address")
+                        .and_then(|a| a.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let symbol = item.get("symbol")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("?")
+                        .to_string();
+                    let price_change = item.get("price_change_percent")
+                        .and_then(|p| p.as_f64())
+                        .unwrap_or(0.0);
+
+                    if !addr.is_empty() {
+                        tokens.push((addr, symbol, price_change));
+                    }
+                }
+            }
+        }
+
+        tokens
     }
 }
 

@@ -1361,6 +1361,7 @@ impl Agent {
         let _behavioral_handle = if let Some(ref cache) = self.subsystems.behavioral_cache {
             let cache = Arc::clone(cache);
             let birdeye_key = std::env::var("BIRDEYE_API_KEY").ok();
+            let db_pool = self.subsystems.portfolio.pool().clone();
             let handle = tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(4 * 3600));
                 interval.tick().await; // Consume the first immediate tick
@@ -1410,9 +1411,108 @@ impl Agent {
                                 noise,
                                 "Behavioral scan complete — wallet cache updated"
                             );
+
+                            // Fallback: if the behavioral scan found zero non-NOISE wallets,
+                            // seed the cache from the SQLite wallet registry so that the
+                            // behavioral signal has wallets to match against during evaluation.
+                            let high_tier_count = prec + sov + em;
+                            if high_tier_count == 0 {
+                                tracing::info!(
+                                    "Behavioral cache has 0 high-tier wallets — falling back to SQLite wallet registry"
+                                );
+                                let registry = solagent_portfolio::WalletRegistry::new(
+                                    db_pool.clone()
+                                );
+                                match registry.list_wallets(
+                                    None,
+                                    Some(solagent_core::Chain::Solana),
+                                    100,
+                                ).await {
+                                    Ok(registry_wallets) => {
+                                        let mut fallback = Vec::new();
+                                        for w in &registry_wallets {
+                                            let tier = if w.score >= 75.0 {
+                                                solagent_signals::BehavioralTier::Sovereign
+                                            } else if w.score >= 55.0 {
+                                                solagent_signals::BehavioralTier::Emerging
+                                            } else {
+                                                solagent_signals::BehavioralTier::Noise
+                                            };
+                                            fallback.push(solagent_signals::BehavioralWallet {
+                                                address: w.address.clone(),
+                                                tier,
+                                                score: w.score,
+                                                primary_edge: "registry_fallback".to_string(),
+                                                red_flags: Vec::new(),
+                                            });
+                                        }
+                                        if !fallback.is_empty() {
+                                            tracing::info!(
+                                                count = fallback.len(),
+                                                "Loaded wallets from SQLite registry as behavioral fallback"
+                                            );
+                                            cache.update(fallback).await;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "Failed to load wallet registry for behavioral fallback"
+                                        );
+                                    }
+                                }
+                            }
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "Behavioral scan failed (will retry in 4h)");
+
+                            // Fallback on scan failure: if cache is empty, load from registry.
+                            if cache.is_empty() {
+                                tracing::info!(
+                                    "Behavioral scan failed and cache is empty — falling back to SQLite wallet registry"
+                                );
+                                let registry = solagent_portfolio::WalletRegistry::new(
+                                    db_pool.clone()
+                                );
+                                match registry.list_wallets(
+                                    None,
+                                    Some(solagent_core::Chain::Solana),
+                                    100,
+                                ).await {
+                                    Ok(registry_wallets) => {
+                                        let mut fallback = Vec::new();
+                                        for w in &registry_wallets {
+                                            let tier = if w.score >= 75.0 {
+                                                solagent_signals::BehavioralTier::Sovereign
+                                            } else if w.score >= 55.0 {
+                                                solagent_signals::BehavioralTier::Emerging
+                                            } else {
+                                                solagent_signals::BehavioralTier::Noise
+                                            };
+                                            fallback.push(solagent_signals::BehavioralWallet {
+                                                address: w.address.clone(),
+                                                tier,
+                                                score: w.score,
+                                                primary_edge: "registry_fallback".to_string(),
+                                                red_flags: Vec::new(),
+                                            });
+                                        }
+                                        if !fallback.is_empty() {
+                                            tracing::info!(
+                                                count = fallback.len(),
+                                                "Loaded wallets from SQLite registry as behavioral fallback"
+                                            );
+                                            cache.update(fallback).await;
+                                        }
+                                    }
+                                    Err(e2) => {
+                                        tracing::warn!(
+                                            error = %e2,
+                                            "Failed to load wallet registry for behavioral fallback"
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
                     interval.tick().await;
