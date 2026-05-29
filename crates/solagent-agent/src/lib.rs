@@ -789,8 +789,9 @@ impl Agent {
 
         let passed = safety_passed && confluence_passed;
 
+        // Build per-signal summary with scores and reasoning.
         let signal_summary: Vec<String> = signals.iter()
-            .map(|s| format!("{}={}/100", s.strategy, s.score))
+            .map(|s| format!("{}={}/100 \"{}\"", s.strategy, s.score, s.reason))
             .collect();
         let status = if passed { "PASS" } else { "FAIL" };
         let reasons = if !safety_passed {

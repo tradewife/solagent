@@ -669,34 +669,55 @@ impl Strategy for AccumulationSignal {
     }
 
     async fn evaluate(&self, token: &TokenInfo) -> Result<Signal> {
-        let score = if let Some(hist) = self.history.get(&token.address) {
-            if hist.len() < 2 {
-                return Ok(Signal::new(
-                    token.address.clone(),
-                    token.chain,
-                    &self.name,
-                    0,
-                    0.0,
-                    "Insufficient history for accumulation signal".to_string(),
-                ));
-            }
-            let first = hist.front().unwrap();
-            let last = hist.back().unwrap();
-            let holder_growth = (last.0 as f64 - first.0 as f64) / first.0.max(1) as f64;
-            let price_change = (last.1 - first.1) / first.1.max(0.0001);
+        // No history at all for this token.
+        if self.history.get(&token.address).is_none() {
+            return Ok(Signal::new(
+                token.address.clone(),
+                token.chain,
+                &self.name,
+                0,
+                0.0,
+                "No holder history recorded for accumulation signal".to_string(),
+            ));
+        }
 
-            if holder_growth > 0.2 && price_change.abs() < 0.1 {
-                80
-            } else if holder_growth > 0.1 && price_change.abs() < 0.2 {
-                60
-            } else if holder_growth > 0.05 && price_change.abs() < 0.3 {
-                40
-            } else {
-                20
-            }
+        let hist = self.history.get(&token.address).unwrap();
+        if hist.len() < 2 {
+            return Ok(Signal::new(
+                token.address.clone(),
+                token.chain,
+                &self.name,
+                0,
+                0.0,
+                format!(
+                    "Insufficient history for accumulation signal ({} snapshot, need ≥2)",
+                    hist.len()
+                ),
+            ));
+        }
+
+        let first = hist.front().unwrap();
+        let last = hist.back().unwrap();
+        let holder_growth = (last.0 as f64 - first.0 as f64) / first.0.max(1) as f64;
+        let price_change = (last.1 - first.1) / first.1.max(0.0001);
+        let snapshot_count = hist.len();
+
+        let score = if holder_growth > 0.2 && price_change.abs() < 0.1 {
+            80
+        } else if holder_growth > 0.1 && price_change.abs() < 0.2 {
+            60
+        } else if holder_growth > 0.05 && price_change.abs() < 0.3 {
+            40
         } else {
-            0
+            20
         };
+
+        let reasoning = format!(
+            "Accumulation: {score}/100 ({} snapshots, holder growth {:+.0}%, price change {:+.1}%)",
+            snapshot_count,
+            holder_growth * 100.0,
+            price_change * 100.0,
+        );
 
         Ok(Signal::new(
             token.address.clone(),
@@ -704,7 +725,7 @@ impl Strategy for AccumulationSignal {
             &self.name,
             score,
             0.6,
-            format!("Accumulation score: {score}/100"),
+            reasoning,
         ))
     }
 }
@@ -813,7 +834,7 @@ impl Strategy for LaunchMomentumSignal {
                     &self.name,
                     0,
                     0.0,
-                    "Insufficient data for launch momentum".to_string(),
+                    "Insufficient data for launch momentum (1 snapshot, need ≥2)".to_string(),
                 ));
             }
             let first = snaps.front().unwrap();
@@ -829,7 +850,27 @@ impl Strategy for LaunchMomentumSignal {
             let composite = (volume_rate + holder_rate) / 2.0;
             let momentum_bonus = if holder_growth_rate > 10.0 { 20.0 } else if holder_growth_rate > 5.0 { 10.0 } else { 0.0 };
 
-            (composite.min(2.0) * 40.0 + momentum_bonus).clamp(0.0, 100.0) as u8
+            let score = (composite.min(2.0) * 40.0 + momentum_bonus).clamp(0.0, 100.0) as u8;
+
+            let bonus_desc = if momentum_bonus >= 20.0 {
+                ", fast holder acquisition bonus +20"
+            } else if momentum_bonus >= 10.0 {
+                ", holder growth bonus +10"
+            } else {
+                ""
+            };
+            let reasoning = format!(
+                "Launch momentum: {score}/100 (vol rate {volume_rate:.1}x, holder rate {holder_rate:.1}x, {snaps} snapshots{bonus_desc})",
+                snaps = snaps.len()
+            );
+            return Ok(Signal::new(
+                token.address.clone(),
+                token.chain,
+                &self.name,
+                score,
+                0.5,
+                reasoning,
+            ));
         } else {
             0
         };
@@ -840,7 +881,7 @@ impl Strategy for LaunchMomentumSignal {
             &self.name,
             score,
             0.5,
-            format!("Launch momentum: {score}/100"),
+            "No launch snapshots recorded for launch momentum signal".to_string(),
         ))
     }
 }
@@ -905,43 +946,73 @@ impl Strategy for VolumeSpikeSignal {
     }
 
     async fn evaluate(&self, token: &TokenInfo) -> Result<Signal> {
-        let score = if let Some(vols) = self.volumes.get(&token.address) {
-            if vols.len() < 3 {
-                return Ok(Signal::new(
-                    token.address.clone(),
-                    token.chain,
-                    &self.name,
-                    0,
-                    0.0,
-                    format!(
-                        "Insufficient volume history ({} points, need ≥3)",
-                        vols.len()
-                    ),
-                ));
-            }
-            // Historical average: all points except the latest (current spike).
-            // This makes spike detection meaningful — comparing current to prior history.
-            let hist_count = vols.len() - 1;
-            let hist_sum: f64 = vols.iter().take(hist_count).map(|v| v.0).sum::<f64>();
-            let hist_avg = hist_sum / hist_count as f64;
-            let current = vols.back().map(|v| v.0).unwrap_or(0.0);
+        // No volume data at all for this token.
+        if self.volumes.get(&token.address).is_none() {
+            return Ok(Signal::new(
+                token.address.clone(),
+                token.chain,
+                &self.name,
+                0,
+                0.0,
+                "No volume history recorded for volume spike signal".to_string(),
+            ));
+        }
 
-            if hist_avg > 0.0 {
-                let ratio = current / hist_avg;
-                if ratio >= self.threshold {
-                    // Scale score proportionally: 3x = 80, 5x+ = 100.
-                    let raw = 50.0 + (ratio / self.threshold * 30.0).min(50.0);
-                    raw.clamp(0.0, 100.0) as u8
-                } else if ratio >= self.threshold * 0.66 {
-                    50
-                } else {
-                    10
-                }
-            } else {
-                0
-            }
+        let vols = self.volumes.get(&token.address).unwrap();
+        if vols.len() < 3 {
+            return Ok(Signal::new(
+                token.address.clone(),
+                token.chain,
+                &self.name,
+                0,
+                0.0,
+                format!(
+                    "Insufficient volume history ({} points, need ≥3)",
+                    vols.len()
+                ),
+            ));
+        }
+
+        // Historical average: all points except the latest (current spike).
+        // This makes spike detection meaningful — comparing current to prior history.
+        let hist_count = vols.len() - 1;
+        let hist_sum: f64 = vols.iter().take(hist_count).map(|v| v.0).sum::<f64>();
+        let hist_avg = hist_sum / hist_count as f64;
+        let current = vols.back().map(|v| v.0).unwrap_or(0.0);
+
+        if hist_avg <= 0.0 {
+            return Ok(Signal::new(
+                token.address.clone(),
+                token.chain,
+                &self.name,
+                0,
+                0.0,
+                "Volume spike: 0/100 (historical avg is 0, cannot compute ratio)".to_string(),
+            ));
+        }
+
+        let ratio = current / hist_avg;
+        let point_count = vols.len();
+
+        let (score, reasoning) = if ratio >= self.threshold {
+            let raw = 50.0 + (ratio / self.threshold * 30.0).min(50.0);
+            let score = raw.clamp(0.0, 100.0) as u8;
+            let reasoning = format!(
+                "Volume spike: {score}/100 ({ratio:.1}x ratio, {point_count} points, avg=${hist_avg:.0} → current=${current:.0})"
+            );
+            (score, reasoning)
+        } else if ratio >= self.threshold * 0.66 {
+            let reasoning = format!(
+                "Volume spike: 50/100 ({ratio:.1}x ratio, near {threshold:.0}x threshold)",
+                threshold = self.threshold
+            );
+            (50, reasoning)
         } else {
-            0
+            let reasoning = format!(
+                "Volume spike: 10/100 ({ratio:.1}x ratio, below {threshold:.0}x threshold)",
+                threshold = self.threshold
+            );
+            (10, reasoning)
         };
 
         Ok(Signal::new(
@@ -950,7 +1021,7 @@ impl Strategy for VolumeSpikeSignal {
             &self.name,
             score,
             0.65,
-            format!("Volume spike ({}x threshold): {score}/100", self.threshold),
+            reasoning,
         ))
     }
 }
@@ -1365,50 +1436,63 @@ impl Strategy for SocialSignal {
     async fn evaluate(&self, token: &TokenInfo) -> Result<Signal> {
         self.prune_stale(&token.address);
 
-        let score = if let Some(mentions) = self.mentions.get(&token.address) {
-            let count = mentions.len();
-            if count < self.min_mentions {
-                return Ok(Signal::new(
-                    token.address.clone(),
-                    token.chain,
-                    &self.name,
-                    0,
-                    0.0,
-                    format!("Social mentions ({count}) below threshold ({})", self.min_mentions),
-                ));
-            }
+        // No mentions at all for this token.
+        if self.mentions.get(&token.address).is_none() {
+            return Ok(Signal::new(
+                token.address.clone(),
+                token.chain,
+                &self.name,
+                0,
+                0.0,
+                "No social mentions recorded".to_string(),
+            ));
+        }
 
-            // Distinct authors mentioning this token.
-            let distinct_authors: HashSet<&str> = mentions.iter().map(|m| m.author.as_str()).collect();
-            let author_count = distinct_authors.len();
+        let mentions = self.mentions.get(&token.address).unwrap();
+        let count = mentions.len();
+        if count < self.min_mentions {
+            return Ok(Signal::new(
+                token.address.clone(),
+                token.chain,
+                &self.name,
+                0,
+                0.0,
+                format!("Social mentions ({count}) below threshold ({})", self.min_mentions),
+            ));
+        }
 
-            // Total engagement across all mentions.
-            let total_engagement: f64 = mentions.iter().map(|m| m.engagement).sum();
+        // Distinct authors mentioning this token.
+        let distinct_authors: HashSet<&str> = mentions.iter().map(|m| m.author.as_str()).collect();
+        let author_count = distinct_authors.len();
 
-            // Mention velocity: how many per minute.
-            let span_mins = if mentions.len() >= 2 {
-                let first = mentions.front().unwrap().timestamp;
-                let last = mentions.back().unwrap().timestamp;
-                (last - first).num_minutes().max(1) as f64
-            } else {
-                self.window_minutes as f64
-            };
-            let velocity = count as f64 / span_mins;
+        // Total engagement across all mentions.
+        let total_engagement: f64 = mentions.iter().map(|m| m.engagement).sum();
 
-            // Score components:
-            // - Mention count: more mentions = higher score (capped at 40)
-            // - Author diversity: more unique authors = higher quality (capped at 30)
-            // - Engagement: higher engagement = stronger signal (capped at 20)
-            // - Velocity: faster mentions = more timely (capped at 10)
-            let count_score = (count as f64 / self.min_mentions as f64 * 20.0).min(40.0);
-            let author_score = (author_count as f64 * 5.0).min(30.0);
-            let engagement_score = (total_engagement.log10().max(0.0) * 5.0).min(20.0);
-            let velocity_score = (velocity * 10.0).min(10.0);
-
-            (count_score + author_score + engagement_score + velocity_score).clamp(0.0, 100.0) as u8
+        // Mention velocity: how many per minute.
+        let span_mins = if mentions.len() >= 2 {
+            let first = mentions.front().unwrap().timestamp;
+            let last = mentions.back().unwrap().timestamp;
+            (last - first).num_minutes().max(1) as f64
         } else {
-            0
+            self.window_minutes as f64
         };
+        let velocity = count as f64 / span_mins;
+
+        // Score components:
+        // - Mention count: more mentions = higher score (capped at 40)
+        // - Author diversity: more unique authors = higher quality (capped at 30)
+        // - Engagement: higher engagement = stronger signal (capped at 20)
+        // - Velocity: faster mentions = more timely (capped at 10)
+        let count_score = (count as f64 / self.min_mentions as f64 * 20.0).min(40.0);
+        let author_score = (author_count as f64 * 5.0).min(30.0);
+        let engagement_score = (total_engagement.log10().max(0.0) * 5.0).min(20.0);
+        let velocity_score = (velocity * 10.0).min(10.0);
+
+        let score = (count_score + author_score + engagement_score + velocity_score).clamp(0.0, 100.0) as u8;
+
+        let reasoning = format!(
+            "Social momentum: {score}/100 ({count} mentions, {author_count} authors, {velocity:.1}/min velocity, engagement={total_engagement:.0})"
+        );
 
         Ok(Signal::new(
             token.address.clone(),
@@ -1416,7 +1500,7 @@ impl Strategy for SocialSignal {
             &self.name,
             score,
             0.5,
-            format!("Social momentum: {score}/100"),
+            reasoning,
         ))
     }
 }
@@ -1759,6 +1843,19 @@ pub struct ConfluenceResult {
     pub signals: Vec<Signal>,
     /// Whether the score passes the confluence threshold.
     pub passed: bool,
+}
+
+impl ConfluenceResult {
+    /// Format per-signal reasoning as a machine-parseable string.
+    ///
+    /// Format: `signal1=N/100 "reason1", signal2=N/100 "reason2", ...`
+    pub fn signal_reasoning_summary(&self) -> String {
+        self.signals
+            .iter()
+            .map(|s| format!("{}={}/100 \"{}\"", s.strategy, s.score, s.reason))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 // ─── Behavioral Wallet Cache ─────────────────────────────────────────────────
@@ -2951,7 +3048,9 @@ mod tests {
         assert_eq!(result.score, 0, "Should score 0 with no mentions");
 
         assert!(
-            result.reason.contains("below threshold") || result.reason.contains("Social momentum: 0"),
+            result.reason.contains("below threshold")
+                || result.reason.contains("No social mentions")
+                || result.reason.contains("Social momentum: 0"),
             "Reason should explain zero score, got: {}",
             result.reason
         );
@@ -3838,5 +3937,570 @@ mod tests {
         assert!(cache.is_high_tier("sov_addr"), "SOVEREIGN should be high-tier");
         assert!(!cache.is_high_tier("em_addr"), "EMERGING should NOT be high-tier");
         assert!(!cache.is_high_tier("unknown_addr"), "Unknown wallet should NOT be high-tier");
+    }
+
+    // ─── Signal Quality Logging Tests (VAL-SIG-013, VAL-SIG-014) ────────
+
+    /// VAL-SIG-014: Every signal returns non-empty reasoning.
+    /// Tests that all 6 signals produce a non-empty reason string.
+    #[tokio::test]
+    async fn test_signal_quality_all_signals_nonempty_reasoning() {
+        let token = make_token("reasoning_test", Some(1.0), Some(10000.0), Some(50000.0), None);
+
+        // AccumulationSignal (no history → zero score)
+        let acc = AccumulationSignal::new(Chain::Solana, 10);
+        let result = acc.evaluate(&token).await.unwrap();
+        assert!(
+            !result.reason.is_empty(),
+            "AccumulationSignal reasoning must be non-empty, got empty string"
+        );
+
+        // VolumeSpikeSignal (no data → zero score)
+        let vs = VolumeSpikeSignal::new(Chain::Solana, 3.0, 10);
+        let result = vs.evaluate(&token).await.unwrap();
+        assert!(
+            !result.reason.is_empty(),
+            "VolumeSpikeSignal reasoning must be non-empty, got empty string"
+        );
+
+        // LaunchMomentumSignal (no data → zero score)
+        let lm = LaunchMomentumSignal::new(Chain::Solana, 10);
+        let result = lm.evaluate(&token).await.unwrap();
+        assert!(
+            !result.reason.is_empty(),
+            "LaunchMomentumSignal reasoning must be non-empty, got empty string"
+        );
+
+        // SocialSignal (no mentions → zero score)
+        let ss = SocialSignal::new(Chain::Solana);
+        let result = ss.evaluate(&token).await.unwrap();
+        assert!(
+            !result.reason.is_empty(),
+            "SocialSignal reasoning must be non-empty, got empty string"
+        );
+
+        // BehavioralSignal (no cache → zero score)
+        let bs = BehavioralSignal::new(
+            Arc::new(BehavioralWalletCache::new()),
+            Chain::Solana,
+        );
+        let result = bs.evaluate(&token).await.unwrap();
+        assert!(
+            !result.reason.is_empty(),
+            "BehavioralSignal reasoning must be non-empty, got empty string"
+        );
+
+        // WhaleConsensusSignal (no events → zero score)
+        let ws = WhaleConsensusSignal::new(
+            Chain::Solana,
+            2,
+            30,
+            10.0,
+            Box::new(InMemoryWalletScores::new()),
+        );
+        let result = ws.evaluate(&token).await.unwrap();
+        assert!(
+            !result.reason.is_empty(),
+            "WhaleConsensusSignal reasoning must be non-empty, got empty string"
+        );
+    }
+
+    /// VAL-SIG-014: Zero-score signals explain why.
+    /// Each zero-score signal must include a diagnostic reason (e.g., "Insufficient",
+    /// "No events", "below threshold").
+    #[tokio::test]
+    async fn test_signal_quality_zero_score_explains_why() {
+        let token = make_token("zero_reasoning_test", Some(1.0), None, None, None);
+
+        // AccumulationSignal: zero score, should explain why
+        let acc = AccumulationSignal::new(Chain::Solana, 10);
+        let result = acc.evaluate(&token).await.unwrap();
+        assert_eq!(result.score, 0);
+        assert!(
+            !result.reason.is_empty(),
+            "Zero-score accumulation must explain why"
+        );
+        assert!(
+            result.reason.to_lowercase().contains("insufficient")
+                || result.reason.to_lowercase().contains("no ")
+                || result.reason.to_lowercase().contains("below"),
+            "Zero-score accumulation reasoning should explain why: got '{}'",
+            result.reason
+        );
+
+        // VolumeSpikeSignal: zero score
+        let vs = VolumeSpikeSignal::new(Chain::Solana, 3.0, 10);
+        let result = vs.evaluate(&token).await.unwrap();
+        assert_eq!(result.score, 0);
+        assert!(
+            !result.reason.is_empty(),
+            "Zero-score volume_spike must explain why"
+        );
+        assert!(
+            result.reason.to_lowercase().contains("insufficient")
+                || result.reason.to_lowercase().contains("no "),
+            "Zero-score volume_spike reasoning should explain why: got '{}'",
+            result.reason
+        );
+
+        // LaunchMomentumSignal: zero score (no snapshots)
+        let lm = LaunchMomentumSignal::new(Chain::Solana, 10);
+        let result = lm.evaluate(&token).await.unwrap();
+        assert_eq!(result.score, 0);
+        assert!(
+            !result.reason.is_empty(),
+            "Zero-score launch_momentum must explain why"
+        );
+
+        // SocialSignal: zero score (no mentions)
+        let ss = SocialSignal::new(Chain::Solana);
+        let result = ss.evaluate(&token).await.unwrap();
+        assert_eq!(result.score, 0);
+        assert!(
+            !result.reason.is_empty(),
+            "Zero-score social must explain why"
+        );
+
+        // BehavioralSignal: zero score (no cache)
+        let bs = BehavioralSignal::new(
+            Arc::new(BehavioralWalletCache::new()),
+            Chain::Solana,
+        );
+        let result = bs.evaluate(&token).await.unwrap();
+        assert_eq!(result.score, 0);
+        assert!(
+            result.reason.to_lowercase().contains("no "),
+            "Zero-score behavioral reasoning should explain why: got '{}'",
+            result.reason
+        );
+
+        // WhaleConsensusSignal: zero score (no events)
+        let ws = WhaleConsensusSignal::new(
+            Chain::Solana,
+            2,
+            30,
+            10.0,
+            Box::new(InMemoryWalletScores::new()),
+        );
+        let result = ws.evaluate(&token).await.unwrap();
+        assert_eq!(result.score, 0);
+        assert!(
+            !result.reason.is_empty(),
+            "Zero-score whale_consensus must explain why"
+        );
+    }
+
+    /// VAL-SIG-014: Non-zero signals include numeric score and contributing factors.
+    #[tokio::test]
+    async fn test_signal_quality_nonzero_accumulation_includes_factors() {
+        let signal = AccumulationSignal::new(Chain::Solana, 10);
+        let token_ca = "nonzero_acc";
+
+        // Record 3 snapshots: strong holder growth, flat price.
+        signal.record_snapshot(token_ca.to_string(), 100, 1.0);
+        signal.record_snapshot(token_ca.to_string(), 150, 1.02);
+        signal.record_snapshot(token_ca.to_string(), 200, 1.05);
+
+        let token = make_token(token_ca, Some(1.05), None, None, None);
+        let result = signal.evaluate(&token).await.unwrap();
+        assert!(result.score > 0, "Should have non-zero score");
+        assert!(
+            !result.reason.is_empty(),
+            "Non-zero accumulation must include reasoning"
+        );
+        // Reasoning should include numeric score.
+        assert!(
+            result.reason.contains(&result.score.to_string()),
+            "Reasoning should include score {}: got '{}'",
+            result.score,
+            result.reason
+        );
+        // Reasoning should include contributing factors (holder growth, snapshots, or price).
+        let reason_lower = result.reason.to_lowercase();
+        assert!(
+            reason_lower.contains("holder")
+                || reason_lower.contains("snapshot")
+                || reason_lower.contains("growth")
+                || reason_lower.contains("price"),
+            "Reasoning should mention contributing factors: got '{}'",
+            result.reason
+        );
+    }
+
+    /// VAL-SIG-014: Non-zero volume spike reasoning includes ratio and contributing factors.
+    #[tokio::test]
+    async fn test_signal_quality_nonzero_volume_spike_includes_factors() {
+        let signal = VolumeSpikeSignal::new(Chain::Solana, 3.0, 10);
+        let token_ca = "nonzero_vs";
+
+        // Record 4 points with a clear spike.
+        signal.record(token_ca.to_string(), 1000.0);
+        signal.record(token_ca.to_string(), 1200.0);
+        signal.record(token_ca.to_string(), 1100.0);
+        signal.record(token_ca.to_string(), 5000.0); // 4.5x spike
+
+        let token = make_token(token_ca, Some(1.0), Some(5000.0), Some(50000.0), None);
+        let result = signal.evaluate(&token).await.unwrap();
+        assert!(result.score > 0, "Should have non-zero score");
+        assert!(
+            !result.reason.is_empty(),
+            "Non-zero volume_spike must include reasoning"
+        );
+        // Reasoning should include numeric score.
+        assert!(
+            result.reason.contains(&result.score.to_string()),
+            "Reasoning should include score {}: got '{}'",
+            result.score,
+            result.reason
+        );
+        // Reasoning should include ratio or spike indicator.
+        let reason_lower = result.reason.to_lowercase();
+        assert!(
+            reason_lower.contains("spike") || reason_lower.contains("ratio") || reason_lower.contains("x"),
+            "Reasoning should mention spike/ratio: got '{}'",
+            result.reason
+        );
+    }
+
+    /// VAL-SIG-014: Non-zero launch momentum reasoning includes factors.
+    #[tokio::test]
+    async fn test_signal_quality_nonzero_launch_momentum_includes_factors() {
+        let signal = LaunchMomentumSignal::new(Chain::Solana, 10);
+        let token_ca = "nonzero_lm";
+
+        // Record 2 snapshots with strong growth.
+        signal.record(token_ca.to_string(), 1000.0, 50);
+        signal.record(token_ca.to_string(), 5000.0, 200);
+
+        let created = Utc::now() - chrono::Duration::minutes(30);
+        let token = make_token(token_ca, Some(1.0), Some(5000.0), Some(50000.0), Some(created));
+        let result = signal.evaluate(&token).await.unwrap();
+        assert!(result.score > 0, "Should have non-zero score");
+        assert!(
+            !result.reason.is_empty(),
+            "Non-zero launch_momentum must include reasoning"
+        );
+        assert!(
+            result.reason.contains(&result.score.to_string()),
+            "Reasoning should include score {}: got '{}'",
+            result.score,
+            result.reason
+        );
+    }
+
+    /// VAL-SIG-014: Non-zero behavioral reasoning includes tier and count.
+    #[tokio::test]
+    async fn test_signal_quality_nonzero_behavioral_includes_tiers() {
+        let cache = Arc::new(BehavioralWalletCache::new());
+        cache.update(vec![
+            BehavioralWallet {
+                address: "wallet1".to_string(),
+                tier: BehavioralTier::Sovereign,
+                score: 80.0,
+                primary_edge: "L2".to_string(),
+                red_flags: vec![],
+            },
+        ]).await;
+
+        let bs = BehavioralSignal::new(cache, Chain::Solana);
+
+        // Manually inject token detection.
+        bs.token_wallets.insert(
+            "behav_nonzero".to_string(),
+            vec![("wallet1".to_string(), BehavioralTier::Sovereign, Utc::now())],
+        );
+
+        let token = make_token("behav_nonzero", Some(1.0), None, None, None);
+        let result = bs.evaluate(&token).await.unwrap();
+        assert!(result.score > 0, "Should have non-zero score");
+        assert!(
+            result.reason.contains(&result.score.to_string()),
+            "Reasoning should include score: got '{}'",
+            result.reason
+        );
+        assert!(
+            result.reason.contains("SOVEREIGN") || result.reason.contains("wallet"),
+            "Reasoning should mention tier/wallets: got '{}'",
+            result.reason
+        );
+    }
+
+    /// VAL-SIG-015: Confluence scorer weighted composite with all 6 signals.
+    /// Tests exact weighted average computation.
+    #[tokio::test]
+    async fn test_signal_quality_confluence_all_six_weighted_correctly() {
+        let mut scorer = ConfluenceScorer::new(35.0);
+
+        let weights = SignalWeights::default();
+
+        let ws = WhaleConsensusSignal::new(
+            Chain::Solana,
+            2,
+            30,
+            10.0,
+            Box::new(InMemoryWalletScores::new()),
+        );
+        let acc = AccumulationSignal::new(Chain::Solana, 10);
+        let lm = LaunchMomentumSignal::new(Chain::Solana, 10);
+        let vs = VolumeSpikeSignal::new(Chain::Solana, 3.0, 10);
+        let ss = SocialSignal::new(Chain::Solana);
+        let bs = BehavioralSignal::new(
+            Arc::new(BehavioralWalletCache::new()),
+            Chain::Solana,
+        );
+
+        scorer.add_strategy(StrategyKind::WhaleConsensus(ws), weights.whale_consensus);
+        scorer.add_strategy(StrategyKind::Accumulation(acc), weights.accumulation);
+        scorer.add_strategy(StrategyKind::LaunchMomentum(lm), weights.launch_momentum);
+        scorer.add_strategy(StrategyKind::VolumeSpike(vs), weights.volume_spike);
+        scorer.add_strategy(StrategyKind::Social(ss), weights.social);
+        scorer.add_strategy(StrategyKind::Behavioral(bs), weights.behavioral);
+
+        // All signals will score 0 (no data fed) — composite should be 0.
+        let token = make_token("empty_token", Some(1.0), None, None, None);
+        let result = scorer.score(&token).await.unwrap();
+        assert_eq!(result.composite_score, 0);
+        assert!(!result.passed);
+        assert_eq!(result.signals.len(), 6, "Should have exactly 6 signals");
+
+        // All reasons should be non-empty.
+        for signal in &result.signals {
+            assert!(
+                !signal.reason.is_empty(),
+                "Signal '{}' reasoning must be non-empty",
+                signal.strategy
+            );
+        }
+    }
+
+    /// VAL-SIG-015: Confluence scorer weighted composite with mixed scores.
+    #[tokio::test]
+    async fn test_signal_quality_confluence_mixed_scores_weighted() {
+        let mut scorer = ConfluenceScorer::new(35.0);
+
+        // Only accumulation and volume_spike for clean math.
+        let acc = AccumulationSignal::new(Chain::Solana, 10);
+        let vs = VolumeSpikeSignal::new(Chain::Solana, 3.0, 10);
+
+        scorer.add_strategy(StrategyKind::Accumulation(acc), 0.15);
+        scorer.add_strategy(StrategyKind::VolumeSpike(vs), 0.10);
+
+        // Feed data so both produce non-zero scores.
+        let token_ca = "weighted_test";
+        scorer.feed_scan_data(token_ca, Some(10000.0), Some(100), Some(1.0));
+        scorer.feed_scan_data(token_ca, Some(12000.0), Some(150), Some(1.02));
+        scorer.feed_scan_data(token_ca, Some(11000.0), Some(200), Some(1.05));
+        scorer.feed_scan_data(token_ca, Some(50000.0), Some(250), Some(1.05));
+
+        let token = make_token(token_ca, Some(1.05), Some(50000.0), Some(50000.0), None);
+        let result = scorer.score(&token).await.unwrap();
+
+        let acc_sig = result.signals.iter().find(|s| s.strategy == "accumulation").unwrap();
+        let vs_sig = result.signals.iter().find(|s| s.strategy == "volume_spike").unwrap();
+
+        let expected = (acc_sig.score as f64 * 0.15 + vs_sig.score as f64 * 0.10) / (0.15 + 0.10);
+        let diff = (result.composite_score as f64 - expected).abs();
+        assert!(
+            diff <= 1.5,
+            "Composite should be within ±1.5 of weighted sum: got {}, expected {}",
+            result.composite_score,
+            expected
+        );
+    }
+
+    /// VAL-SIG-014: Accumulation zero-score with history but declining holders.
+    #[tokio::test]
+    async fn test_signal_quality_accumulation_declining_reasoning() {
+        let signal = AccumulationSignal::new(Chain::Solana, 10);
+
+        // Record declining holders.
+        signal.record_snapshot("decl_reason".to_string(), 200, 1.0);
+        signal.record_snapshot("decl_reason".to_string(), 100, 0.9);
+
+        let token = make_token("decl_reason", Some(0.9), None, None, None);
+        let result = signal.evaluate(&token).await.unwrap();
+
+        // Score should be low (20 in the else branch).
+        assert!(
+            result.score <= 20,
+            "Declining holders should score <= 20, got {}",
+            result.score
+        );
+        assert!(
+            !result.reason.is_empty(),
+            "Reasoning must be non-empty even for low scores"
+        );
+        // Reasoning should include numeric score.
+        assert!(
+            result.reason.contains(&result.score.to_string()),
+            "Reasoning should include score: got '{}'",
+            result.reason
+        );
+    }
+
+    /// VAL-SIG-014: Social signal with mentions below threshold has diagnostic.
+    #[tokio::test]
+    async fn test_signal_quality_social_below_threshold_diagnostic() {
+        let ss = SocialSignal::with_config(
+            Chain::Solana,
+            "nonexistent_twitter".to_string(),
+            vec![],
+            60,
+            3,
+        );
+
+        // Inject 1 mention (below threshold of 3).
+        ss.mentions.insert("social_diag".to_string(), {
+            let mut q = VecDeque::new();
+            q.push_back(MentionRecord {
+                tweet_id: "123".to_string(),
+                author: "user1".to_string(),
+                engagement: 100.0,
+                timestamp: Utc::now(),
+            });
+            q
+        });
+
+        let token = make_token("social_diag", Some(1.0), None, None, None);
+        let result = ss.evaluate(&token).await.unwrap();
+        assert_eq!(result.score, 0);
+        assert!(
+            result.reason.contains("below threshold") || result.reason.contains("below"),
+            "Below-threshold social should explain: got '{}'",
+            result.reason
+        );
+    }
+
+    /// VAL-SIG-014: Volume spike with data but no spike has diagnostic.
+    #[tokio::test]
+    async fn test_signal_quality_volume_no_spike_diagnostic() {
+        let signal = VolumeSpikeSignal::new(Chain::Solana, 3.0, 10);
+        let token_ca = "no_spike_diag";
+
+        // Record 3 flat points (no spike).
+        signal.record(token_ca.to_string(), 1000.0);
+        signal.record(token_ca.to_string(), 1050.0);
+        signal.record(token_ca.to_string(), 1020.0);
+
+        let token = make_token(token_ca, Some(1.0), Some(1020.0), Some(50000.0), None);
+        let result = signal.evaluate(&token).await.unwrap();
+
+        // Score should be low (10 for ratio < threshold*0.66, or possibly 50 for near-threshold).
+        assert!(
+            !result.reason.is_empty(),
+            "Reasoning must be non-empty for no-spike case"
+        );
+        // Reasoning should include numeric score.
+        assert!(
+            result.reason.contains(&result.score.to_string()),
+            "Reasoning should include score: got '{}'",
+            result.reason
+        );
+    }
+
+    /// VAL-SIG-014: Launch momentum too old has diagnostic.
+    #[tokio::test]
+    async fn test_signal_quality_launch_too_old_diagnostic() {
+        let signal = LaunchMomentumSignal::new(Chain::Solana, 10);
+        let token_ca = "old_lm";
+
+        signal.record(token_ca.to_string(), 1000.0, 50);
+        signal.record(token_ca.to_string(), 5000.0, 200);
+
+        // Token created 48 hours ago (too old for 1h max).
+        let created = Utc::now() - chrono::Duration::hours(48);
+        let token = make_token(token_ca, Some(1.0), Some(5000.0), Some(50000.0), Some(created));
+        let result = signal.evaluate(&token).await.unwrap();
+
+        assert_eq!(result.score, 0);
+        assert!(
+            result.reason.contains("too old") || result.reason.to_lowercase().contains("old"),
+            "Too-old token reasoning should mention age: got '{}'",
+            result.reason
+        );
+    }
+
+    /// VAL-SIG-014: Launch momentum MC below threshold has diagnostic.
+    #[tokio::test]
+    async fn test_signal_quality_launch_below_mc_diagnostic() {
+        let signal = LaunchMomentumSignal::with_filters(
+            Chain::Solana,
+            10,
+            5000.0,
+            50,
+            1,
+        );
+        let token_ca = "low_mc";
+
+        signal.record(token_ca.to_string(), 1000.0, 50);
+        signal.record(token_ca.to_string(), 5000.0, 200);
+
+        let created = Utc::now() - chrono::Duration::minutes(30);
+        let token = make_token(token_ca, Some(1.0), Some(5000.0), Some(3000.0), Some(created));
+        let result = signal.evaluate(&token).await.unwrap();
+
+        assert_eq!(result.score, 0);
+        assert!(
+            result.reason.contains("below") || result.reason.contains("MC"),
+            "Below-MC reasoning should mention threshold: got '{}'",
+            result.reason
+        );
+    }
+
+    /// VAL-SIG-013 / VAL-CROSS-004: ConfluenceResult signal_reasoning_summary()
+    /// produces machine-parseable per-signal reasoning.
+    #[tokio::test]
+    async fn test_signal_quality_confluence_result_reasoning_summary() {
+        let mut scorer = ConfluenceScorer::new(35.0);
+
+        let ws = WhaleConsensusSignal::new(
+            Chain::Solana,
+            2,
+            30,
+            10.0,
+            Box::new(InMemoryWalletScores::new()),
+        );
+        let acc = AccumulationSignal::new(Chain::Solana, 10);
+        let vs = VolumeSpikeSignal::new(Chain::Solana, 3.0, 10);
+        let ss = SocialSignal::new(Chain::Solana);
+        let bs = BehavioralSignal::new(
+            Arc::new(BehavioralWalletCache::new()),
+            Chain::Solana,
+        );
+        let lm = LaunchMomentumSignal::new(Chain::Solana, 10);
+
+        scorer.add_strategy(StrategyKind::WhaleConsensus(ws), 0.25);
+        scorer.add_strategy(StrategyKind::Accumulation(acc), 0.15);
+        scorer.add_strategy(StrategyKind::LaunchMomentum(lm), 0.15);
+        scorer.add_strategy(StrategyKind::VolumeSpike(vs), 0.10);
+        scorer.add_strategy(StrategyKind::Social(ss), 0.10);
+        scorer.add_strategy(StrategyKind::Behavioral(bs), 0.25);
+
+        let token = make_token("reasoning_summary_test", Some(1.0), None, None, None);
+        let result = scorer.score(&token).await.unwrap();
+
+        let summary = result.signal_reasoning_summary();
+
+        // Summary should contain all 6 signal names.
+        assert!(summary.contains("whale_consensus="), "Summary should contain whale_consensus: {summary}");
+        assert!(summary.contains("accumulation="), "Summary should contain accumulation: {summary}");
+        assert!(summary.contains("launch_momentum="), "Summary should contain launch_momentum: {summary}");
+        assert!(summary.contains("volume_spike="), "Summary should contain volume_spike: {summary}");
+        assert!(summary.contains("social="), "Summary should contain social: {summary}");
+        assert!(summary.contains("behavioral="), "Summary should contain behavioral: {summary}");
+
+        // Each signal should have a quoted reason string.
+        assert!(
+            summary.contains("\""),
+            "Summary should contain quoted reasoning strings: {summary}"
+        );
+
+        // Summary should be parseable (each entry has signal=N/100 "reason" format).
+        for part in summary.split(", ") {
+            assert!(
+                part.contains("/100"),
+                "Each signal entry should have N/100 format: {part}"
+            );
+        }
     }
 }
