@@ -402,6 +402,9 @@ pub struct AgentSubsystems {
     /// the background behavioral scan task. Read by BehavioralSignal
     /// during evaluation and by WhaleConsensusSignal for quality weighting.
     pub behavioral_cache: Option<std::sync::Arc<solagent_signals::BehavioralWalletCache>>,
+    /// Optional Helius credit tracker — records estimated credit usage per API call
+    /// and provides threshold warnings at 50% and 90% consumption.
+    pub helius_credit_tracker: Option<std::sync::Arc<solagent_data::HeliusCreditTracker>>,
 }
 
 // ─── Agent ───────────────────────────────────────────────────────────────────
@@ -430,6 +433,9 @@ pub struct Agent {
     /// Before each evaluation, tracked tokens are re-fed through the signal
     /// engine so accumulation, volume_spike, and launch_momentum get multi-cycle data.
     hot_token_tracker: Arc<tokio::sync::RwLock<HotTokenTracker>>,
+    /// Helius credit budget tracker. Shared with the HeliusSdkClient so every
+    /// API call records estimated credit usage. Persisted to SQLite on each scan.
+    helius_credit_tracker: Option<std::sync::Arc<solagent_data::HeliusCreditTracker>>,
 }
 
 impl Agent {
@@ -457,6 +463,9 @@ impl Agent {
         subsystems.auto_tuner = Some(auto_tuner);
         subsystems.zerion = if zerion_for_agent.is_enabled() { Some(zerion_for_agent) } else { None };
 
+        // Extract the credit tracker before subsystems is moved into Arc.
+        let helius_credit_tracker = subsystems.helius_credit_tracker.take();
+
         let event_bus = subsystems.event_bus.clone();
         let _ = event_bus;
         let progressive = ProgressiveThreshold::from_config(
@@ -477,6 +486,7 @@ impl Agent {
             cached_sol_balance: Arc::new(tokio::sync::RwLock::new(0.0)),
             consecutive_scan_failures: Arc::new(AtomicU32::new(0)),
             hot_token_tracker: Arc::new(tokio::sync::RwLock::new(HotTokenTracker::new())),
+            helius_credit_tracker,
         }
     }
 
@@ -533,6 +543,7 @@ impl Agent {
                 )),
                 zerion: None,
                 behavioral_cache: None,
+                helius_credit_tracker: None,
             }),
             decisions: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             running: Arc::new(tokio::sync::RwLock::new(false)),
@@ -544,6 +555,7 @@ impl Agent {
             cached_sol_balance: Arc::new(tokio::sync::RwLock::new(0.0)),
             consecutive_scan_failures: Arc::new(AtomicU32::new(0)),
             hot_token_tracker: Arc::new(tokio::sync::RwLock::new(HotTokenTracker::new())),
+            helius_credit_tracker: None,
         }
     }
 
@@ -737,6 +749,29 @@ impl Agent {
         }
 
         Ok(tokens)
+    }
+
+    /// Persist the Helius credit tracker state to SQLite so it survives restarts.
+    ///
+    /// Stores `helius_credits_used` and `helius_credits_total` in the `agent_state` table.
+    /// Called after each successful scan cycle. On startup, the CLI loads these values
+    /// and passes them to the credit tracker via `restore()`.
+    async fn persist_helius_credits(&self) {
+        if let Some(ref tracker) = self.helius_credit_tracker {
+            let snap = tracker.snapshot();
+            if let Err(e) = self.subsystems.portfolio
+                .set_agent_state("helius_credits_used", &snap.credits_used.to_string())
+                .await
+            {
+                tracing::debug!(error = %e, "Failed to persist helius_credits_used");
+            }
+            if let Err(e) = self.subsystems.portfolio
+                .set_agent_state("helius_credits_total", &snap.credits_total.to_string())
+                .await
+            {
+                tracing::debug!(error = %e, "Failed to persist helius_credits_total");
+            }
+        }
     }
 
     /// Run the evaluation phase — heuristic safety check from DexScreener data
@@ -1597,6 +1632,9 @@ impl Agent {
                             if let Err(e) = self.subsystems.portfolio.set_agent_state("last_scan", &now_iso).await {
                                 tracing::debug!(error = %e, "Failed to persist last_scan timestamp");
                             }
+
+                            // Persist Helius credit tracking state.
+                            self.persist_helius_credits().await;
 
                             // Search Twitter for discovered token CAs (top 5 per cycle to respect rate limits).
                             let addresses: Vec<String> = tokens.iter().take(5).map(|t| t.address.clone()).collect();

@@ -1250,19 +1250,36 @@ async fn main() -> Result<()> {
             let helius_key = config.as_ref()
                 .map(|c| c.chains.solana.helius_api_key.trim().to_string())
                 .unwrap_or_default();
-            let (helius_sdk, watcher, wallet_registry) = if !helius_key.is_empty() {
+            let (helius_sdk, watcher, wallet_registry, helius_credit_tracker) = if !helius_key.is_empty() {
                 let helius = std::sync::Arc::new(
                     solagent_data::HeliusSdkClient::new(&helius_key)
                         .expect("Failed to create Helius SDK client")
                 );
+
+                // Create credit tracker and restore from persisted state.
+                let tracker = solagent_data::HeliusCreditTracker::new_shared(
+                    solagent_data::DEFAULT_CREDIT_BUDGET,
+                );
+                let pm_for_restore = solagent_portfolio::PortfolioManager::new(pool.clone());
+                if let Ok(Some(used_str)) = pm_for_restore.get_agent_state("helius_credits_used").await
+                    && let Ok(used) = used_str.parse::<u64>()
+                {
+                    tracker.restore(used);
+                    tracing::info!(
+                        credits_restored = used,
+                        "Helius credit tracker restored from persisted state"
+                    );
+                }
+                helius.set_credit_tracker(tracker.clone());
+
                 // Use WebSocket-first watcher with polling fallback.
                 let ws_config = solagent_data::WsWatcherConfig::default();
                 let watcher = solagent_data::WsWatcher::new(helius.clone(), event_bus.clone(), ws_config);
-                tracing::info!("Helius SDK client initialized, WebSocket wallet watcher configured");
-                (Some(helius), Some(watcher), true)
+                tracing::info!("Helius SDK client initialized, WebSocket wallet watcher configured, credit tracking enabled");
+                (Some(helius), Some(watcher), true, Some(tracker))
             } else {
                 tracing::info!("No Helius API key -- wallet watcher disabled, DAS API unavailable");
-                (None, None, false)
+                (None, None, false, None)
             };
 
             // Wire Helius SDK client to execution engine for DAS API token balances.
@@ -1302,6 +1319,7 @@ async fn main() -> Result<()> {
                 auto_tuner: None,
                 zerion: None,
                 behavioral_cache: Some(behavioral_cache),
+                helius_credit_tracker,
             }
             };
 

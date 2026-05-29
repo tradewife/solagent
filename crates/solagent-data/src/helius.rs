@@ -361,9 +361,13 @@ fn convert_instruction(inst: &helius::types::Instruction) -> Instruction {
 /// - Enhanced transaction history via `parsed_transaction_history()`
 /// - DAS API token balances via `get_assets_by_owner()`
 /// - Webhook management (delegated to SDK)
+/// - Credit budget tracking via optional `HeliusCreditTracker`
 pub struct HeliusSdkClient {
     helius: helius::Helius,
     api_key: String,
+    /// Optional credit tracker — records estimated credit usage per API call.
+    /// Uses `std::sync::RwLock` for interior mutability since the client is shared via `Arc`.
+    credit_tracker: std::sync::RwLock<Option<Arc<crate::credit_tracker::HeliusCreditTracker>>>,
 }
 
 impl HeliusSdkClient {
@@ -371,6 +375,7 @@ impl HeliusSdkClient {
     ///
     /// Validates the API key is non-empty (per SDK's `ApiKey::new()`).
     /// Construction is synchronous — for WebSocket support use `HeliusBuilder`.
+    /// Credit tracking is disabled by default; call `set_credit_tracker()` to enable.
     pub fn new(api_key: &str) -> Result<Self> {
         let helius = helius::Helius::new(api_key, Cluster::MainnetBeta)
             .map_err(|e| anyhow::anyhow!("Failed to create Helius SDK client: {e}"))?;
@@ -382,6 +387,7 @@ impl HeliusSdkClient {
         Ok(Self {
             helius,
             api_key: api_key.to_string(),
+            credit_tracker: std::sync::RwLock::new(None),
         })
     }
 
@@ -395,6 +401,38 @@ impl HeliusSdkClient {
         &self.helius
     }
 
+    /// Set the credit tracker for this client.
+    ///
+    /// Once set, every API call will record estimated credit usage.
+    /// This method is thread-safe — the client may already be behind an `Arc`.
+    pub fn set_credit_tracker(
+        &self,
+        tracker: Arc<crate::credit_tracker::HeliusCreditTracker>,
+    ) {
+        if let Ok(mut guard) = self.credit_tracker.write() {
+            *guard = Some(tracker);
+        }
+    }
+
+    /// Returns a cloned reference to the credit tracker, if configured.
+    pub fn credit_tracker(
+        &self,
+    ) -> Option<Arc<crate::credit_tracker::HeliusCreditTracker>> {
+        self.credit_tracker
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    /// Record a credit-tracked API call (no-op if tracker not configured).
+    fn track_call(&self, call_type: crate::credit_tracker::ApiCallType) {
+        if let Ok(guard) = self.credit_tracker.read()
+            && let Some(ref tracker) = *guard
+        {
+            tracker.record_call(call_type);
+        }
+    }
+
     // ─── Enhanced Transaction History ────────────────────────────────────────
 
     /// Get parsed (enhanced) transaction history for an address.
@@ -406,6 +444,7 @@ impl HeliusSdkClient {
         address: &str,
         tx_type: Option<&str>,
     ) -> Result<Vec<ParsedTransaction>> {
+        self.track_call(crate::credit_tracker::ApiCallType::TransactionHistory);
         let mut request = ParsedTransactionHistoryRequest {
             address: address.to_string(),
             before: None,
@@ -443,6 +482,7 @@ impl HeliusSdkClient {
     ///
     /// Uses the SDK's `parse_transactions()` method with a single signature.
     pub async fn get_parsed_transaction(&self, signature: &str) -> Result<ParsedTransaction> {
+        self.track_call(crate::credit_tracker::ApiCallType::ParseTransaction);
         let request = helius::types::ParseTransactionsRequest {
             transactions: vec![signature.to_string()],
         };
@@ -469,6 +509,7 @@ impl HeliusSdkClient {
         &self,
         owner_address: &str,
     ) -> Result<Vec<(String, u64, u8)>> {
+        self.track_call(crate::credit_tracker::ApiCallType::DasGetAssets);
         let request = GetAssetsByOwner {
             owner_address: owner_address.to_string(),
             page: 1,
@@ -638,6 +679,7 @@ impl HeliusSdkClient {
 
     /// Verify the Helius client can reach the RPC endpoint.
     pub fn health_check(&self) -> Result<()> {
+        self.track_call(crate::credit_tracker::ApiCallType::RpcCall);
         // Use the embedded Solana RPC client for a lightweight health check.
         match self.helius.connection().get_health() {
             Ok(_) => {
@@ -693,6 +735,7 @@ impl HeliusSdkClient {
         &self,
         account_keys: &[String],
     ) -> Result<f64> {
+        self.track_call(crate::credit_tracker::ApiCallType::PriorityFee);
         let request = helius::types::GetPriorityFeeEstimateRequest {
             transaction: None,
             account_keys: if account_keys.is_empty() {
@@ -750,6 +793,7 @@ impl HeliusSdkClient {
         lookup_tables: Vec<solana_sdk::message::AddressLookupTableAccount>,
         priority_fee_cap: Option<u64>,
     ) -> Result<solana_sdk::signature::Signature> {
+        self.track_call(crate::credit_tracker::ApiCallType::SmartTransaction);
         let create_config = helius::types::CreateSmartTransactionConfig {
             instructions,
             signers,
@@ -814,6 +858,7 @@ impl HeliusSdkClient {
         &self,
         vtx: &solana_sdk::transaction::VersionedTransaction,
     ) -> Result<solana_sdk::signature::Signature> {
+        self.track_call(crate::credit_tracker::ApiCallType::SmartTransaction);
         let rpc = self.helius.connection();
 
         // Get latest blockhash and last valid block height.
@@ -897,6 +942,7 @@ impl HeliusSdkClient {
         &self,
         addresses: &[String],
     ) -> Result<Vec<solana_sdk::message::AddressLookupTableAccount>> {
+        self.track_call(crate::credit_tracker::ApiCallType::RpcCall);
         use solana_sdk::pubkey::Pubkey;
 
         let rpc = self.helius.connection();

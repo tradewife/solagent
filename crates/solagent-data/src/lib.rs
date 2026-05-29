@@ -5,6 +5,7 @@
 //! polling fallback) for real-time wallet monitoring.
 
 pub mod birdeye;
+pub mod credit_tracker;
 pub mod dexscreener;
 pub mod gmgn;
 pub mod helius;
@@ -24,6 +25,9 @@ pub use dexscreener::{
     DexTokenResponse, TokenLink,
 };
 pub use gmgn::{GmgnClient, GmgnTokenInfo, GMGN_CLI_DEFAULT_PATH};
+pub use credit_tracker::{
+    ApiCallType, CreditSnapshot, HeliusCreditTracker, DEFAULT_CREDIT_BUDGET,
+};
 pub use helius::{
     BalancesResponse, HeliusSdkClient, NativeBalanceChange, NativeTransfer, ParsedTransaction,
     SwapEvent, TokenBalance, TokenBalanceChange, TokenTransfer, TransactionEvent,
