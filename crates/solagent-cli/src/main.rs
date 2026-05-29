@@ -88,6 +88,13 @@ enum Commands {
         deployer: Option<String>,
     },
 
+    /// Show agent health snapshot (circuit breaker, thresholds, signal health, positions, last scan)
+    Status {
+        /// Output as JSON instead of formatted text
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Behavioral intelligence scan — discover wallets with genuine edge
     BehavioralScan {
         /// Number of crashed tokens to analyze (Layer 1/2)
@@ -625,6 +632,128 @@ async fn main() -> Result<()> {
                 deployer.as_deref(),
             ).await;
             println!("{}", report.summary());
+        }
+
+        // ─── Status ──────────────────────────────────────────────────────
+        Commands::Status { json } => {
+            use serde_json::json;
+
+            let pool = solagent_portfolio::db::init_pool(DEFAULT_DB_PATH).await?;
+            let pm = solagent_portfolio::PortfolioManager::new(pool);
+
+            // 1. Circuit breaker state (persisted by agent during runtime).
+            let circuit_breaker = pm.get_agent_state("circuit_breaker").await?
+                .unwrap_or_else(|| "NORMAL".to_string());
+
+            // 2. Effective threshold (persisted by agent after each evaluation).
+            //    Fall back to config value if agent hasn't run yet.
+            //    Always clamp to ABSOLUTE_FLOOR of 25.0 to match agent behavior.
+            const EFFECTIVE_THRESHOLD_FLOOR: f64 = 25.0;
+            let effective_threshold = match pm.get_agent_state("effective_threshold").await? {
+                Some(v) => v.parse::<f64>().unwrap_or_else(|_| {
+                    config.as_ref().map(|c| c.strategies.confluence_threshold).unwrap_or(35.0)
+                }),
+                None => config.as_ref().map(|c| c.strategies.confluence_threshold).unwrap_or(35.0),
+            };
+            let effective_threshold = effective_threshold.max(EFFECTIVE_THRESHOLD_FLOOR);
+
+            // 3. Signal health — read weights from config defaults + check if active.
+            let weights = solagent_signals::SignalWeights::default();
+            let active_strategies = config.as_ref()
+                .map(|c| c.strategies.active_strategies.clone())
+                .unwrap_or_else(|| vec![
+                    "whale_consensus".into(),
+                    "behavioral".into(),
+                    "accumulation".into(),
+                    "launch_momentum".into(),
+                    "volume_spike".into(),
+                    "social".into(),
+                ]);
+
+            let signal_names = [
+                ("whale_consensus", weights.whale_consensus),
+                ("behavioral", weights.behavioral),
+                ("accumulation", weights.accumulation),
+                ("launch_momentum", weights.launch_momentum),
+                ("volume_spike", weights.volume_spike),
+                ("social", weights.social),
+            ];
+
+            let signal_health: Vec<serde_json::Value> = signal_names.iter().map(|(name, weight)| {
+                let is_active = active_strategies.iter().any(|s| s == name);
+                json!({
+                    "signal": name,
+                    "weight": weight,
+                    "status": if is_active { "active" } else { "disabled" },
+                })
+            }).collect();
+
+            // 4. Open positions count.
+            let positions = pm.get_open_positions().await?;
+            let open_positions = positions.len();
+
+            // 5. Last scan timestamp (persisted by agent after each successful scan).
+            let last_scan = pm.get_agent_state("last_scan").await?
+                .unwrap_or_else(|| "never".to_string());
+
+            // 6. Helius credit budget (from agent_state if tracked, else N/A).
+            let helius_credits_used = pm.get_agent_state("helius_credits_used").await?
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            let helius_credits_total = pm.get_agent_state("helius_credits_total").await?
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            let helius_credits_pct = if helius_credits_total > 0 {
+                helius_credits_used as f64 / helius_credits_total as f64 * 100.0
+            } else {
+                -1.0 // sentinel: not tracked
+            };
+
+            if json {
+                let output = json!({
+                    "circuit_breaker": circuit_breaker,
+                    "effective_threshold": effective_threshold,
+                    "signal_health": signal_health,
+                    "open_positions": open_positions,
+                    "last_scan": last_scan,
+                    "helius_credit_budget": if helius_credits_total > 0 {
+                        json!({
+                            "used": helius_credits_used,
+                            "total": helius_credits_total,
+                            "pct": format!("{:.1}%", helius_credits_pct),
+                        })
+                    } else {
+                        json!("not_tracked")
+                    },
+                });
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            } else {
+                println!("=== SolAgent Status ===");
+                println!();
+                println!("  circuit_breaker:   {}", circuit_breaker);
+                println!("  effective_threshold: {:.1}", effective_threshold);
+                println!("  open_positions:    {}", open_positions);
+                println!("  last_scan:         {}", if last_scan == "never" { "never".to_string() } else {
+                    let display: String = last_scan.chars().take(19).collect();
+                    display.replace('T', " ")
+                });
+                println!();
+                println!("  Signal Health:");
+                for sh in &signal_health {
+                    let name = sh["signal"].as_str().unwrap_or("?");
+                    let weight = sh["weight"].as_f64().unwrap_or(0.0);
+                    let status = sh["status"].as_str().unwrap_or("?");
+                    println!("    {:<18} weight={:.2}  status={}", name, weight, status);
+                }
+                println!();
+                println!("  Helius Credit Budget:");
+                if helius_credits_total > 0 {
+                    println!("    used: {} / {} ({:.1}%)", helius_credits_used, helius_credits_total, helius_credits_pct);
+                } else {
+                    println!("    not tracked (credit tracking not enabled)");
+                }
+                println!();
+            }
         }
 
         // ─── Portfolio ───────────────────────────────────────────────────

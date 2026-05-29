@@ -812,6 +812,14 @@ impl Agent {
             signal_summary.join(", "),
         );
 
+        // Persist effective threshold for status CLI.
+        if let Err(e) = self.subsystems.portfolio.set_agent_state(
+            "effective_threshold",
+            &format!("{effective_threshold:.1}"),
+        ).await {
+            tracing::debug!(error = %e, "Failed to persist effective_threshold");
+        }
+
         Ok(EvaluationResult {
             token_address: token.address.clone(),
             chain: token.chain,
@@ -874,6 +882,12 @@ impl Agent {
             open_positions = positions.len(),
             "Risk check completed ({})"
         , report.reason);
+
+        // Persist circuit breaker state for status CLI.
+        let cb_str = format!("{}", report.circuit_breaker);
+        if let Err(e) = self.subsystems.portfolio.set_agent_state("circuit_breaker", &cb_str).await {
+            tracing::debug!(error = %e, "Failed to persist circuit_breaker state");
+        }
 
         Ok(report.passed && risk.can_trade())
     }
@@ -1577,6 +1591,12 @@ impl Agent {
                         Ok(tokens) => {
                             // Reset backoff counter on successful scan.
                             self.consecutive_scan_failures.store(0, Ordering::SeqCst);
+
+                            // Persist last scan timestamp for status CLI.
+                            let now_iso = Utc::now().to_rfc3339();
+                            if let Err(e) = self.subsystems.portfolio.set_agent_state("last_scan", &now_iso).await {
+                                tracing::debug!(error = %e, "Failed to persist last_scan timestamp");
+                            }
 
                             // Search Twitter for discovered token CAs (top 5 per cycle to respect rate limits).
                             let addresses: Vec<String> = tokens.iter().take(5).map(|t| t.address.clone()).collect();

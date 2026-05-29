@@ -599,6 +599,34 @@ impl PortfolioManager {
         Ok(rows.into_iter().map(|r| r.into_record()).collect())
     }
 
+    // ─── Agent State Persistence ────────────────────────────────────────
+
+    /// Set an agent state key-value pair. Used by the running agent to persist
+    /// runtime state (circuit breaker, effective threshold, last scan time)
+    /// so the `solagent status` CLI can report it even when the agent is not running.
+    pub async fn set_agent_state(&self, key: &str, value: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO agent_state (key, value, updated_at) VALUES (?, ?, datetime('now'))
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Get an agent state value by key. Returns None if the key has never been set.
+    pub async fn get_agent_state(&self, key: &str) -> Result<Option<String>> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT value FROM agent_state WHERE key = ?",
+        )
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(v,)| v))
+    }
+
     // ─── Twitter Account Management ─────────────────────────────────────
 
     /// Upsert a Twitter account into the twitter_accounts table.
@@ -1448,5 +1476,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count.0, 1, "Normal position should still exist");
+    }
+
+    // ─── Agent State Tests ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_agent_state_set_and_get() {
+        let pool = test_pool().await;
+        let pm = PortfolioManager::new(pool);
+
+        // Initially no state.
+        let val = pm.get_agent_state("circuit_breaker").await.unwrap();
+        assert!(val.is_none(), "Should return None for unset key");
+
+        // Set a value.
+        pm.set_agent_state("circuit_breaker", "NORMAL").await.unwrap();
+
+        // Get it back.
+        let val = pm.get_agent_state("circuit_breaker").await.unwrap();
+        assert_eq!(val.as_deref(), Some("NORMAL"));
+
+        // Update the value.
+        pm.set_agent_state("circuit_breaker", "HALTED").await.unwrap();
+        let val = pm.get_agent_state("circuit_breaker").await.unwrap();
+        assert_eq!(val.as_deref(), Some("HALTED"));
+    }
+
+    #[tokio::test]
+    async fn test_agent_state_multiple_keys() {
+        let pool = test_pool().await;
+        let pm = PortfolioManager::new(pool);
+
+        pm.set_agent_state("circuit_breaker", "WARNING").await.unwrap();
+        pm.set_agent_state("effective_threshold", "30.0").await.unwrap();
+        pm.set_agent_state("last_scan", "2026-05-29T12:00:00Z").await.unwrap();
+
+        assert_eq!(pm.get_agent_state("circuit_breaker").await.unwrap().as_deref(), Some("WARNING"));
+        assert_eq!(pm.get_agent_state("effective_threshold").await.unwrap().as_deref(), Some("30.0"));
+        assert_eq!(pm.get_agent_state("last_scan").await.unwrap().as_deref(), Some("2026-05-29T12:00:00Z"));
+        assert!(pm.get_agent_state("nonexistent").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_agent_state_upsert() {
+        let pool = test_pool().await;
+        let pm = PortfolioManager::new(pool);
+
+        // Insert.
+        pm.set_agent_state("key1", "value1").await.unwrap();
+        assert_eq!(pm.get_agent_state("key1").await.unwrap().as_deref(), Some("value1"));
+
+        // Upsert (update).
+        pm.set_agent_state("key1", "value2").await.unwrap();
+        assert_eq!(pm.get_agent_state("key1").await.unwrap().as_deref(), Some("value2"));
     }
 }

@@ -134,6 +134,14 @@ CREATE TABLE IF NOT EXISTS performance_metrics (
 );
 
 CREATE INDEX IF NOT EXISTS idx_performance_metrics_timestamp ON performance_metrics(timestamp);
+
+-- Agent state key-value store for persisting runtime state across restarts.
+-- Used by the status CLI command to show circuit breaker state, effective threshold, etc.
+CREATE TABLE IF NOT EXISTS agent_state (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 "#;
 
 /// Open a SQLite pool and run all migrations.
